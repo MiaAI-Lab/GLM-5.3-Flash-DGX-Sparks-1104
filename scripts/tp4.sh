@@ -386,6 +386,8 @@ tp4_rank_env() {
                -e NCCL_IB_MERGE_NICS=0 -e "NCCL_MIN_NCHANNELS=$NCCL_CHANNELS" -e "NCCL_MAX_NCHANNELS=$NCCL_CHANNELS")
     [[ -z "$MESH_NCCL_ALGO" ]] || RANK_ENV+=(-e "NCCL_ALGO=$MESH_NCCL_ALGO")
     [[ -z "$RING_PREFIX" ]] || RANK_ENV+=(-e "NCCL_IB_SUBNET_PREFIX_LEN=$RING_PREFIX")
+    # the RoCE all-gather (patch 0107) stripes over this rank's devices and finds each one's RoCE v2 IPv4 GID itself
+    [[ "$ROCE" != on ]] || RANK_ENV+=(-e "TF_ROCE_HCA=${NODE_HCAS[r]}")
     RANK_MOUNTS=()
     return 0
   fi

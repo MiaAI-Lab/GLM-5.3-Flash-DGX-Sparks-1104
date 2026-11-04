@@ -26,8 +26,13 @@ esac
 validate_config
 set_image
 inspect_model
-# Four ranks carry every exchange on NCCL: the engine's RoCE all-gather is written for two ranks (zig/src/cuda/roce.zig
-# refuses any other world) and the peer-store gathers do not apply at four, on a ring or a switch alike.
+# On a ring every exchange is NCCL: the ranks across the ring are unreachable and the peer-store gathers do not apply at four.
+# On a switch, with engine patch 0107 in the image (the one-shot RoCE all-gather at any world), the decode-sized gathers go
+# over RoCE as on the pair: MESH_ROCE=auto (the default) turns it on when the patch is present. The engine's own connect-time
+# probe refuses a peer it cannot write to, so a wrong fabric fails before the weights load.
+MESH_ROCE_WANT=off
+if compgen -G "$REPO_ROOT/patches/engine/0107-cuda-roce-*.patch" >/dev/null; then MESH_ROCE_WANT=on; fi
+case "$MESH_ROCE" in auto) ;; on|off) MESH_ROCE_WANT=$MESH_ROCE ;; *) fail E_CONFIG "MESH_ROCE must be auto, on or off, not $MESH_ROCE." ;; esac
 ROCE=off
 # NCCL_COMM_ID's address: this Spark's address on the network every Spark shares, the one its default route leaves
 # with (the LAN). Every rank keeps NCCL_COMM_ID and NCCL finds its bootstrap interface by that address's subnet (see
@@ -47,7 +52,7 @@ if [[ "$PREFILL_REDUCE" == auto ]]; then
   if [[ "$FABRIC" == mesh ]]; then PREFILL_REDUCE=split; else PREFILL_REDUCE=gather; fi
 fi
 [[ "$FABRIC" != ring || "$PREFILL_REDUCE" != split ]] || fail E_CONFIG 'PREFILL_REDUCE=split sends every rank'"'"'s prompt rows straight to every other rank, which a ring cannot carry: use gather or ring on a ring.'
-if [[ "$FABRIC" == mesh ]]; then FABRIC_DESC='a switch (mesh)'; else FABRIC_DESC='a ring'; fi
+if [[ "$FABRIC" == mesh ]]; then FABRIC_DESC='a switch (mesh)'; ROCE=$MESH_ROCE_WANT; else FABRIC_DESC='a ring'; fi
 
 step() { printf '\n[%s/6] %s\n' "$1" "$2"; }
 bits() { case "$1" in bf16) echo 16 ;; q8) echo 8 ;; q6) echo 6 ;; q4) echo 4 ;; esac; }
@@ -175,7 +180,7 @@ build_env_args() {
     -e "TF_GLM_DENSE_BITS=$(bits "$DENSE")" -e "TF_GLM_HEAD_BITS=$(bits "$HEAD")" -e "TF_GLM_CLEAR_THINKING=$CLEAR_THINKING"
     -e "TF_KV_PAGES=$KV_PAGES" -e "TF_GLM_CE_EXCHANGE=$CE_EXCHANGE" -e "TF_GLM_ABSORB_MMA=$ABSORB_MMA" -e "TF_GLM_W8A8=$W8A8"
     -e "TF_CUDA_DEVICE=0" -e "TF_GLM_WORLD=$TP" -e "NCCL_COMM_ID=$MASTER_ADDR:$NCCL_PORT"
-    -e "TF_GLM_PREFILL_REDUCE=$PREFILL_REDUCE" -e TF_ROCE=0 -e "TF_ROCE_MAX_KB=$ROCE_MAX_KB"
+    -e "TF_GLM_PREFILL_REDUCE=$PREFILL_REDUCE" -e "TF_ROCE=$([[ "$ROCE" == on ]] && echo 1 || echo 0)" -e "TF_ROCE_MAX_KB=$ROCE_MAX_KB"
     -e "TF_BIN=$TF_BIN" -e "TENSORFOLD_PREFILL_SHARE=$PREFILL_SHARE")
   [[ -z "$HOST_CACHE_GIB" ]] || ENV_ARGS+=(-e "TF_GLM_HOST_CACHE_GIB=$HOST_CACHE_GIB")
   [[ -z "$PREFILL_BUDGET" ]] || ENV_ARGS+=(-e "TENSORFOLD_PREFILL_BUDGET=$PREFILL_BUDGET")
@@ -390,9 +395,9 @@ PY
 }
 
 banner
-printf '\n%s\n%s at once | context %s (%s)\n%s dense, %s head, %s KV | %s drafts | vision %s | reserve %s GiB | port %s\nTP=4 on %s: rank 0 here, ranks 1-3 on %s, %s, %s | NCCL only, prefill reduce %s\n' \
+printf '\n%s\n%s at once | context %s (%s)\n%s dense, %s head, %s KV | %s drafts | vision %s | reserve %s GiB | port %s\nTP=4 on %s: rank 0 here, ranks 1-3 on %s, %s, %s | %s, prefill reduce %s\n' \
   "$MODEL_DESC" "$PARALLEL" "$CTX" "$CTX_NOTE" "$DENSE" "$HEAD" "$KV$([[ "$KV_PAGES" != on ]] || echo ' (one shared page pool; context = one request'"'"'s cap)')" \
-  "$DRAFTER" "$VISION" "$MEMORY_RESERVE_GIB" "$PORT" "$FABRIC_DESC" "$(whost 1)" "$(whost 2)" "$(whost 3)" "$PREFILL_REDUCE"
+  "$DRAFTER" "$VISION" "$MEMORY_RESERVE_GIB" "$PORT" "$FABRIC_DESC" "$(whost 1)" "$(whost 2)" "$(whost 3)" "$([[ "$ROCE" == on ]] && echo 'RoCE gathers + NCCL' || echo 'NCCL only')" "$PREFILL_REDUCE"
 
 step 1 'Check all four Sparks: Linux aarch64, Docker, the NVIDIA runtime, memory, disk and ports'
 if [[ "$DRY_RUN" == 1 ]]; then
