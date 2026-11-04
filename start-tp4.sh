@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# One command for four Sparks cabled as a ring (TP=4, no switch): check all four, build the engine image here and send it
-# to the workers, check the weights, start one rank on each Spark (rank 0 here, the API), wait for the API and
-# smoke-test it. The same image, patches, settings and checks as ./start.sh; the ring's NCCL settings and the workers'
-# NFS weights are scripts/tp4.sh. README: "4 Sparks".
-# Usage: ./start-tp4.sh [restart]       (./stop-tp4.sh stops it; DRY_RUN=1 prints the plan and the ring found, changes nothing)
+# One command for four Sparks (TP=4), cabled as a ring or every port on one switch: check all four, build the engine image
+# here and send it to the workers, check the weights, start one rank on each Spark (rank 0 here, the API), wait for the
+# API and smoke-test it. The same image, patches, settings and checks as ./start.sh; the fabric's NCCL settings and the
+# workers' weights are scripts/tp4.sh. README: "4 Sparks".
+# Usage: ./start-tp4.sh [restart]       (./stop-tp4.sh stops it; DRY_RUN=1 prints the plan and the fabric found, changes nothing)
 # Configuration: scripts/config.sh defaults < .env < scripts/local.sh < exported environment, with WORKER, WORKER2 and
-# WORKER3 in the ring's order from this Spark (its two neighbours are WORKER and WORKER3; WORKER2 is across the ring).
+# WORKER3 in the ring's order from this Spark on a ring (its two neighbours are WORKER and WORKER3; WORKER2 is across the
+# ring); any order on a switch.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 export TP=4 GLM_TP4=1
@@ -25,7 +26,8 @@ esac
 validate_config
 set_image
 inspect_model
-# The ring carries every exchange on NCCL: the engine's two-rank RoCE path and peer-store gathers do not apply at four.
+# Four ranks carry every exchange on NCCL: the engine's RoCE all-gather is written for two ranks (zig/src/cuda/roce.zig
+# refuses any other world) and the peer-store gathers do not apply at four, on a ring or a switch alike.
 ROCE=off
 # NCCL_COMM_ID's address: this Spark's address on the network every Spark shares, the one its default route leaves
 # with (the LAN). Every rank keeps NCCL_COMM_ID and NCCL finds its bootstrap interface by that address's subnet (see
@@ -36,6 +38,15 @@ if [[ -z "$MASTER_ADDR" ]]; then
   [[ -n "$MASTER_ADDR" ]] || fail E_CONFIG 'MASTER_ADDR is empty and this Spark has no default route: set MASTER_ADDR to an address of this Spark every worker reaches.'
 fi
 [[ "$MASTER_ADDR" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || fail E_CONFIG "MASTER_ADDR must be an IPv4 address (the ranks' watch lines take no host name), not $MASTER_ADDR."
+
+# The fabric is read first (read-only: ip and sysfs on every Spark over ssh), because the prefill reduce mode, the banner
+# and the context fit's key depend on whether the four are a ring or sit on a switch.
+tp4_probe_workers
+detect_ring
+if [[ "$PREFILL_REDUCE" == auto ]]; then
+  if [[ "$FABRIC" == mesh ]]; then PREFILL_REDUCE=split; else PREFILL_REDUCE=gather; fi
+fi
+if [[ "$FABRIC" == mesh ]]; then FABRIC_DESC='a switch (mesh)'; else FABRIC_DESC='a ring'; fi
 
 step() { printf '\n[%s/6] %s\n' "$1" "$2"; }
 bits() { case "$1" in bf16) echo 16 ;; q8) echo 8 ;; q6) echo 6 ;; q4) echo 4 ;; esac; }
@@ -308,8 +319,8 @@ show_failure() {
 
 live_message() {
   brand_style
-  printf '%sGLM-5.3-Flash-EXL3 is now LIVE! on port %s (four Sparks, TP=4)%s\n%sEndpoint: %s/v1%s\n' \
-    "$AE_SILVER" "$PORT" "$AE_RESET" "$AE_WHITE" "$URL" "$AE_RESET"
+  printf '%sGLM-5.3-Flash-EXL3 is now LIVE! on port %s (four Sparks, TP=4 on %s)%s\n%sEndpoint: %s/v1%s\n' \
+    "$AE_SILVER" "$PORT" "$FABRIC_DESC" "$AE_RESET" "$AE_WHITE" "$URL" "$AE_RESET"
 }
 
 SMOKE_JSON=$(python3 - "$SERVED_NAME" <<'PY'
@@ -371,17 +382,16 @@ PY
 }
 
 banner
-printf '\n%s\n%s at once | context %s (%s)\n%s dense, %s head, %s KV | %s drafts | vision %s | reserve %s GiB | port %s\nTP=4 on a ring: rank 0 here, ranks 1-3 on %s, %s, %s | NCCL only, prefill reduce %s\n' \
+printf '\n%s\n%s at once | context %s (%s)\n%s dense, %s head, %s KV | %s drafts | vision %s | reserve %s GiB | port %s\nTP=4 on %s: rank 0 here, ranks 1-3 on %s, %s, %s | NCCL only, prefill reduce %s\n' \
   "$MODEL_DESC" "$PARALLEL" "$CTX" "$CTX_NOTE" "$DENSE" "$HEAD" "$KV$([[ "$KV_PAGES" != on ]] || echo ' (one shared page pool; context = one request'"'"'s cap)')" \
-  "$DRAFTER" "$VISION" "$MEMORY_RESERVE_GIB" "$PORT" "$(whost 1)" "$(whost 2)" "$(whost 3)" "$PREFILL_REDUCE"
+  "$DRAFTER" "$VISION" "$MEMORY_RESERVE_GIB" "$PORT" "$FABRIC_DESC" "$(whost 1)" "$(whost 2)" "$(whost 3)" "$PREFILL_REDUCE"
 
 step 1 'Check all four Sparks: Linux aarch64, Docker, the NVIDIA runtime, memory, disk and ports'
 if [[ "$DRY_RUN" == 1 ]]; then
-  log '[I_DRY_RUN] Plan only: nothing is built, started, downloaded, sent or changed. The ring below is probed read-only.'
+  log '[I_DRY_RUN] Plan only: nothing is built, started, downloaded, sent or changed. The fabric above was probed read-only.'
   log "Check Linux aarch64, docker group access and the NVIDIA runtime here and on the three workers over ssh; a GB10 on each;"
   log "$MIN_AVAIL_GIB GiB available on each; disk for what is missing; port $PORT on $HOST and $NCCL_PORT-$((NCCL_PORT + 1)) here."
   if [[ "$MODE" == restart ]]; then DRY_RUN=1 "$REPO_ROOT/stop-tp4.sh"; fi
-  tp4_probe_workers
 else
   [[ "$(uname -s)" == Linux && "$(uname -m)" == aarch64 ]] || fail E_PLATFORM 'This recipe requires Linux aarch64 (DGX Spark, GB10).'
   for cmd in docker curl python3 flock gzip tar sha256sum nvidia-smi ssh ip awk getent; do
@@ -393,7 +403,6 @@ else
   fi
   nvidia_docker_ready '' || fail E_NVIDIA_RUNTIME 'Docker cannot give a container the GPU: install NVIDIA Container Toolkit.'
   log '[I_PLATFORM] Linux aarch64, Docker access and GPU passthrough are ready here.'
-  tp4_probe_workers
   mkdir -p "$STATE_DIR"
   exec 8>"$STATE_DIR/start.lock"
   flock -n 8 || fail E_LOCK 'Another start, stop or preparation is in progress.'
@@ -451,8 +460,7 @@ step 3 'Download or check the checkpoint and the drafter weights'
 prepare_weights
 model_overlay
 
-step 4 'Find the ring, write the NCCL graphs, and mount the weights on the workers'
-detect_ring
+step 4 "Write the NCCL graphs (a ring) and check or mount the weights on the workers ($FABRIC_DESC)"
 ring_graphs
 tp4_prepare_worker_weights
 

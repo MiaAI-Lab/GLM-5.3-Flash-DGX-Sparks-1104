@@ -78,8 +78,10 @@ validate_config() {
       [[ "${!key}" =~ ^[A-Za-z0-9_.@:-]+$ ]] || fail E_CONFIG "$key must be an ssh target such as user@host, with no spaces."
     done
     [[ "$WORKER" != "$WORKER2" && "$WORKER" != "$WORKER3" && "$WORKER2" != "$WORKER3" ]] || fail E_CONFIG 'WORKER, WORKER2 and WORKER3 must name three different Sparks.'
-    [[ "$PREFILL_REDUCE" =~ ^(gather|ring)$ ]] || fail E_CONFIG 'PREFILL_REDUCE must be gather or ring (TF_GLM_PREFILL_REDUCE on a ring; split cannot run there).'
+    [[ "$PREFILL_REDUCE" =~ ^(auto|split|gather|ring)$ ]] || fail E_CONFIG 'PREFILL_REDUCE must be auto, split, gather or ring (TF_GLM_PREFILL_REDUCE; auto: gather on a ring, split on a switch; split cannot run on a ring).'
     [[ "$RING_NCCL_ALGO" =~ ^[A-Za-z,^]+$ ]] || fail E_CONFIG 'RING_NCCL_ALGO must be an NCCL_ALGO value (Ring).'
+    [[ -z "$MESH_NCCL_ALGO" || "$MESH_NCCL_ALGO" =~ ^[A-Za-z,^]+$ ]] || fail E_CONFIG 'MESH_NCCL_ALGO must be empty or an NCCL_ALGO value.'
+    [[ "$FABRIC" =~ ^(auto|ring|mesh)$ ]] || fail E_CONFIG 'FABRIC must be auto, ring or mesh.'
     for key in MASTER_ADDR SOCKET_IFNAME NFS_SERVER1 NFS_SERVER2 NFS_SERVER3; do
       [[ -z "${!key}" || "${!key}" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail E_CONFIG "$key must be an address, host name or netdev."
     done

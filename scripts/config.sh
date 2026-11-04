@@ -74,10 +74,11 @@ ROCE="${ROCE:-on}"
 ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest shard the RDMA region holds
 
 # --- four Sparks (./start-tp4.sh, ./stop-tp4.sh; README "4 Sparks") -----------------------------------------------------
-# TP=4 over four Sparks cabled as a ring without a switch: this Spark (rank 0, the API) and WORKER, WORKER2, WORKER3
-# (ranks 1-3) in the ring's order, each cabled to the next and the last back to this one, one subnet per cable. The two
-# Sparks across the ring from each other reach each other only through a neighbour (an address routed over the cables,
-# or the LAN). start.sh never reads these; start-tp4.sh sets TP=4 itself.
+# TP=4 over four Sparks: this Spark (rank 0, the API) and WORKER, WORKER2, WORKER3 (ranks 1-3). Either cabled as a ring
+# without a switch (each to the next and the last back to this one, one subnet per cable, WORKER..WORKER3 in the ring's
+# order; the two Sparks across the ring reach each other only through a neighbour), or every Spark's ConnectX-7 port on
+# one switch (a mesh: every pair shares a RoCE subnet, any rank order). start.sh never reads these; start-tp4.sh sets
+# TP=4 itself.
 WORKER2="${WORKER2:-}"                           # rank 2's ssh target, the Spark across the ring (e.g. zurih@10.0.0.3)
 WORKER3="${WORKER3:-}"                           # rank 3's ssh target, cabled to this Spark (e.g. zurih@10.0.41.4)
 # NCCL_COMM_ID's address at TP=4 and the ranks' lines to rank 0: an address of this Spark every worker reaches (auto:
@@ -88,8 +89,13 @@ SOCKET_IFNAME="${SOCKET_IFNAME:-}"
 # TF_GLM_PREFILL_REDUCE at TP=4. The engine's default, split, sends every rank's prompt rows straight to every other
 # rank, which a ring cannot carry (the engine probes and refuses it). gather: the exchanges as all-gathers between
 # neighbours, no point-to-point sends (the qualified mode here); ring: split, its exchanges passed along the ring.
-PREFILL_REDUCE="${PREFILL_REDUCE:-gather}"
+# auto: gather on a ring, split on a switch (every rank reaches every other directly, so the engine's default applies).
+PREFILL_REDUCE="${PREFILL_REDUCE:-auto}"
 RING_NCCL_ALGO="${RING_NCCL_ALGO:-Ring}"         # NCCL_ALGO on the ring: Ring sends only to the next rank
+# FABRIC: how the four Sparks are joined. auto (default) reads it from their ConnectX-7 addresses: a ring when each Spark
+# shares a subnet with exactly two others, a switch (mesh) when every pair shares one. ring / mesh insist on that kind.
+FABRIC="${FABRIC:-auto}"
+MESH_NCCL_ALGO="${MESH_NCCL_ALGO:-}"             # NCCL_ALGO on a switch (empty: NCCL's own choice; every pair is reachable)
 # The checkpoint and drafter paths as the NFS server on this Spark exports them, when they differ from MODEL_DIR and
 # DFLASH2_DIR (an NFS server in a container exports its own view: /huggingface/... for /home/you/.cache/huggingface/...).
 NFS_MODEL_PATH="${NFS_MODEL_PATH:-}"
