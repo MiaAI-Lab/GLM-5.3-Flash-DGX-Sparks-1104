@@ -342,6 +342,13 @@ startup_report() {
   if grep -q -i 'cannot keep one state' "$f" 2>/dev/null; then
     warn W_CACHE 'Rank 0 says it cannot keep one prompt state: the prompt cache is empty at this reserve (README "Memory"). Raise MEMORY_RESERVE_GIB a little or lower CONTEXT.'
   fi
+  # At four the page pool takes whole windows before the prompt cache: eight 1M windows left 4.4 GiB a rank on GB10, and
+  # three ~275k-token conversations then evicted each other (0 of 3 resumed). Say so when the cache is small.
+  local gib
+  gib=$(grep -h -m1 -oE 'prompt cache: [0-9.]+ GiB' "$f" 2>/dev/null | grep -oE '[0-9.]+' || true)
+  if [[ -n "$gib" ]] && ! at_least "$gib" 8; then
+    warn W_CACHE_SMALL "The prompt cache is $gib GiB a rank: long conversations will not be kept between turns. With $PARALLEL streams at a $CTX-token window the pages take the room first; CONTEXT=786432 (eight streams) or PARALLEL=6 (1M) leaves the 16 GiB cache."
+  fi
 }
 
 finish_start() {

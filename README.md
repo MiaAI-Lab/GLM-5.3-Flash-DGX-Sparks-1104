@@ -255,6 +255,13 @@ dense and head, DFlash2, greedy, the same harness as above, the client on a desk
 | cold ~200K prefill beside 3 decoders | | 100.8 s, worst decode pause 2.0 s (p99 1.9 s) |
 | KV pool | 16,392 pages (8.4M tokens) | 16,392 pages (8.4M tokens), 4.4 GiB prompt cache |
 
+Memory at four: the page pool takes whole windows before the prompt cache (see Memory above), and eight 1M windows left
+a 4.4 GiB cache a rank, in which three ~275k-token conversations evicted each other (0 of 3 resumed). `CONTEXT=786432`
+with eight streams (or `PARALLEL=6` at 1M) leaves the 16 GiB cache, and the same three conversations all resume in 0.5 s;
+the launcher warns (`W_CACHE_SMALL`) when the cache is under 8 GiB. `split` prefill sends every rank's rows to every other
+rank at once, so a switch port sees three senders: check the NICs' `rx_prio*_discards` / `out_of_sequence` counters once
+after a long prompt (zero on the CRS804 at 200G). `MESH_NCCL_CROSS_NIC=0` pins rail to rail (untested; `1` measured).
+
 Same tokens as the ring: with the published checkpoint the harness's greedy hashes are the ring's (`b6ae240144bc` prose,
 `9b68d8a77151` code), drafts on or off, `split` or `gather`, and four streams equal one. The NCCL log of a
 `NCCL_DEBUG=INFO` boot shows both devices on GID 3 on every rank, no `ibv_modify_qp` retry, no socket data channel, no
@@ -299,7 +306,7 @@ dense and head, DFlash2; greedy, the same harness as the pair's numbers under [P
 Rank 0 loads 45.6 GiB; each rank's NCCL connects only to its two neighbours. Greedy replies are repeatable run to
 run and the same with drafts off; they are not the pair's tokens (a different partition rounds differently).
 
-Settings beside the pair's: `WORKER2`, `WORKER3`, `MASTER_ADDR`, `SOCKET_IFNAME`, `PREFILL_REDUCE` (`auto`: `gather` on a ring, `split` on a switch), `FABRIC` (`auto`), `MESH_NCCL_ALGO` (empty),
+Settings beside the pair's: `WORKER2`, `WORKER3`, `MASTER_ADDR`, `SOCKET_IFNAME`, `PREFILL_REDUCE` (`auto`: `gather` on a ring, `split` on a switch), `FABRIC` (`auto`), `MESH_NCCL_ALGO` (empty), `MESH_NCCL_CROSS_NIC` (`1`),
 `RING_NCCL_ALGO` (`Ring`), `NFS_MODEL_PATH`, `NFS_DFLASH2_PATH`, `NFS_SERVER1..3`. Logs: `logs/current/rank0..3.log`.
 
 ## Logs and stopping

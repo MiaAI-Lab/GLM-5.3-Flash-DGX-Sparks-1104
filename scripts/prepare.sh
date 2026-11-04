@@ -82,6 +82,7 @@ validate_config() {
     [[ "$RING_NCCL_ALGO" =~ ^[A-Za-z,^]+$ ]] || fail E_CONFIG 'RING_NCCL_ALGO must be an NCCL_ALGO value (Ring).'
     [[ -z "$MESH_NCCL_ALGO" || "$MESH_NCCL_ALGO" =~ ^[A-Za-z,^]+$ ]] || fail E_CONFIG 'MESH_NCCL_ALGO must be empty or an NCCL_ALGO value.'
     [[ "$FABRIC" =~ ^(auto|ring|mesh)$ ]] || fail E_CONFIG 'FABRIC must be auto, ring or mesh.'
+    [[ "$MESH_NCCL_CROSS_NIC" =~ ^[01]$ ]] || fail E_CONFIG 'MESH_NCCL_CROSS_NIC must be 0 or 1.'
     for key in MASTER_ADDR SOCKET_IFNAME NFS_SERVER1 NFS_SERVER2 NFS_SERVER3; do
       [[ -z "${!key}" || "${!key}" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail E_CONFIG "$key must be an address, host name or netdev."
     done

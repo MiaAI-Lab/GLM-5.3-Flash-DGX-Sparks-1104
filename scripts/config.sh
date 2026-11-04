@@ -96,6 +96,7 @@ RING_NCCL_ALGO="${RING_NCCL_ALGO:-Ring}"         # NCCL_ALGO on the ring: Ring s
 # shares a subnet with exactly two others, a switch (mesh) when every pair shares one. ring / mesh insist on that kind.
 FABRIC="${FABRIC:-auto}"
 MESH_NCCL_ALGO="${MESH_NCCL_ALGO:-}"             # NCCL_ALGO on a switch (empty: NCCL's own choice; every pair is reachable)
+MESH_NCCL_CROSS_NIC="${MESH_NCCL_CROSS_NIC:-1}"  # NCCL_CROSS_NIC on a switch: 1 lets subnet-aware routing pick the device per send; 0 pins rail to rail
 # The checkpoint and drafter paths as the NFS server on this Spark exports them, when they differ from MODEL_DIR and
 # DFLASH2_DIR (an NFS server in a container exports its own view: /huggingface/... for /home/you/.cache/huggingface/...).
 NFS_MODEL_PATH="${NFS_MODEL_PATH:-}"
