@@ -1,0 +1,1103 @@
+From eeca35866fb780a45cad874efb55673588287ca5 Mon Sep 17 00:00:00 2001
+From: Cameron Basham <cambash23@gmail.com>
+Date: Wed, 4 Nov 2026 17:12:51 -0600
+Subject: [PATCH 107/108] cuda roce: the one-shot RoCE all-gather at any world
+ on a mesh (four Sparks on a switch), with a connect probe
+
+roce.zig and roce_gather.cu were written for two ranks (Gather.init refused world != 2, Group.openRoce never asked),
+so at TP=4 every one of a decode verify call's ~90 small all-gathers (16 KiB a rank: rows x hidden x 4 bytes) rode NCCL
+Ring LL/LL128, 30-50 us each: gather_a + gather_b = 4.7 ms of a 28.3 ms call, measured with TF_GLM_PROF=1 on four GB10s
+behind a MikroTik CRS804 (NCCL 2.30, two RoCE devices a Spark, every pair of ranks on both /24s). The two-rank path did
+the same exchange in 10.4 us at 4 KiB and 17.4 us at 64 KiB against NCCL's 12.3 / 51.5.
+
+The design generalised: a rank's peers are the other ranks in rank order (peerIndex / senderOf); every rank opens one RC
+queue pair a peer an HCA (Hca.qp[peer]) and the region is recv[slot][world - 1][slot_bytes], flags[slot][world - 1][hca],
+send[slot], ctrl. post() writes the shard's stripe on each HCA to every peer on this rank's queue pair toward it, the flag
+behind it on the same queue pair; the kernel's thread tid < (world - 1) * n_hca waits for flag [slot][tid / n_hca][tid %
+n_hca] and every block copies its own shard and each peer's stripes into the output slot of the sender's rank, the layout
+ncclAllGather gives. The blob exchange and both verdicts cross the group's NCCL communicator as all-gathers (Group.gather
+already takes N ranks) instead of the two-rank swap; the cap is the minimum over every rank's. fits(), TF_ROCE,
+TF_ROCE_MAX_KB, TF_ROCE_HCA and TF_ROCE_GID_INDEX are unchanged. At world 2 (one peer) every offset, every address a NIC
+writes and every byte the kernel moves is the two-rank design's, so two Sparks keep their bits and their speed (a test
+pins the layout to the old formula).
+
+Fail closed on a fabric a ring cannot carry: the RC transitions succeed whether or not a cable reaches the peer, so after
+every rank reports its queue pairs in RTS (one all-gather), each rank RDMA-writes a token to every peer on every HCA and
+waits for its writes' completions and every peer's token (about 5 s); a far rank on a ring of four ends in a
+retry-exhausted completion or a missing token, and every rank then refuses with error.PeerUnreachable and a REFUSE TF_ROCE
+line naming the rank (set TF_ROCE=0 there), before any weight loads and instead of a kernel spinning at the first gather.
+The proxy thread starts only after the probe, so no completion queue is shared between threads. max_world is 8.
+
+The launch is unchanged: a plain stream-ordered launch after the kernel that writes its input, so the PDL chains of the
+decode path (glm_mm_reduce, the hc chain, the p2p gather) are untouched; the RoCE kernel is never a dependent launch.
+
+Exactness: an all-gather is a data move. Every rank's bytes land in the output slot of its rank, as before and as NCCL
+lays them; nothing is summed or rounded, so the verified tokens cannot change (hashes fab1d3b6894b / e71492bf766b on the
+recipe's acc.py harness, Ablit checkpoint, greedy, must repeat).
+
+Tests: roce.zig pins the two-rank layout, the four-rank slot and flag placement (no overlap, sender's rank order, both
+sides agree on every peer number), the cap over four ranks and the fabric contract (a mesh of four reaches every rank, a
+ring of four leaves rank r without rank r + 2, two on a cable are neighbours); cuda_ranks_test runs the same contract on
+its fake Fabric. `tf-cuda-test roce-gather <rank> [world]` is the microbench on real ranks (NCCL_COMM_ID): every size up to
+the cap and past it against ncclAllGather byte for byte, a captured graph replayed 64 times, 3,000 mixed-size calls (16 /
+32 / 64 KiB a rank, tiny ones between) each compared with NCCL's rows, then the time a call of each path at 4 to 64 KiB;
+its RESULT line carries the recipe's GO gate: at most 25 us a call at 32 KiB and zero mismatches. Not yet run on hardware
+(this change was written without a Zig toolchain or a Spark at hand): the gate decides before any ROCE=on boot.
+---
+ docs/roce-gather.md                      |  20 +-
+ zig/build/cuda_kernels.zig               |   2 +-
+ zig/kernels/cuda/roce_gather.cu          |  32 +-
+ zig/src/cuda/roce.zig                    | 385 ++++++++++++++++++-----
+ zig/src/cuda/tp_group.zig                |  11 +-
+ zig/src/families/glm/cuda_ranks_test.zig |  20 ++
+ zig/tests/cuda/main.zig                  |   4 +-
+ zig/tests/cuda/roce_gather_tests.zig     | 120 ++++---
+ 8 files changed, 450 insertions(+), 144 deletions(-)
+
+diff --git a/docs/roce-gather.md b/docs/roce-gather.md
+index e0ff5ae8..03b4e5ad 100644
+--- a/docs/roce-gather.md
++++ b/docs/roce-gather.md
+@@ -1,15 +1,17 @@
+-# RoCE all-gather for two ranks
++# RoCE all-gather for a group of ranks
+ 
+-One-shot all-gather between two DGX Sparks over RoCE: the GPU side of b12x's "RoCEnante" exchange (https://github.com/local-inference-lab/b12x, b12x/comm/roce, Apache License 2.0), written for two ranks. The host side (zig/src/cuda/roce.zig) owns a pinned region both GPUs and both NICs reach:
++One-shot all-gather between DGX Sparks over RoCE: the GPU side of b12x's "RoCEnante" exchange (https://github.com/local-inference-lab/b12x, b12x/comm/roce, Apache License 2.0), written for two ranks and generalised to any world whose ranks all reach each other (two on one cable; two, four or more on a switch; at most `roce.max_world` = 8). The host side (zig/src/cuda/roce.zig) owns a pinned region the GPU and the NICs reach:
+ 
+ ```
+-  recv[slot]       the peer's shard, written by the peer's NIC (2 slots of slot_bytes)
+-  flag[slot][hca]  the sequence the peer's NIC writes after its stripe on that HCA (128 bytes apart)
+-  send[slot]       this rank's shard, staged here for its NIC (2 slots)
+-  ctrl             {seq, nbytes of slot 0, nbytes of slot 1, error seq, missing hca}: the proxy's doorbell
++  recv[slot][peer]       each peer's shard, written by that peer's NIC (2 slots of world - 1 of slot_bytes)
++  flag[slot][peer][hca]  the sequence a peer's NIC writes after its stripe on that HCA (128 bytes apart)
++  send[slot]             this rank's shard, staged here for its NICs (2 slots)
++  ctrl                   {seq, nbytes of slot 0, nbytes of slot 1, error seq, missing hca, missing rank, probe tokens}
+ ```
+ 
+-One launch: (1) every block stages its share of the shard into send[seq & 1]; (2) the last block to stage publishes the slot's size and rings ctrl.seq after a system fence, and the proxy thread RDMA-writes the shard and then a flag per HCA stripe on the same queue pair (so a flag never lands before its stripe); (3) each block waits for every stripe's flag; (4) every block writes both shards in rank order (the layout NCCL's all-gather gives); (5) the last block to finish advances the device epoch, so a CUDA graph replays the exchange with new sequences. A wait past the spin limit poisons the exchange: later launches return at once and the host reports the error.
++A rank's peers are the other ranks in rank order (rank 2's peers 0, 1, 3 are its peer numbers 0, 1, 2); every rank opens one RC queue pair a peer an HCA, and at world 2 (one peer) every offset and every byte is the two-rank design's.
++
++One launch: (1) every block stages its share of the shard into send[seq & 1]; (2) the last block to stage publishes the slot's size and rings ctrl.seq after a system fence, and the proxy thread RDMA-writes the shard to every peer, each copy on this rank's queue pair toward that peer, and then a flag per HCA stripe on the same queue pair (so a flag never lands before its stripe); (3) one thread a (peer, HCA) waits for that stripe's flag, (world - 1) x HCAs of them; (4) every block writes every shard into the output slot of its rank (the layout NCCL's all-gather gives); (5) the last block to finish advances the device epoch, so a CUDA graph replays the exchange with new sequences. A wait past the spin limit poisons the exchange: later launches return at once and the host reports the error, naming the HCA and the rank whose stripe never came.
+ 
+ ## Host side
+ 
+@@ -17,8 +19,8 @@ Small all-gathers between two ranks as one-shot RDMA writes over RoCE: b12x's "R
+ 
+ ## Setup and use
+ 
+-`tp_group.Group.openRoce` brings the path up on a two-rank group: each rank opens its HCAs, and what each brings (its region, keys, queue pairs and the largest shard it would send) crosses the group's own NCCL communicator, as does each rank's verdict after connecting. Both ranks get the path or neither does (`TF_ROCE=0` on either rank keeps NCCL). From then on `Group.allGather` sends a gather of up to the smaller rank's cap (512 KiB by default) this way and leaves larger ones to NCCL; the size alone decides, so both ranks always take the same path. A rank whose buffers are not 16-byte aligned gets `error.Misaligned` instead of falling back alone. Liveness is `tp_watch`'s, as for every group.
++`tp_group.Group.openRoce` brings the path up on the group: each rank opens its HCAs and a queue pair a peer an HCA, and what each brings (its region, keys, queue pairs and the largest shard it would send) crosses the group's own NCCL communicator (an all-gather), as does each rank's verdict after connecting. Every rank gets the path or none does (`TF_ROCE=0` on any rank keeps NCCL). Then a connect probe: every rank RDMA-writes a token to every peer on every HCA and waits for its writes to complete and for every peer's token; a rank with no RDMA path to another (a ring of four without a switch, whose far ranks share no cable) fails this, and the start is refused on every rank with `error.PeerUnreachable` and a `REFUSE TF_ROCE` line naming the rank, rather than a kernel spinning at the first gather. From then on `Group.allGather` sends a gather of up to the smallest rank's cap (512 KiB by default) this way and leaves larger ones to NCCL; the size alone decides, so every rank always takes the same path. A rank whose buffers are not 16-byte aligned gets `error.Misaligned` instead of falling back alone. Liveness is `tp_watch`'s, as for every group.
+ 
+ A failed exchange writes nothing into the gathered rows. Call `Group.check` after any synchronize whose result reads a gather: it returns the error the GPU or the proxy recorded.
+ 
+-`tf-cuda-test roce-gather <rank>` runs on both ranks (NCCL_COMM_ID set): every size up to the cap and past it against NCCL's all-gather, byte for byte, then each path's time a call.
++`tf-cuda-test roce-gather <rank> [world]` runs on every rank (NCCL_COMM_ID set; world 2 by default): every size up to the cap and past it against NCCL's all-gather, byte for byte, a captured graph replayed, 3,000 mixed-size calls (16, 32 and 64 KiB a rank with tiny ones between) each against NCCL's rows, then each path's time a call at 4 to 64 KiB. Its last line, `RESULT roce-gather world N rank R: 32 KiB a rank RoCE X us a call (GO at most 25.0), 3000 mixed-size calls, M mismatch(es) (GO 0)`, is the gate a recipe reads before turning the path on at four ranks. The two-rank timings above stand; four ranks on a switch are to be measured with it.
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 711e85af..dc585857 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -114,7 +114,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
+     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
+     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
+-    .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, two ranks
++    .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, any world on a mesh
+     .{ .name = "drama3_staged_gemv", .flags = glue },
+     .{ .name = "drama3", .flags = &.{"-O3"} },
+     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
+diff --git a/zig/kernels/cuda/roce_gather.cu b/zig/kernels/cuda/roce_gather.cu
+index 832afbcf..bb7cdfce 100644
+--- a/zig/kernels/cuda/roce_gather.cu
++++ b/zig/kernels/cuda/roce_gather.cu
+@@ -1,10 +1,13 @@
+-// Two-rank one-shot RoCE all-gather after b12x (github.com/local-inference-lab/b12x, Apache-2.0): docs/roce-gather.md.
++// One-shot RoCE all-gather after b12x (github.com/local-inference-lab/b12x, Apache-2.0): docs/roce-gather.md.
++// Written for two ranks; any world whose ranks all reach each other: a receive slot and a flag a peer an HCA, each
++// peer's stripes copied into the output slot of its rank. At world 2 every address and every byte is the two-rank
++// kernel's.
+ 
+ #include <stdint.h>
+ 
+ namespace {
+ 
+-constexpr int C_SEQ = 0, C_NBYTES = 1, C_ERROR = 3, C_HCA = 4;  // ctrl words (C_NBYTES + slot)
++constexpr int C_SEQ = 0, C_NBYTES = 1, C_ERROR = 3, C_HCA = 4, C_PEER = 5;  // ctrl words (C_NBYTES + slot)
+ constexpr int FLAG_STRIDE = 128;
+ // counters (device memory, u32): epoch, poison, then stage and tail arrivals for each grid size class
+ constexpr int K_EPOCH = 0, K_POISON = 1, K_CLASSES = 4;
+@@ -46,11 +49,14 @@ __device__ __forceinline__ void fence_gpu() { asm volatile("fence.sc.gpu;" ::: "
+ 
+ }  // namespace
+ 
+-// in: this rank's shard (packs of 16 bytes); out: [rank 0's shard | rank 1's shard]. klass: log2(gridDim.x).
++// in: this rank's shard (packs of 16 bytes); out: every rank's shard in rank order (world of them). klass: log2(gridDim.x).
++// recv: [slot][world - 1][slot_bytes], a peer's shard at its number in this rank's peer list (the ranks without this
++// one, in order); flags: [slot][world - 1][n_hca] sequences, FLAG_STRIDE apart.
+ extern "C" __global__ void __launch_bounds__(512) roce_gather(
+     const uint4* __restrict__ in, uint4* __restrict__ out, int packs, int rank, char* recv, char* flags, char* send,
+-    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint32_t spin_limit, int n_hca) {
++    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint32_t spin_limit, int n_hca, int world) {
+     const int tid = threadIdx.x;
++    const int peers = world - 1;
+     uint32_t* stage = counters + 2 + klass;
+     uint32_t* tail = counters + 2 + K_CLASSES + klass;
+     if (ld_relaxed_gpu(counters + K_POISON) != 0u) return;
+@@ -69,12 +75,14 @@ extern "C" __global__ void __launch_bounds__(512) roce_gather(
+             st_relaxed_sys(ctrl + C_SEQ, seq);
+         }
+     }
+-    if (tid < n_hca) {  // 3. the peer's stripes
+-        const uint32_t* flag = reinterpret_cast<const uint32_t*>(flags + ((long long)slot * n_hca + tid) * FLAG_STRIDE);
++    if (tid < peers * n_hca) {  // 3. every peer's stripes: one thread a (peer, HCA) flag
++        const int p = tid / n_hca, h = tid - p * n_hca;
++        const uint32_t* flag = reinterpret_cast<const uint32_t*>(flags + (((long long)slot * peers + p) * n_hca + h) * FLAG_STRIDE);
+         uint32_t polls = 0;
+         while (ld_acquire_sys(flag) != seq) {
+             if (++polls >= spin_limit) {
+-                st_relaxed_sys(ctrl + C_HCA, (uint32_t)tid);
++                st_relaxed_sys(ctrl + C_HCA, (uint32_t)h);
++                st_relaxed_sys(ctrl + C_PEER, (uint32_t)(p < rank ? p : p + 1));
+                 st_relaxed_sys(ctrl + C_ERROR, seq);
+                 st_release_gpu(counters + K_POISON, seq);
+                 break;
+@@ -82,13 +90,15 @@ extern "C" __global__ void __launch_bounds__(512) roce_gather(
+         }
+     }
+     __syncthreads();
+-    if (ld_relaxed_gpu(counters + K_POISON) == 0u) {  // 4. both shards in rank order
+-        const uint4* theirs = reinterpret_cast<const uint4*>(recv + (long long)slot * slot_bytes);
++    if (ld_relaxed_gpu(counters + K_POISON) == 0u) {  // 4. every shard in rank order: this one from in, each peer's from its slot
+         uint4* own_out = out + (long long)rank * packs;
+-        uint4* peer_out = out + (long long)(1 - rank) * packs;
+         for (int i = at; i < packs; i += stride) {
+             own_out[i] = in[i];
+-            peer_out[i] = ld_relaxed_sys4(theirs + i);
++            for (int p = 0; p < peers; ++p) {
++                const int r = p < rank ? p : p + 1;
++                const uint4* theirs = reinterpret_cast<const uint4*>(recv + ((long long)slot * peers + p) * slot_bytes);
++                (out + (long long)r * packs)[i] = ld_relaxed_sys4(theirs + i);
++            }
+         }
+     }
+     fence_gpu();  // 5. the epoch, by the last block to finish
+diff --git a/zig/src/cuda/roce.zig b/zig/src/cuda/roce.zig
+index 0f0ec655..99cc9cec 100644
+--- a/zig/src/cuda/roce.zig
++++ b/zig/src/cuda/roce.zig
+@@ -1,4 +1,6 @@
+-//! Two-rank all-gathers as one-shot RoCE writes after b12x's RoCEnante (local-inference-lab/b12x, Apache-2.0).
++//! A group's small all-gathers as one-shot RoCE writes after b12x's RoCEnante (local-inference-lab/b12x, Apache-2.0):
++//! written for two ranks, since generalised to any world whose ranks all reach each other (a switch; a ring's far ranks
++//! do not), with one RC queue pair a peer an HCA, a receive slot a peer and a flag a peer an HCA.
+ 
+ const std = @import("std");
+ const platform = @import("sys");
+@@ -14,6 +16,8 @@ const kernels = @import("kernels.zig");
+ const nap = @import("roce_nap.zig");
+ 
+ const max_hcas = 2;
++pub const max_world = 8; // ranks a group may have on this path (GB10 kits are 2 or 4)
++const max_peers = max_world - 1;
+ const slots = 2;
+ const flag_stride = 128;
+ const send_depth = 256;
+@@ -23,6 +27,7 @@ const max_blocks = 8; // the largest grid; smaller shards launch fewer (a power
+ const classes = 4; // grid size classes 1, 2, 4, 8 (each its own arrival counters)
+ const idle_spins: u64 = 20_000_000; // doorbell polls before the proxy naps between them (a model's gaps are short)
+ const spin_limit: u32 = 100_000_000; // the kernel's flag polls before it gives up and poisons the exchange
++const probe_naps: u32 = 250_000; // 20 us naps a connect probe waits for every peer's token (about 5 s) before refusing
+ 
+ // -- libibverbs (the ABI of rdma-core's verbs.h; offsets checked against its headers) ---------------------------------
+ const Device = opaque {};
+@@ -146,56 +151,98 @@ fn opsCall(comptime T: type, ctx: *Context, offset: usize) T {
+     return slot.*;
+ }
+ 
+-pub const Error = error{ VerbsUnavailable, NoHca, HcaFailed, PeerRefused, ProxyFailed, ExchangeTimedOut, Misaligned };
++pub const Error = error{ VerbsUnavailable, NoHca, HcaFailed, PeerRefused, PeerUnreachable, ProxyFailed, ExchangeTimedOut, Misaligned };
+ 
+-/// TF_ROCE=0 keeps every gather on NCCL; unset or any other value asks for this path (both ranks must ask).
++/// TF_ROCE=0 keeps every gather on NCCL; unset or any other value asks for this path (every rank must ask).
+ pub fn wanted() bool {
+     const v = std.c.getenv("TF_ROCE") orelse return true;
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+ }
+ 
+-/// The peer's `mine`: both ranks' values cross the group's communicator, rank order.
+-fn swap(comptime T: type, group: *const tp_group.Group, d: *const Driver, s: Stream, mine: T) !T {
+-    var both: [2]T = undefined;
+-    try group.gather(T, d, s, mine, &both);
+-    return both[1 - group.rank];
++/// Every rank's `mine` in rank order: the values cross the group's communicator (an NCCL all-gather).
++fn exchange(comptime T: type, group: *const tp_group.Group, d: *const Driver, s: Stream, mine: T, all: *[max_world]T) ![]T {
++    const out = all[0..group.world];
++    try group.gather(T, d, s, mine, out);
++    return out;
+ }
+ 
+-// -- the region's layout (the same on both ranks) ---------------------------------------------------------------------
++/// A rank's peers in rank order, without itself: rank `peer` is this rank's peer number `peerIndex`.
++pub fn peerIndex(rank: usize, peer: usize) usize {
++    return if (peer < rank) peer else peer - 1;
++}
++
++/// The rank behind peer number `p` of `rank` (the inverse of peerIndex).
++pub fn senderOf(rank: usize, p: usize) usize {
++    return if (p < rank) p else p + 1;
++}
++
++/// The first rank `rank` cannot reach on a fabric described by `reaches` (every rank must: a ring of four leaves its
++/// far rank out), or null when every peer answers. The device probe in `Gather.probe` establishes this with one RDMA
++/// write each way; this is its contract for the fabric tests.
++pub fn firstUnreachable(rank: usize, world: usize, ctx: anytype, reaches: *const fn (@TypeOf(ctx), usize, usize) bool) ?usize {
++    for (0..world) |peer| if (peer != rank and !reaches(ctx, rank, peer)) return peer;
++    return null;
++}
++
++// -- the region's layout (the same on every rank) ---------------------------------------------------------------------
++//   recv[slot][peer][slot_bytes]       each peer's shard, written by that peer's NIC (peer: the sender's peerIndex here)
++//   flags[slot][peer][hca]             the sequence a peer's NIC writes after its stripe on that HCA (128 bytes apart)
++//   send[slot][slot_bytes]             this rank's shard, staged for its NICs
++//   ctrl                               the doorbell, sizes, error words and the connect probe's tokens
++// At world 2 (one peer) every offset is the two-rank layout's, byte for byte.
+ const Layout = struct {
+     slot_bytes: usize,
++    peers: usize,
+     recv: usize,
+     flags: usize,
+     send: usize,
+     ctrl: usize,
+     total: usize,
+ 
+-    fn of(max_bytes: usize) Layout {
++    fn of(max_bytes: usize, world: usize) Layout {
++        const peers = world - 1;
+         const s = std.mem.alignForward(usize, max_bytes, 4096);
+-        const flags = slots * s;
+-        const send = flags + slots * max_hcas * flag_stride;
++        const flags = slots * peers * s;
++        const send = flags + slots * peers * max_hcas * flag_stride;
+         const ctrl = send + slots * s;
+-        return .{ .slot_bytes = s, .recv = 0, .flags = flags, .send = send, .ctrl = ctrl, .total = ctrl + flag_stride };
++        return .{ .slot_bytes = s, .peers = peers, .recv = 0, .flags = flags, .send = send, .ctrl = ctrl, .total = ctrl + flag_stride };
++    }
++
++    /// Where peer number `p`'s shard of slot `slot` lands.
++    fn recvAt(l: Layout, slot: usize, p: usize) usize {
++        return l.recv + (slot * l.peers + p) * l.slot_bytes;
++    }
++
++    /// Where peer number `p`'s flag for HCA `h` of slot `slot` lands (`n_hca` HCAs in use: the kernel's stride).
++    fn flagAt(l: Layout, slot: usize, p: usize, h: usize, n_hca: usize) usize {
++        return l.flags + ((slot * l.peers + p) * n_hca + h) * flag_stride;
+     }
+ };
+-// ctrl words
++// ctrl words (32 of them in flag_stride bytes)
+ const c_seq = 0;
+ const c_nbytes = 1; // + slot
+ const c_error = 3;
+ const c_hca = 4;
++const c_peer = 5; // the rank whose stripe a timed-out wait missed
++const c_probe = 8; // + peer * max_hcas + hca: the connect probe's token (rank + 1) from that peer on that HCA
+ 
+-/// What a rank tells its peer to connect: its region, and per HCA its key, address and queue pair.
++comptime {
++    std.debug.assert(c_probe + max_peers * max_hcas <= flag_stride / 4);
++}
++
++/// What a rank tells the others to connect: its region, per HCA its key, address and port, and per HCA and peer the
++/// queue pair it opened toward that peer (indexed by the peer's number in this rank's list, peerIndex).
+ const Blob = extern struct {
+     ok: u32,
+     n_hca: u32,
+     slot_bytes: u64,
+-    max_bytes: u64, // the largest shard this rank would send this way (both ranks use the smaller)
++    max_bytes: u64, // the largest shard this rank would send this way (every rank uses the smallest)
+     addr: u64,
+     rkey: [max_hcas]u32,
+-    qpn: [max_hcas]u32,
+     mtu: [max_hcas]u32,
+     lid: [max_hcas]u16,
+     gid: [max_hcas][16]u8,
++    qpn: [max_hcas][max_peers]u32,
+ };
+ 
+ const Hca = struct {
+@@ -203,12 +250,12 @@ const Hca = struct {
+     pd: ?*Pd = null,
+     mr: ?*Mr = null,
+     cq: ?*Cq = null,
+-    qp: ?*Qp = null,
++    qp: [max_peers]?*Qp = @splat(null), // one RC queue pair a peer, by peerIndex
+     gid: [16]u8 = @splat(0),
+     gid_index: c_int = 0,
+     lid: u16 = 0,
+     mtu: u32 = 0,
+-    outstanding: u32 = 0,
++    outstanding: u32 = 0, // signalled writes posted on this HCA's queue pairs and not yet drained
+ };
+ 
+ pub const Gather = struct {
+@@ -217,6 +264,7 @@ pub const Gather = struct {
+     lib: platform.DynLib,
+     api: Api,
+     rank: u8,
++    world: u8,
+     hcas: [max_hcas]Hca = @splat(.{}),
+     n_hca: u32 = 0,
+     layout: Layout,
+@@ -226,8 +274,8 @@ pub const Gather = struct {
+     module: Module,
+     f: Function,
+     max_bytes: usize,
+-    peer_addr: u64 = 0,
+-    peer_rkey: [max_hcas]u32 = @splat(0),
++    peer_addr: [max_peers]u64 = @splat(0), // by peerIndex
++    peer_rkey: [max_peers][max_hcas]u32 = @splat(@splat(0)),
+     last_seq: u32 = 0,
+     running: std.atomic.Value(bool) = .init(false),
+     failed: std.atomic.Value(bool) = .init(false),
+@@ -235,48 +283,87 @@ pub const Gather = struct {
+     err: [256]u8 = @splat(0),
+     gathers: u64 = 0,
+ 
+-    /// Both ranks' exchange or null on both; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a shard.
++    /// Every rank's exchange or null on every rank; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a
++    /// shard. A rank with no RDMA path to another (a ring's far rank) is `error.PeerUnreachable` on every rank, after
++    /// a connect probe (one write each way with each peer): set TF_ROCE=0 on such a fabric.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize) !?*Gather {
+-        if (group.world != 2) return error.PeerRefused;
++        if (group.world < 2) return error.PeerRefused;
++        if (group.world > max_world) {
++            std.log.err("RoCE all-gather: {d} ranks; this path carries at most {d}", .{ group.world, max_world });
++            return error.PeerRefused;
++        }
+         const g = try gpa.create(Gather);
+         var mine: Blob = std.mem.zeroes(Blob);
+         const ok = want and blk: {
+-            g.setup(gpa, io, d, @intCast(group.rank), max_bytes) catch |e| {
++            g.setup(gpa, io, d, @intCast(group.rank), @intCast(group.world), max_bytes) catch |e| {
+                 std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
+                 break :blk false;
+             };
+             break :blk true;
+         };
+         if (ok) g.blob(&mine);
+-        const theirs = swap(Blob, group, d, s, mine) catch |e| {
++        var blobs: [max_world]Blob = undefined;
++        const all = exchange(Blob, group, d, s, mine, &blobs) catch |e| {
+             if (ok) g.teardown();
+             gpa.destroy(g);
+             return e;
+         };
+-        if (!ok or theirs.ok == 0 or theirs.n_hca != mine.n_hca or theirs.slot_bytes != mine.slot_bytes) {
++        var every = ok;
++        var caps: [max_world]u64 = undefined;
++        for (all, 0..) |b, r| {
++            if (b.ok == 0 or b.n_hca != mine.n_hca or b.slot_bytes != mine.slot_bytes) every = false;
++            caps[r] = b.max_bytes;
++        }
++        if (!every) {
+             if (ok) g.teardown();
+             gpa.destroy(g);
+             return null;
+         }
+-        g.max_bytes = agreedCap(mine.max_bytes, theirs.max_bytes); // one cap for fits on both ranks
++        g.max_bytes = agreedCap(caps[0..group.world]); // one cap for fits on every rank
+         const connected = blk: {
+-            g.connect(&theirs) catch |e| {
++            g.connect(all) catch |e| {
+                 std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
+                 break :blk false;
+             };
+             break :blk true;
+         };
+-        const peer_connected = swap(u32, group, d, s, @intFromBool(connected)) catch |e| {
++        // every rank's queue pairs are ready to receive before any rank's probe write leaves
++        var words: [max_world]u32 = undefined;
++        const ready = exchange(u32, group, d, s, @intFromBool(connected), &words) catch |e| {
+             g.teardown();
+             gpa.destroy(g);
+             return e;
+         };
+-        if (!connected or peer_connected == 0) {
++        if (!connected or std.mem.indexOfScalar(u32, ready, 0) != null) {
+             g.teardown();
+             gpa.destroy(g);
+             return null;
+         }
+-        std.log.info("RoCE all-gather: {d} HCA(s), shards up to {d} KiB by RDMA writes", .{ g.n_hca, g.max_bytes >> 10 });
++        // the connect probe: a token to every peer on every HCA, our writes completed and every peer's token in
++        const reached: u32 = blk: {
++            g.probe() catch |e| {
++                std.log.err("RoCE all-gather: {s} ({s})", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
++                break :blk 0;
++            };
++            break :blk 1;
++        };
++        const verdicts = exchange(u32, group, d, s, reached, &words) catch |e| {
++            g.teardown();
++            gpa.destroy(g);
++            return e;
++        };
++        if (std.mem.indexOfScalar(u32, verdicts, 0)) |r| {
++            g.teardown();
++            gpa.destroy(g);
++            std.log.err("REFUSE TF_ROCE: rank {d} has no RDMA path to every other rank (its log names the peer); every rank must reach every other by RoCE (a switch, or two ranks on one cable); on a ring of four without a switch set TF_ROCE=0", .{r});
++            return error.PeerUnreachable;
++        }
++        g.startProxy() catch |e| {
++            g.teardown();
++            gpa.destroy(g);
++            return e;
++        };
++        std.log.info("RoCE all-gather: {d} ranks, {d} HCA(s), shards up to {d} KiB by RDMA writes", .{ g.world, g.n_hca, g.max_bytes >> 10 });
+         return g;
+     }
+ 
+@@ -284,8 +371,8 @@ pub const Gather = struct {
+         _ = std.fmt.bufPrint(g.err[0 .. g.err.len - 1], fmt, args) catch {};
+     }
+ 
+-    fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, max_bytes: usize) !void {
+-        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .layout = .of(max_bytes), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .max_bytes = max_bytes };
++    fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, world: u8, max_bytes: usize) !void {
++        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .world = world, .layout = .of(max_bytes, world), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .max_bytes = max_bytes };
+         g.lib = platform.DynLib.open("libibverbs.so.1") catch return platform.optional_libraries.unavailable(.verbs);
+         errdefer g.lib.close();
+         const info = @typeInfo(Api).@"struct";
+@@ -312,7 +399,9 @@ pub const Gather = struct {
+ 
+     fn closeHcas(g: *Gather) void {
+         for (&g.hcas) |*x| {
+-            if (x.qp) |q| _ = g.api.ibv_destroy_qp(q);
++            for (x.qp) |maybe| if (maybe) |q| {
++                _ = g.api.ibv_destroy_qp(q);
++            };
+             if (x.cq) |q| _ = g.api.ibv_destroy_cq(q);
+             if (x.mr) |m| _ = g.api.ibv_dereg_mr(m);
+             if (x.pd) |p| _ = g.api.ibv_dealloc_pd(p);
+@@ -351,11 +440,15 @@ pub const Gather = struct {
+             g.fail("{s}: registering the pinned region failed", .{name});
+             return error.HcaFailed;
+         };
++        // one completion queue an HCA: post() keeps at most send_depth / 4 signalled writes outstanding across its
++        // queue pairs (each with its unsignalled stripe ahead of it), the probe at most one a peer
+         hca.cq = a.ibv_create_cq(hca.ctx.?, send_depth, null, null, 0) orelse return error.HcaFailed;
+-        var attr: QpInitAttr = .{ .send_cq = hca.cq, .recv_cq = hca.cq, .qp_type = qpt_rc, .cap = .{ .max_send_wr = send_depth, .max_recv_wr = 1, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 16 } };
+-        hca.qp = a.ibv_create_qp(hca.pd.?, &attr) orelse return error.HcaFailed;
+-        var init_attr: QpAttr = .{ .qp_state = qps_init, .port_num = port_num, .qp_access_flags = access_remote_write };
+-        if (a.ibv_modify_qp(hca.qp.?, &init_attr, qp_state | qp_pkey_index | qp_port | qp_access_flags) != 0) return error.HcaFailed;
++        for (0..g.world - 1) |p| { // one RC queue pair a peer, every peer's writes on their own connection
++            var attr: QpInitAttr = .{ .send_cq = hca.cq, .recv_cq = hca.cq, .qp_type = qpt_rc, .cap = .{ .max_send_wr = send_depth, .max_recv_wr = 1, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 16 } };
++            hca.qp[p] = a.ibv_create_qp(hca.pd.?, &attr) orelse return error.HcaFailed;
++            var init_attr: QpAttr = .{ .qp_state = qps_init, .port_num = port_num, .qp_access_flags = access_remote_write };
++            if (a.ibv_modify_qp(hca.qp[p].?, &init_attr, qp_state | qp_pkey_index | qp_port | qp_access_flags) != 0) return error.HcaFailed;
++        }
+     }
+ 
+     fn blob(g: *Gather, b: *Blob) void {
+@@ -367,29 +460,87 @@ pub const Gather = struct {
+         for (0..g.n_hca) |h| {
+             const x = &g.hcas[h];
+             b.rkey[h] = x.mr.?.rkey;
+-            b.qpn[h] = x.qp.?.qp_num;
+             b.mtu[h] = x.mtu;
+             b.lid[h] = x.lid;
+             b.gid[h] = x.gid;
++            for (0..g.world - 1) |p| b.qpn[h][p] = x.qp[p].?.qp_num;
+         }
+     }
+ 
+-    fn connect(g: *Gather, peer: *const Blob) !void {
+-        g.peer_addr = peer.addr;
+-        for (0..g.n_hca) |h| {
+-            const x = &g.hcas[h];
+-            g.peer_rkey[h] = peer.rkey[h];
+-            var rtr: QpAttr = .{ .qp_state = qps_rtr, .path_mtu = @min(peer.mtu[h], x.mtu), .dest_qp_num = peer.qpn[h], .max_dest_rd_atomic = 1, .min_rnr_timer = 12, .ah_attr = .{ .is_global = 1, .dlid = peer.lid[h], .port_num = port_num, .grh = .{ .dgid = peer.gid[h], .sgid_index = @intCast(x.gid_index), .hop_limit = 64 } } };
+-            if (g.api.ibv_modify_qp(x.qp.?, &rtr, qp_state | qp_av | qp_path_mtu | qp_dest_qpn | qp_rq_psn | qp_max_dest_rd_atomic | qp_min_rnr_timer) != 0) {
+-                g.fail("HCA {d}: the queue pair refused RTR", .{h});
+-                return error.PeerRefused;
++    /// Every queue pair to its peer's (the one that peer opened toward this rank, on the same HCA): RTR, then RTS.
++    fn connect(g: *Gather, all: []const Blob) !void {
++        for (0..g.world) |r| if (r != g.rank) {
++            const p = peerIndex(g.rank, r);
++            const me = peerIndex(r, g.rank); // this rank's number in that peer's list
++            const peer = &all[r];
++            g.peer_addr[p] = peer.addr;
++            for (0..g.n_hca) |h| {
++                const x = &g.hcas[h];
++                g.peer_rkey[p][h] = peer.rkey[h];
++                var rtr: QpAttr = .{ .qp_state = qps_rtr, .path_mtu = @min(peer.mtu[h], x.mtu), .dest_qp_num = peer.qpn[h][me], .max_dest_rd_atomic = 1, .min_rnr_timer = 12, .ah_attr = .{ .is_global = 1, .dlid = peer.lid[h], .port_num = port_num, .grh = .{ .dgid = peer.gid[h], .sgid_index = @intCast(x.gid_index), .hop_limit = 64 } } };
++                if (g.api.ibv_modify_qp(x.qp[p].?, &rtr, qp_state | qp_av | qp_path_mtu | qp_dest_qpn | qp_rq_psn | qp_max_dest_rd_atomic | qp_min_rnr_timer) != 0) {
++                    g.fail("HCA {d}: the queue pair toward rank {d} refused RTR", .{ h, r });
++                    return error.PeerRefused;
++                }
++                var rts: QpAttr = .{ .qp_state = qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .max_rd_atomic = 1 };
++                if (g.api.ibv_modify_qp(x.qp[p].?, &rts, qp_state | qp_timeout | qp_retry_cnt | qp_rnr_retry | qp_sq_psn | qp_max_qp_rd_atomic) != 0) {
++                    g.fail("HCA {d}: the queue pair toward rank {d} refused RTS", .{ h, r });
++                    return error.PeerRefused;
++                }
+             }
+-            var rts: QpAttr = .{ .qp_state = qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .max_rd_atomic = 1 };
+-            if (g.api.ibv_modify_qp(x.qp.?, &rts, qp_state | qp_timeout | qp_retry_cnt | qp_rnr_retry | qp_sq_psn | qp_max_qp_rd_atomic) != 0) {
+-                g.fail("HCA {d}: the queue pair refused RTS", .{h});
+-                return error.PeerRefused;
++        };
++    }
++
++    /// The connect probe, on the host before the proxy runs: this rank's token (rank + 1) RDMA-written into every
++    /// peer's ctrl on every HCA, then every write's completion (a cable no path follows ends in a retry-exhausted
++    /// completion naming the rank) and every peer's token here. Both directions of every pair are thus proven
++    /// before the first gather; a ring's far rank fails here, not in a kernel's spin.
++    fn probe(g: *Gather) !void {
++        const c = g.ctrl();
++        var token: u32 = @as(u32, g.rank) + 1;
++        for (0..g.world) |r| if (r != g.rank) {
++            const p = peerIndex(g.rank, r);
++            const me = peerIndex(r, g.rank);
++            for (0..g.n_hca) |h| {
++                const x = &g.hcas[h];
++                var sge: Sge = .{ .addr = @intFromPtr(&token), .length = 4, .lkey = 0 };
++                var wr: SendWr = .{ .wr_id = r, .sg_list = &sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr[p] + g.layout.ctrl + 4 * (c_probe + me * max_hcas + h), .rkey = g.peer_rkey[p][h] };
++                var bad: ?*SendWr = null;
++                const rc = opsCall(PostSend, x.ctx.?, ops_post_send)(x.qp[p].?, &wr, &bad);
++                if (rc != 0) {
++                    g.fail("ibv_post_send (probe to rank {d}): {d}", .{ r, rc });
++                    return error.ProxyFailed;
++                }
++                x.outstanding += 1;
+             }
++        };
++        var naps: u32 = 0;
++        while (true) {
++            var pending: u32 = 0;
++            for (0..g.n_hca) |h| {
++                g.drain(h) catch return error.PeerUnreachable; // g.err names the HCA and the write's rank (wr_id)
++                pending += g.hcas[h].outstanding;
++            }
++            var missing: ?usize = null;
++            var missing_hca: usize = 0;
++            for (0..g.world) |r| if (r != g.rank) {
++                const p = peerIndex(g.rank, r);
++                for (0..g.n_hca) |h| if (@atomicLoad(u32, &c[c_probe + p * max_hcas + h], .acquire) != r + 1) {
++                    missing = r;
++                    missing_hca = h;
++                };
++            };
++            if (pending == 0 and missing == null) return;
++            if (naps >= probe_naps) {
++                if (missing) |r| g.fail("rank {d}: no token from rank {d} on HCA {d} after about 5 s (no RDMA path between them?)", .{ g.rank, r, missing_hca }) else g.fail("rank {d}: {d} probe write(s) never completed", .{ g.rank, pending });
++                return error.PeerUnreachable;
++            }
++            nap.pause();
++            naps += 1;
+         }
++    }
++
++    fn startProxy(g: *Gather) !void {
+         g.running.store(true, .release);
+         g.thread = try std.Thread.spawn(.{}, proxy, .{g});
+     }
+@@ -406,45 +557,51 @@ pub const Gather = struct {
+         for (wc[0..@intCast(n)]) |w| {
+             if (w.status != 0) {
+                 const why = g.api.ibv_wc_status_str(w.status) orelse "?";
+-                g.fail("RDMA write on HCA {d} failed: {s} (vendor 0x{x}, seq {d})", .{ h, std.mem.span(why), w.vendor_err, g.last_seq });
++                g.fail("RDMA write on HCA {d} to rank {d} failed: {s} (vendor 0x{x}, seq {d})", .{ h, w.wr_id, std.mem.span(why), w.vendor_err, g.last_seq });
+                 return error.ProxyFailed;
+             }
+             x.outstanding -= 1;
+         }
+     }
+ 
+-    /// One sequence's shard to the peer: per HCA a stripe, then its flag (inline, signalled) on the same queue pair.
++    /// One sequence's shard to every peer: per HCA a stripe, then its flag (inline, signalled) on the same queue pair,
++    /// so a flag never lands before its stripe; each peer's copy goes on this rank's queue pair toward it.
+     fn post(g: *Gather, seq: u32, nbytes: u32) !void {
+         if (nbytes == 0 or nbytes % 16 != 0 or nbytes > g.layout.slot_bytes) {
+             g.fail("bad shard size {d} at seq {d}", .{ nbytes, seq });
+             return error.ProxyFailed;
+         }
+-        const slot: u64 = seq & 1;
++        const slot: usize = seq & 1;
++        const peers: u32 = @as(u32, g.world) - 1;
+         const base = @intFromPtr(g.region.bytes.ptr);
+         const packs = nbytes / 16;
+         var seq_copy: u32 = seq;
+         var offset: u64 = 0;
+         for (0..g.n_hca) |h| {
+             const x = &g.hcas[h];
+-            while (x.outstanding >= send_depth / 4) {
++            while (x.outstanding + peers > send_depth / 4) {
+                 try g.drain(h);
+                 if (!g.running.load(.monotonic)) return error.ProxyFailed;
+             }
+             var n = packs / g.n_hca;
+             if (h < packs % g.n_hca) n += 1;
+             const bytes: u32 = n * 16;
+-            var flag_sge: Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
+-            var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr + g.layout.flags + (slot * g.n_hca + h) * flag_stride, .rkey = g.peer_rkey[h] };
+-            var data_sge: Sge = .{ .addr = base + g.layout.send + slot * g.layout.slot_bytes + offset, .length = bytes, .lkey = x.mr.?.lkey };
+-            var data: SendWr = .{ .wr_id = h, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = wr_rdma_write, .remote_addr = g.peer_addr + g.layout.recv + slot * g.layout.slot_bytes + offset, .rkey = g.peer_rkey[h] };
+-            var bad: ?*SendWr = null;
+-            const first: *SendWr = if (bytes != 0) &data else &flag;
+-            const rc = opsCall(PostSend, x.ctx.?, ops_post_send)(x.qp.?, first, &bad);
+-            if (rc != 0) {
+-                g.fail("ibv_post_send: {d}", .{rc});
+-                return error.ProxyFailed;
+-            }
+-            x.outstanding += 1;
++            for (0..g.world) |r| if (r != g.rank) {
++                const p = peerIndex(g.rank, r);
++                const me = peerIndex(r, g.rank);
++                var flag_sge: Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
++                var flag: SendWr = .{ .wr_id = r, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr[p] + g.layout.flagAt(slot, me, h, g.n_hca), .rkey = g.peer_rkey[p][h] };
++                var data_sge: Sge = .{ .addr = base + g.layout.send + slot * g.layout.slot_bytes + offset, .length = bytes, .lkey = x.mr.?.lkey };
++                var data: SendWr = .{ .wr_id = r, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = wr_rdma_write, .remote_addr = g.peer_addr[p] + g.layout.recvAt(slot, me) + offset, .rkey = g.peer_rkey[p][h] };
++                var bad: ?*SendWr = null;
++                const first: *SendWr = if (bytes != 0) &data else &flag;
++                const rc = opsCall(PostSend, x.ctx.?, ops_post_send)(x.qp[p].?, first, &bad);
++                if (rc != 0) {
++                    g.fail("ibv_post_send (to rank {d}): {d}", .{ r, rc });
++                    return error.ProxyFailed;
++                }
++                x.outstanding += 1;
++            };
+             offset += bytes;
+         }
+         for (0..g.n_hca) |h| try g.drain(h);
+@@ -488,17 +645,19 @@ pub const Gather = struct {
+         }
+     }
+ 
+-    /// The cap both ranks test in ``fits``: the smaller of the two, which each rank's slot holds.
+-    fn agreedCap(mine: u64, theirs: u64) usize {
+-        return @intCast(@min(mine, theirs));
++    /// The cap every rank tests in ``fits``: the smallest of theirs, which each rank's slot holds.
++    fn agreedCap(caps: []const u64) usize {
++        var cap = caps[0];
++        for (caps[1..]) |c| cap = @min(cap, c);
++        return @intCast(cap);
+     }
+ 
+-    /// Whether a gather of ``bytes`` a rank goes this way: the size alone decides, so both ranks pick the same path.
++    /// Whether a gather of ``bytes`` a rank goes this way: the size alone decides, so every rank picks the same path.
+     pub fn fits(g: *const Gather, bytes: usize) bool {
+         return bytes > 0 and bytes <= g.max_bytes and bytes % 16 == 0;
+     }
+ 
+-    /// Both ranks' ``bytes`` from ``send`` into ``recv`` in rank order (as ncclAllGather); misaligned is an error.
++    /// Every rank's ``bytes`` from ``send`` into ``recv`` in rank order (as ncclAllGather); misaligned is an error.
+     pub fn gather(g: *Gather, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize) !void {
+         if (send % 16 != 0 or recv % 16 != 0) return error.Misaligned;
+         const packs = bytes / 16;
+@@ -520,6 +679,7 @@ pub const Gather = struct {
+         a.add(klass);
+         a.add(spin_limit);
+         a.add(@as(i32, @intCast(g.n_hca)));
++        a.add(@as(i32, g.world));
+         try launch.launch(g.f, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = g.d }, &a);
+         g.gathers += 1;
+     }
+@@ -529,7 +689,7 @@ pub const Gather = struct {
+         const c = g.ctrl();
+         const bad = @atomicLoad(u32, &c[c_error], .acquire);
+         if (bad == 0 and !g.failed.load(.acquire)) return;
+-        std.log.err("RoCE all-gather failed (sequence {d}, HCA {d}): {s}", .{ bad, c[c_hca], std.mem.sliceTo(&g.err, 0) });
++        std.log.err("RoCE all-gather failed (sequence {d}, HCA {d}, rank {d}): {s}", .{ bad, c[c_hca], c[c_peer], std.mem.sliceTo(&g.err, 0) });
+         return error.ProxyFailed;
+     }
+ 
+@@ -587,11 +747,78 @@ fn gidIndex(io: std.Io, gpa: std.mem.Allocator, name: []const u8) !c_int {
+     return error.NoHca;
+ }
+ 
+-test "RoCE gather: both ranks agree one cap" {
+-    // 511 KiB and 512 KiB round to the same slot; a 512 KiB shard must take the same path on both ranks
+-    try std.testing.expectEqual(Layout.of(511 << 10).slot_bytes, Layout.of(512 << 10).slot_bytes);
+-    const a = Gather.agreedCap(511 << 10, 512 << 10);
+-    const b = Gather.agreedCap(512 << 10, 511 << 10);
++test "RoCE gather: every rank agrees one cap" {
++    // 511 KiB and 512 KiB round to the same slot; a 512 KiB shard must take the same path on every rank
++    try std.testing.expectEqual(Layout.of(511 << 10, 2).slot_bytes, Layout.of(512 << 10, 2).slot_bytes);
++    const a = Gather.agreedCap(&.{ 511 << 10, 512 << 10 });
++    const b = Gather.agreedCap(&.{ 512 << 10, 511 << 10 });
+     try std.testing.expectEqual(a, b);
+     try std.testing.expectEqual(@as(usize, 511 << 10), a);
++    // four ranks: the smallest, wherever it sits
++    try std.testing.expectEqual(@as(usize, 64 << 10), Gather.agreedCap(&.{ 4096 << 10, 512 << 10, 64 << 10, 4096 << 10 }));
++}
++
++test "RoCE gather: two ranks keep the two-rank region, byte for byte" {
++    for ([_]usize{ 16, 4096, 64 << 10, 512 << 10, 4096 << 10 }) |max_bytes| {
++        const l = Layout.of(max_bytes, 2);
++        // the layout before any world: recv[2][s], flags[2][max_hcas], send[2][s], ctrl
++        const s = std.mem.alignForward(usize, max_bytes, 4096);
++        try std.testing.expectEqual(@as(usize, 0), l.recv);
++        try std.testing.expectEqual(slots * s, l.flags);
++        try std.testing.expectEqual(slots * s + slots * max_hcas * flag_stride, l.send);
++        try std.testing.expectEqual(l.send + slots * s, l.ctrl);
++        try std.testing.expectEqual(l.ctrl + flag_stride, l.total);
++        for (0..slots) |slot| {
++            try std.testing.expectEqual(slot * s, l.recvAt(slot, 0));
++            for (0..max_hcas) |h| try std.testing.expectEqual(l.flags + (slot * 2 + h) * flag_stride, l.flagAt(slot, 0, h, 2));
++        }
++    }
++}
++
++test "RoCE gather: four ranks' slots and flags never overlap and sit in the sender's rank order" {
++    const l = Layout.of(16 << 10, 4);
++    try std.testing.expectEqual(@as(usize, 3), l.peers);
++    try std.testing.expectEqual(slots * 3 * l.slot_bytes, l.flags);
++    try std.testing.expect(l.flags + slots * 3 * max_hcas * flag_stride == l.send);
++    for (0..4) |rank| {
++        for (0..4) |r| if (r != rank) {
++            const p = peerIndex(rank, r);
++            try std.testing.expect(p < 3);
++            try std.testing.expectEqual(r, senderOf(rank, p));
++            // what rank r writes here lands where this rank reads peer p: the same number on both sides
++            try std.testing.expectEqual(p, peerIndex(rank, senderOf(rank, p)));
++        };
++        // the three peers of a rank are numbered 0, 1, 2 without a gap
++        var seen: [3]bool = @splat(false);
++        for (0..4) |r| if (r != rank) {
++            seen[peerIndex(rank, r)] = true;
++        };
++        for (seen) |x| try std.testing.expect(x);
++    }
++    for (0..slots) |slot| for (0..3) |p| {
++        const at = l.recvAt(slot, p);
++        try std.testing.expect(at + l.slot_bytes <= l.flags);
++        for (0..3) |q| if (q != p) try std.testing.expect(l.recvAt(slot, q) >= at + l.slot_bytes or l.recvAt(slot, q) + l.slot_bytes <= at);
++        for (0..2) |h| {
++            const f = l.flagAt(slot, p, h, 2);
++            try std.testing.expect(f >= l.flags and f + flag_stride <= l.send);
++        }
++    };
++    try std.testing.expect(@sizeOf(Blob) % 8 == 0);
++}
++
++test "RoCE gather: a mesh reaches every rank, a ring of four leaves the far rank out, two on a cable are neighbours" {
++    const Fabric = struct {
++        fn ring(world: usize, rank: usize, peer: usize) bool {
++            return (peer + 1) % world == rank or (rank + 1) % world == peer;
++        }
++        fn mesh(_: usize, _: usize, _: usize) bool {
++            return true;
++        }
++    };
++    for (0..4) |r| try std.testing.expectEqual(@as(?usize, null), firstUnreachable(r, 4, @as(usize, 4), &Fabric.mesh));
++    try std.testing.expectEqual(@as(?usize, 2), firstUnreachable(0, 4, @as(usize, 4), &Fabric.ring));
++    try std.testing.expectEqual(@as(?usize, 3), firstUnreachable(1, 4, @as(usize, 4), &Fabric.ring));
++    try std.testing.expectEqual(@as(?usize, 0), firstUnreachable(2, 4, @as(usize, 4), &Fabric.ring));
++    for (0..2) |r| try std.testing.expectEqual(@as(?usize, null), firstUnreachable(r, 2, @as(usize, 2), &Fabric.ring));
+ }
+diff --git a/zig/src/cuda/tp_group.zig b/zig/src/cuda/tp_group.zig
+index 0c8b82ed..237dcf9f 100644
+--- a/zig/src/cuda/tp_group.zig
++++ b/zig/src/cuda/tp_group.zig
+@@ -1,4 +1,5 @@
+-//! A tensor-parallel group over NCCL (NCCL_COMM_ID; rows in rank order); two ranks add RoCE small gathers (roce.zig).
++//! A tensor-parallel group over NCCL (NCCL_COMM_ID; rows in rank order); ranks that all reach each other by RoCE add
++//! small gathers as one-shot RDMA writes (roce.zig).
+ const std = @import("std");
+ const nccl = @import("nccl.zig");
+ const driver = @import("driver.zig");
+@@ -17,7 +18,7 @@ pub const Group = struct {
+     rank: usize,
+     world: usize,
+     aborted: std.atomic.Value(bool) = .init(false),
+-    fast: ?*roce.Gather = null, // two ranks' small all-gathers by RoCE writes (openRoce), when both ranks brought it up
++    fast: ?*roce.Gather = null, // the ranks' small all-gathers by RoCE writes (openRoce), when every rank brought it up
+     p2p: ?*p2p_gather.Gather = null, // two ranks on one host: one stream's small all-gathers by peer stores (openP2p)
+ 
+     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
+@@ -60,9 +61,11 @@ pub const Group = struct {
+         g.p2p = try p2p_gather.Gather.open(gpa, d, g, s, f, wanted, cap, timeout_ns);
+     }
+ 
+-    /// Two ranks: gathers up to `max_bytes` a rank go by RoCE writes if both ranks bring it up; else NCCL keeps them.
++    /// Gathers up to `max_bytes` a rank go by RoCE writes if every rank brings it up; else NCCL keeps them. Every rank
++    /// must reach every other by RoCE (two on a cable, or any number on a switch): a connect probe refuses a fabric
++    /// where one does not (a ring of four without a switch) with `error.PeerUnreachable`; TF_ROCE=0 keeps NCCL there.
+     pub fn openRoce(g: *Group, gpa: std.mem.Allocator, io: std.Io, d: *const driver.Driver, s: Stream, max_bytes: usize) !void {
+-        if (g.world != 2 or g.fast != null) return;
++        if (g.world < 2 or g.fast != null) return;
+         g.fast = try roce.Gather.init(gpa, io, d, g, s, roce.wanted(), max_bytes);
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index cb611385..f34cab40 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -156,6 +156,26 @@ test "a direct split start on a ring of four without a switch is refused before
+     for (0..2) |r| try std.testing.expectEqual(@as(usize, 2), try Fabric.probe(.{}, r, 2, false));
+ }
+ 
++test "RoCE all-gather on this fabric: a mesh of four reaches every rank; a ring of four leaves the far rank out" {
++    const Reach = struct {
++        fn reaches(_: void, rank: usize, peer: usize) bool {
++            Fabric.rank = rank;
++            return Fabric.reaches(@intCast(peer));
++        }
++    };
++    // behind a switch every rank is a peer's one RDMA write away: the RoCE path (Group.openRoce) comes up on all four
++    Fabric.world = 4;
++    Fabric.switched = true;
++    for (0..4) |r| try std.testing.expectEqual(@as(?usize, null), cuda.roce.firstUnreachable(r, 4, {}, &Reach.reaches));
++    // a ring of four without a switch: each rank's far rank has no path, so the connect probe must refuse (the launcher
++    // keeps TF_ROCE=0 on a ring; the engine's probe is the backstop)
++    Fabric.switched = false;
++    for (0..4) |r| try std.testing.expectEqual(@as(?usize, (r + 2) % 4), cuda.roce.firstUnreachable(r, 4, {}, &Reach.reaches));
++    // two ranks on one cable are each other's neighbours: the two-rank path as before
++    Fabric.world = 2;
++    for (0..2) |r| try std.testing.expectEqual(@as(?usize, null), cuda.roce.firstUnreachable(r, 2, {}, &Reach.reaches));
++}
++
+ test "a ring start on four ranks that reach only their neighbours loads without the all-peer probe" {
+     var problem: []const u8 = "";
+     const ring = try Settings.read(&ringed, &problem);
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 3b5920b8..0c745206 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -152,7 +152,7 @@ const usage =
+     \\  cublaslt                  bf16 GEMM through cuBLASLt against an fp64 reference
+     \\  nccl                      one-rank NCCL all-reduce and all-gather
+     \\  rank-scatter <rank> <n> [id]  rank-order reduce-scatter (NCCL_COMM_ID or an id file) against an all-gather
+-    \\  roce-gather <rank>        two ranks (NCCL_COMM_ID): the RoCE all-gather against NCCL's, graph replays, time a call
++    \\  roce-gather <rank> [world]  the RoCE all-gather against NCCL's (NCCL_COMM_ID; world 2 by default, any on a switch): every size, graph replays, 3000 mixed calls, time a call
+     \\  rank-sum                  the reduce-scatter's sum kernel alone, 2 to 5 ranks as each rank (one GPU, no NCCL)
+     \\  nccl-pair <rank> <world> <idfile>  one rank of a multi-host communicator: send/recv with every peer, all-reduce, all-gather
+     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
+@@ -362,7 +362,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+         const world = try std.fmt.parseInt(usize, try arg(rest, 1), 10);
+         return rank_scatter_tests.run(gpu, rank, world, if (rest.len > 2) rest[2] else null);
+     }
+-    if (std.mem.eql(u8, cmd, "roce-gather")) return roce_gather_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
++    if (std.mem.eql(u8, cmd, "roce-gather")) return roce_gather_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10), if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 2);
+     if (std.mem.eql(u8, cmd, "rank-sum")) return rank_scatter_tests.sum(gpu);
+     if (std.mem.eql(u8, cmd, "nccl-pair")) return libs_tests.ncclPair(gpu, try std.fmt.parseInt(c_int, try arg(rest, 0), 10), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try arg(rest, 2));
+     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
+diff --git a/zig/tests/cuda/roce_gather_tests.zig b/zig/tests/cuda/roce_gather_tests.zig
+index 2232ac2c..620230cb 100644
+--- a/zig/tests/cuda/roce_gather_tests.zig
++++ b/zig/tests/cuda/roce_gather_tests.zig
+@@ -1,4 +1,5 @@
+-//! Two ranks' RoCE all-gather (Group.openRoce) against NCCL's byte for byte, graph replays, time a call (NCCL_COMM_ID).
++//! The group's RoCE all-gather (Group.openRoce) against NCCL's byte for byte at any world (NCCL_COMM_ID): every size,
++//! graph replays, 3,000 mixed-size calls, then the time a call of each path. `tf-cuda-test roce-gather <rank> [world]`.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const check = @import("check.zig");
+@@ -6,11 +7,18 @@ const Gpu = check.Gpu;
+ 
+ const cap = 512 << 10;
+ /// Shards a rank: tiny, a few decode rows, the cap, and past it or not a multiple of 16 (those stay on NCCL).
+-const sizes = [_]usize{ 16, 48, 4096, 8192, 32768, 65536, 262144, cap, cap + 16, 100 };
++const sizes = [_]usize{ 16, 48, 4096, 8192, 16384, 32768, 65536, 262144, cap, cap + 16, 100 };
+ const seeds = [_]u64{ 1, 2, 3 };
+ const graph_gathers = 4;
+ const graph_replays = 64;
+ const reps = 2000;
++/// The mixed phase: decode-sized shards (a verify call's gathers are 16 KiB a rank at four ranks, the drafter's up to
++/// 64 KiB) with a few tiny ones between, every call against NCCL's rows. The recipe's GO gate: zero mismatches.
++const mixed_calls = 3000;
++const mixed_sizes = [_]usize{ 16384, 32768, 65536, 16384, 32768, 65536, 4096, 16 };
++/// The recipe's GO gate on time: a 32 KiB-a-rank gather in at most this many microseconds (printed, not failed: the
++/// bytes decide pass or fail, the launcher decides on the time).
++const go_us_32k: f64 = 25.0;
+ 
+ /// Rank `rank`'s shard for a case: bytes that differ by rank, size and seed.
+ fn shard(out: []u8, seed: u64, rank: usize) void {
+@@ -18,83 +26,85 @@ fn shard(out: []u8, seed: u64, rank: usize) void {
+     rng.random().bytes(out);
+ }
+ 
+-pub fn run(gpu: Gpu, rank: usize) !void {
++/// Every rank's shard of `n` bytes for `seed`, in rank order: what both all-gathers must produce.
++fn expected(want: []u8, n: usize, seed: u64, world: usize) void {
++    for (0..world) |r| shard(want[r * n ..][0..n], seed, r);
++}
++
++pub fn run(gpu: Gpu, rank: usize, world: usize) !void {
+     const a = gpu.gpa;
+     try check.expect(std.c.getenv("NCCL_COMM_ID") != null, "roce-gather: NCCL_COMM_ID names rank 0's address", .{});
++    try check.expect(world >= 2 and rank < world, "roce-gather: rank {d} of world {d}", .{ rank, world });
+     var s = try cuda.Stream.init(gpu.d, false);
+     defer s.deinit();
+-    var g = try cuda.tp_group.Group.open(gpu.d, rank, 2);
++    var g = try cuda.tp_group.Group.open(gpu.d, rank, world);
+     defer g.close();
+     try g.openRoce(a, gpu.io, gpu.d, s, cap);
+-    try check.expect(g.fast != null, "roce-gather: the RoCE path did not come up on both ranks (see the warning above)", .{});
++    try check.expect(g.fast != null, "roce-gather: the RoCE path did not come up on every rank (see the warning above)", .{});
+ 
+     const most = sizes[std.mem.indexOfMax(usize, &sizes)];
+     var mine = try cuda.DeviceBuffer.alloc(gpu.d, most);
+     defer mine.free();
+-    var by_group = try cuda.DeviceBuffer.alloc(gpu.d, 2 * most);
++    var by_group = try cuda.DeviceBuffer.alloc(gpu.d, world * most);
+     defer by_group.free();
+-    var by_nccl = try cuda.DeviceBuffer.alloc(gpu.d, 2 * most);
++    var by_nccl = try cuda.DeviceBuffer.alloc(gpu.d, world * most);
+     defer by_nccl.free();
+     const host = try a.alloc(u8, most);
+     defer a.free(host);
+-    const peer = try a.alloc(u8, most);
+-    defer a.free(peer);
+-    const got = try a.alloc(u8, 2 * most);
++    const got = try a.alloc(u8, world * most);
+     defer a.free(got);
+-    const want = try a.alloc(u8, 2 * most);
++    const want = try a.alloc(u8, world * most);
+     defer a.free(want);
+ 
+     var by_roce: usize = 0;
+     for (sizes) |n| for (seeds) |seed| {
+         shard(host[0..n], seed, rank);
+-        shard(peer[0..n], seed, 1 - rank);
+         try mine.upload(0, host[0..n]);
+         try g.allGather(s, mine.ptr, by_group.ptr, n);
+         try g.lib.check(g.lib.api.ncclAllGather(mine.ptr, by_nccl.ptr, n, .u8, g.comm, s.handle), "ncclAllGather");
+         try s.synchronize();
+         try g.check();
+-        @memcpy(want[rank * n ..][0..n], host[0..n]);
+-        @memcpy(want[(1 - rank) * n ..][0..n], peer[0..n]);
+-        try by_group.download(0, got[0 .. 2 * n]);
+-        try check.sameBytes("group all-gather against both ranks' shards", got[0 .. 2 * n], want[0 .. 2 * n]);
+-        try by_nccl.download(0, got[0 .. 2 * n]);
+-        try check.sameBytes("NCCL all-gather against both ranks' shards", got[0 .. 2 * n], want[0 .. 2 * n]);
++        expected(want, n, seed, world);
++        try by_group.download(0, got[0 .. world * n]);
++        try check.sameBytes("group all-gather against every rank's shard", got[0 .. world * n], want[0 .. world * n]);
++        try by_nccl.download(0, got[0 .. world * n]);
++        try check.sameBytes("NCCL all-gather against every rank's shard", got[0 .. world * n], want[0 .. world * n]);
+         if (g.fast.?.fits(n)) by_roce += 1;
+     };
+-    check.pass("roce-gather rank {d}: shards of {any} bytes (seeds 1-3) equal NCCL's all-gather; {d} of {d} cases by RoCE", .{ rank, sizes, by_roce, sizes.len * seeds.len });
++    check.pass("roce-gather rank {d} of {d}: shards of {any} bytes (seeds 1-3) equal NCCL's all-gather; {d} of {d} cases by RoCE", .{ rank, world, sizes, by_roce, sizes.len * seeds.len });
+ 
+-    try replays(gpu, &g, s, rank);
+-    try timing(gpu, &g, s, rank);
++    try replays(gpu, &g, s, rank, world);
++    const mismatches = try mixed(gpu, &g, s, rank, world, mine, by_group, by_nccl, host, got, want);
++    const us_32k = try timing(gpu, &g, s, rank, world);
++    std.debug.print("RESULT roce-gather world {d} rank {d}: 32 KiB a rank RoCE {d:.1} us a call (GO at most {d:.1}), {d} mixed-size calls, {d} mismatch(es) (GO 0)\n", .{ world, rank, us_32k, go_us_32k, mixed_calls, mismatches });
++    try check.expect(mismatches == 0, "roce-gather rank {d}: {d} of {d} mixed-size calls differed from NCCL's rows", .{ rank, mismatches, mixed_calls });
+ }
+ 
+ /// A graph of `graph_gathers` RoCE gathers replayed with new shards each time: each replay's rows are its own.
+-fn replays(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize) !void {
++fn replays(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize, world: usize) !void {
+     const a = gpu.gpa;
+     const n = 8192;
+     var mine = try cuda.DeviceBuffer.alloc(gpu.d, graph_gathers * n);
+     defer mine.free();
+-    var all = try cuda.DeviceBuffer.alloc(gpu.d, graph_gathers * 2 * n);
++    var all = try cuda.DeviceBuffer.alloc(gpu.d, graph_gathers * world * n);
+     defer all.free();
+     try cuda.graph.beginCapture(s, .thread_local);
+-    for (0..graph_gathers) |i| try g.allGather(s, mine.ptr + i * n, all.ptr + i * 2 * n, n);
++    for (0..graph_gathers) |i| try g.allGather(s, mine.ptr + i * n, all.ptr + i * world * n, n);
+     var captured = try cuda.graph.endCapture(s);
+     defer captured.deinit();
+     var exec = try captured.instantiate();
+     defer exec.deinit();
+     const host = try a.alloc(u8, graph_gathers * n);
+     defer a.free(host);
+-    const peer = try a.alloc(u8, graph_gathers * n);
+-    defer a.free(peer);
+-    const got = try a.alloc(u8, graph_gathers * 2 * n);
++    const got = try a.alloc(u8, graph_gathers * world * n);
+     defer a.free(got);
+-    const want = try a.alloc(u8, graph_gathers * 2 * n);
++    const want = try a.alloc(u8, graph_gathers * world * n);
+     defer a.free(want);
+     for (0..graph_replays) |r| {
+         for (0..graph_gathers) |i| {
+-            shard(host[i * n ..][0..n], 100 + r * graph_gathers + i, rank);
+-            shard(peer[i * n ..][0..n], 100 + r * graph_gathers + i, 1 - rank);
+-            @memcpy(want[i * 2 * n + rank * n ..][0..n], host[i * n ..][0..n]);
+-            @memcpy(want[i * 2 * n + (1 - rank) * n ..][0..n], peer[i * n ..][0..n]);
++            const seed = 100 + r * graph_gathers + i;
++            shard(host[i * n ..][0..n], seed, rank);
++            expected(want[i * world * n ..][0 .. world * n], n, seed, world);
+         }
+         try mine.upload(0, host);
+         try exec.launchOn(s);
+@@ -103,20 +113,52 @@ fn replays(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize) !void
+         try all.download(0, got);
+         try check.sameBytes("a replayed graph's gathers", got, want);
+     }
+-    check.pass("roce-gather rank {d}: a captured graph of {d} gathers of {d} bytes replayed {d} times, each replay's rows its own", .{ rank, graph_gathers, n, graph_replays });
++    check.pass("roce-gather rank {d} of {d}: a captured graph of {d} gathers of {d} bytes replayed {d} times, each replay's rows its own", .{ rank, world, graph_gathers, n, graph_replays });
+ }
+ 
+-/// Median microseconds a call of `reps` back-to-back gathers, RoCE against NCCL, at decode-sized shards.
+-fn timing(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize) !void {
++/// `mixed_calls` gathers of cycling decode sizes, each by the group (RoCE) and by NCCL, every call's rows compared to
++/// the expected shards and to each other; the count of calls that differed (the GO gate wants zero).
++fn mixed(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize, world: usize, mine: cuda.DeviceBuffer, by_group: cuda.DeviceBuffer, by_nccl: cuda.DeviceBuffer, host: []u8, got: []u8, want: []u8) !usize {
++    _ = gpu;
++    var mismatches: usize = 0;
++    var by_roce: usize = 0;
++    for (0..mixed_calls) |i| {
++        const n = mixed_sizes[i % mixed_sizes.len];
++        const seed: u64 = 10_000 + i;
++        shard(host[0..n], seed, rank);
++        try mine.upload(0, host[0..n]);
++        try g.allGather(s, mine.ptr, by_group.ptr, n);
++        try g.lib.check(g.lib.api.ncclAllGather(mine.ptr, by_nccl.ptr, n, .u8, g.comm, s.handle), "ncclAllGather");
++        try s.synchronize();
++        try g.check();
++        expected(want, n, seed, world);
++        try by_group.download(0, got[0 .. world * n]);
++        const group_ok = std.mem.eql(u8, got[0 .. world * n], want[0 .. world * n]);
++        try by_nccl.download(0, got[0 .. world * n]);
++        const nccl_ok = std.mem.eql(u8, got[0 .. world * n], want[0 .. world * n]);
++        if (!group_ok or !nccl_ok) {
++            mismatches += 1;
++            if (mismatches <= 8) std.debug.print("FAIL roce-gather rank {d}: call {d} ({d} bytes a rank): group {s}, NCCL {s}\n", .{ rank, i, n, if (group_ok) "ok" else "differs", if (nccl_ok) "ok" else "differs" });
++        }
++        if (g.fast.?.fits(n)) by_roce += 1;
++    }
++    check.pass("roce-gather rank {d} of {d}: {d} mixed-size calls ({any} bytes a rank, cycling), {d} by RoCE, {d} mismatch(es) against NCCL's rows", .{ rank, world, mixed_calls, mixed_sizes, by_roce, mismatches });
++    return mismatches;
++}
++
++/// Median microseconds a call of `reps` back-to-back gathers, RoCE against NCCL, at decode-sized shards; the RoCE
++/// figure at 32 KiB a rank.
++fn timing(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize, world: usize) !f64 {
+     var t0 = try cuda.Event.init(gpu.d, true);
+     defer t0.deinit();
+     var t1 = try cuda.Event.init(gpu.d, true);
+     defer t1.deinit();
+     var mine = try cuda.DeviceBuffer.alloc(gpu.d, 65536);
+     defer mine.free();
+-    var all = try cuda.DeviceBuffer.alloc(gpu.d, 2 * 65536);
++    var all = try cuda.DeviceBuffer.alloc(gpu.d, world * 65536);
+     defer all.free();
+-    for ([_]usize{ 4096, 8192, 32768, 65536 }) |n| {
++    var at_32k: f64 = 0;
++    for ([_]usize{ 4096, 8192, 16384, 32768, 65536 }) |n| {
+         var us: [2]f64 = undefined;
+         for (0..2) |which| {
+             for (0..2) |round| { // the first round warms
+@@ -130,6 +172,8 @@ fn timing(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize) !void
+             }
+         }
+         try g.check();
+-        check.pass("roce-gather rank {d}: {d} bytes a rank, {d} calls: RoCE {d:.1} us a call, NCCL {d:.1} us", .{ rank, n, reps, us[0], us[1] });
++        if (n == 32768) at_32k = us[0];
++        check.pass("roce-gather rank {d} of {d}: {d} bytes a rank, {d} calls: RoCE {d:.1} us a call, NCCL {d:.1} us", .{ rank, world, n, reps, us[0], us[1] });
+     }
++    return at_32k;
+ }
+-- 
+2.56.0
+
