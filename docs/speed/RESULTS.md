@@ -1597,3 +1597,58 @@ Decode +46% at one stream, +48% at four, +55% at eight; prefill about the pair's
 hops). Available memory after the benches: spark1 12.2 GiB, spark2 14.0, spark3 11.9, spark4 14.2. Not measured yet:
 PREFILL_REDUCE=ring (the split prefill's rows passed along the ring; the engine's own neighbours-only mode) against
 gather, sampled decode at T=0.7, and a long soak. 0106 is in patches/engine; the served image is 74e19a63a9a5 on all four Sparks (daa6f2cde063 is the same code under the earlier label).
+
+## TP=4 on a switch: FABRIC=mesh, five boots, the ring's hashes reproduced (2026-11-04, 14:20-16:00 CST, another kit)
+
+**The kit.** Four DGX Sparks (spark-6f90 rank 0, spark-de02, spark-8fe0, spark-8458), each with one 200G cable to a
+MikroTik CRS804-4DDQ; a port and its PCIe twin addressed on 192.168.120.0/24 and 192.168.121.0/24, MTU 9000, RoCE v2 GID 3
+on every device; every pair of Sparks shares both subnets, so `detect_ring` as shipped stops with "Every pair of these four
+Sparks shares a RoCE subnet (a switch)". Weights: the Ablit checkpoint `57edefd2` (and, for the hash check, the published
+`078455ff`, byte-identical to the pin as recorded above) served from flat hard-linked copies of the Hub blobs on every
+Spark (`WORKER_WEIGHTS=check`; a snapshot directory is symlinks into `../../blobs`, which dangle inside the container:
+boot 1 stopped at `cannot read /model/tokenizer.json`). Image `74e19a63a9a5` built on rank 0 (12 min) and shipped.
+`PARALLEL=8`, `CONTEXT=auto` (1,048,576 fit first try), `KV=fp8`, `DENSE=q8`, `HEAD=q8`, reserve 12 GiB, thinking off.
+
+**What was changed** (`FABRIC=auto|ring|mesh`): `detect_ring` calls a fabric with no missing pair a mesh (an explicit
+`FABRIC=ring` or `mesh` that disagrees fails); on a mesh `ring_graphs` writes nothing and `tp4_rank_env` sets
+`NCCL_CROSS_NIC=1`, `NCCL_IB_SUBNET_AWARE_ROUTING=1`, `NCCL_IB_SUBNET_PREFIX_LEN` from `pair_links` (24 here),
+`NCCL_IB_MERGE_NICS=0`, `NCCL_P2P_DISABLE=1`, `NCCL_SHM_DISABLE=1`, the channel count, and nothing else: no graph file, no
+`NCCL_ALGO` (`MESH_NCCL_ALGO` pins one), no `NCCL_RUNTIME_CONNECT` (eager connect, the engine's default; every edge is
+reachable). `NCCL_SOCKET_IFNAME` stays on rank 0 only. `PREFILL_REDUCE=auto` resolves to `split` on a mesh and `gather` on
+a ring; the launcher reads the fabric before the banner and keys the context fit on it. A ring runs exactly as before.
+
+**Pre-registered gates** (an advisor's review of the patch before the first boot): GO-1 boot: NET/IB to every peer on
+every rank, no `ibv_modify_qp` retry, no NET/Socket channel, no queue pair between the two subnets, rank 0's line with 8
+streams and a prompt cache; GO-2 correctness: greedy `token_sha` repeats, drafts on == off, 4 streams == 1, `split` ==
+`gather`, and on the published checkpoint the ring's hashes above (`b6ae240144bc`, `9b68d8a77151`). KILL: a cross-subnet
+queue pair, a rank that exits, a hash that differs between greedy runs. Speed recorded, not gated.
+
+**Boots (all with the patch; `./start-tp4.sh restart`):**
+
+| Boot | Settings | Result |
+|---|---|---|
+| 2 | Ablit, split, NCCL algo unset | LIVE in 121.8 s (digest 44.7 s); `p2p: NCCL transport: rank N NET/IB (12 connections)` to every peer on every rank; 8 streams, 16,392 pages, **4.4 GiB** prompt cache; smoke `ready`. acc.py: prose 53.8 (`fab1d3b6894b`), code 83.0 (`e71492bf766b`), 4 streams 117.6-122.4, both reps equal |
+| 3 | gather, `NCCL_DEBUG=INFO,SUBSYS=INIT,NET,GRAPH,ENV` | LIVE 77.2 s (warm). Every rank `Using [0]rocep1s0f0:1/RoCE [1]roceP2p1s0f0:1/RoCE`, two virtual devices of one physical each, 12 QP lines all GID 3, 0 `modify_qp`, 0 NET/Socket, 0 QPs 120↔121, sends 6/6 over NET/IB/0 and /1, rings and trees connected (the trees span non-neighbours, as a mesh allows). **GO-1 met.** acc.py: same hashes, 53.5 / 82.6. Prompt cache 3.8 GiB |
+| 4 | split, `MESH_NCCL_ALGO=Ring` | same hashes, 53.6 / 82.5, 4 streams 120.6-124.2: no difference, `NCCL_ALGO` stays unset |
+| 5 | `DRAFTER=none` | same hashes; 44.0 tok/s serial (22.7 ms a round) |
+| 6 | **published `078455ff`, gather** | **`b6ae240144bc` / `9b68d8a77151`, the ring's hashes**; 55.6 / 83.2 tok/s (ring: 56.0-56.2 / 84.5-85.3), 4 streams 119.9 |
+
+**GO-2 met.** The fabric does not change the arithmetic: gathers are exact and the hashes are the ring's.
+
+**Speed (greedy; the lab's harness and the site's own battery, client on a desktop over 1 GbE):**
+
+| | ring (above) | switch, split | switch, gather |
+|---|---:|---:|---:|
+| 1 stream prose / code | 56.0-56.2 / 84.5-85.3 | 55.6 / 83.2 (published), 53.8 / 83.0 (Ablit) | 53.5 / 82.6 |
+| 4 streams prose total | 115-120 | 117.6-124.2 | 119.2-121.3 |
+| 8 streams prose total | 163-166 | 162.7 (site battery, T=0) | |
+| prefill 6K / 25K / 51K / 100K tok/s | 1,752 (16K) / 1,889 (64K) | **2,070 / 2,421 / 2,462 / 2,457** | 1,498 / 1,865 / 1,878 / 1,882 |
+| cold ~200K prefill beside 3 decoders | | 100.8 s; worst pause 2.02 s, p99 1.86 s | |
+| 4 prompts concurrent == solo at T=0 | | 4/4 | |
+
+Decode equals the ring's; `split`, which a ring cannot carry, prefills ~30% faster than `gather`. The 2 s decode pause
+during a cold prefill is the 4,096-row prompt chunk (the ring's mixed1 showed 2.6 s). With drafts off, four streams
+decoded at 91 ms a round against 22.7 ms for one (no batching gain without drafts; noted, not pursued).
+
+**Open:** a four-rank RoCE all-gather (roce.zig is two-rank) would take the decode-sized exchanges off NCCL on a mesh;
+`NCCL_CROSS_NIC=0` (rail-only) and 8 channels are untried A/Bs; `DENSE=q4` was not tried (rejected on quality above).

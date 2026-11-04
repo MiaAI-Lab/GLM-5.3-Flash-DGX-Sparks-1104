@@ -161,7 +161,7 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `WORKER` | **required** | The second Spark's ssh target on the direct link, e.g. `zurih@10.0.34.4` |
-| `TP` | `2` | Two Sparks with `./start.sh`; four cabled as a ring with `./start-tp4.sh` (below) |
+| `TP` | `2` | Two Sparks with `./start.sh`; four, cabled as a ring or on one switch, with `./start-tp4.sh` (below) |
 | `FABRIC_PEER`, `FABRIC_SELF`, `NCCL_SOCKET_IFNAME`, `TF_ROCE_HCA`, `NCCL_IB_GID_INDEX` | auto | Found from the route to `WORKER`, the port's RDMA devices and its RoCE v2 GID table |
 | `NCCL_CHANNELS` | `4` | `NCCL_MIN_NCHANNELS` and `NCCL_MAX_NCHANNELS` |
 | `ROCE`, `ROCE_MAX_KB` | `on`, `4096` | The engine's one-shot RDMA all-gathers, and the largest shard they carry; `off` puts everything on NCCL |
@@ -225,7 +225,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 
-## 4 Sparks (TP=4 on a ring, experimental)
+## 4 Sparks (TP=4 on a ring or a switch, experimental)
 
 `./start-tp4.sh` runs the same image and settings as tensor parallel over four Sparks cabled to each other without a
 switch: each Spark's two ConnectX-7 ports to its two neighbours, one subnet per cable (a port and its PCIe twin on it),
@@ -234,7 +234,34 @@ or the LAN). Rank 0 is this Spark (the API); `WORKER`, `WORKER2` and `WORKER3` a
 order** from here (`WORKER` and `WORKER3` cabled to this Spark, `WORKER2` across). `./stop-tp4.sh` stops the four.
 `DRY_RUN=1 ./start-tp4.sh` prints the ring it finds and every rank's command, and changes nothing.
 
-What differs from the pair (`scripts/tp4.sh`):
+**On a switch.** When every Spark's ConnectX-7 port goes to one switch, every pair of Sparks shares a RoCE subnet (two,
+when a port and its PCIe twin are addressed on two subnets) and the launcher runs the four as a mesh: `WORKER`, `WORKER2`
+and `WORKER3` in any order, no NCCL graph files, NCCL's own algorithm choice, every RoCE device toward every peer with
+`NCCL_CROSS_NIC=1` and subnet-aware routing, the engine's default eager connect, and `TF_GLM_PREFILL_REDUCE=split` (every
+rank's prompt rows straight to every other rank, which a ring cannot carry). `FABRIC=auto` (the default) reads ring or
+mesh from the Sparks' addresses; `FABRIC=ring` / `FABRIC=mesh` insist. The engine's two-rank RoCE all-gather stays off at
+four on either fabric.
+
+Measured 2026-11-04 on four DGX Sparks behind a MikroTik CRS804 (one 200G cable each, a port and its twin on
+192.168.120.0/24 and 192.168.121.0/24, RoCE v2 GID 3), image `74e19a63a9a5`, `PARALLEL=8`, 1M window, FP8 KV on pages, q8
+dense and head, DFlash2, greedy, the same harness as above, the client on a desktop over 1 GbE:
+
+| | four Sparks, a ring (above) | four Sparks, a switch |
+| --- | ---: | ---: |
+| 1 stream, prose / code | 56.1 / 85.0 tok/s | 55.6 / 83.2 tok/s (published checkpoint); 53.8 / 83.0 (Ablit) |
+| 4 streams, prose, total | 115-120 tok/s | 118-124 tok/s |
+| 8 streams, prose, total | 163-166 tok/s | 163 tok/s |
+| prefill 25K / 51K / 100K | 1,752 (16K) / 1,889 (64K) tok/s | **2,421 / 2,462 / 2,457** tok/s with `split`; 1,865 / 1,878 / 1,882 with `gather` |
+| cold ~200K prefill beside 3 decoders | | 100.8 s, worst decode pause 2.0 s (p99 1.9 s) |
+| KV pool | 16,392 pages (8.4M tokens) | 16,392 pages (8.4M tokens), 4.4 GiB prompt cache |
+
+Same tokens as the ring: with the published checkpoint the harness's greedy hashes are the ring's (`b6ae240144bc` prose,
+`9b68d8a77151` code), drafts on or off, `split` or `gather`, and four streams equal one. The NCCL log of a
+`NCCL_DEBUG=INFO` boot shows both devices on GID 3 on every rank, no `ibv_modify_qp` retry, no socket data channel, no
+queue pair between the two subnets, and sends split evenly over the two devices. Decode speed equals the ring's; prefill
+gains ~30% from `split`, which only a switch can run. Rank 0 loads in ~122 s cold, ~77 s warm.
+
+What differs from the pair on a ring (`scripts/tp4.sh`):
 
 - **The ring.** Each Spark's RoCE addresses are read over ssh and paired by subnet; the launcher refuses a switch, a
   ring that is not in `WORKER` order, or a missing cable. NCCL gets `NCCL_ALGO=Ring` and a graph file per rank whose
@@ -272,7 +299,7 @@ dense and head, DFlash2; greedy, the same harness as the pair's numbers under [P
 Rank 0 loads 45.6 GiB; each rank's NCCL connects only to its two neighbours. Greedy replies are repeatable run to
 run and the same with drafts off; they are not the pair's tokens (a different partition rounds differently).
 
-Settings beside the pair's: `WORKER2`, `WORKER3`, `MASTER_ADDR`, `SOCKET_IFNAME`, `PREFILL_REDUCE` (`gather`),
+Settings beside the pair's: `WORKER2`, `WORKER3`, `MASTER_ADDR`, `SOCKET_IFNAME`, `PREFILL_REDUCE` (`auto`: `gather` on a ring, `split` on a switch), `FABRIC` (`auto`), `MESH_NCCL_ALGO` (empty),
 `RING_NCCL_ALGO` (`Ring`), `NFS_MODEL_PATH`, `NFS_DFLASH2_PATH`, `NFS_SERVER1..3`. Logs: `logs/current/rank0..3.log`.
 
 ## Logs and stopping

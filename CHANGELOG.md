@@ -1,5 +1,16 @@
 # Changelog
 
+- **2026-11-04** -- `./start-tp4.sh` on a switch: `FABRIC=auto|ring|mesh` (README "4 Sparks"). When every pair of the four
+  Sparks shares a RoCE subnet (every ConnectX-7 port on one switch) the launcher runs them as a mesh: no NCCL graph files,
+  NCCL's own algorithm choice (`MESH_NCCL_ALGO` pins it), every RoCE device toward every peer with `NCCL_CROSS_NIC=1`,
+  subnet-aware routing and `NCCL_IB_MERGE_NICS=0`, the engine's default eager connect, workers in any order, and
+  `TF_GLM_PREFILL_REDUCE=split` (`PREFILL_REDUCE=auto`: `gather` on a ring, `split` on a switch; a ring refuses `split`
+  before the start). The fabric is read before the banner, so the reduce mode and the context fit key (now keyed on the
+  fabric too) follow it; a ring runs exactly as before. Measured on four DGX Sparks behind a MikroTik CRS804, one 200G cable
+  each: decode equal to the ring's (55.6 / 83.2 tok/s prose / code at one stream, 163 at eight), prefill 2,421-2,462 tok/s
+  with `split` against 1,865-1,882 with `gather`; the published checkpoint gives the ring's greedy hashes (`b6ae240144bc`,
+  `9b68d8a77151`), drafts on or off, `split` or `gather`; `NCCL_DEBUG=INFO` shows no retry, no socket channel and no queue
+  pair between the two subnets. Details: docs/speed/RESULTS.md, "TP=4 on a switch".
 - **2026-11-04** -- `WORKER_WEIGHTS=check` accepts a local checkpoint with no `.revision` marker when its config.json
   and shards are there, as `worker_weights_ready`'s comment always said; `MODEL_REVISION`'s default made the marker
   mandatory even for `MODEL_SOURCE=local` (issue 3, failure 1). The `E_WEIGHTS` hint names the marker.
