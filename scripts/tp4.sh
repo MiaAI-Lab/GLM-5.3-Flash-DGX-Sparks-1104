@@ -15,7 +15,7 @@
 # On a switch (FABRIC=mesh) every pair of Sparks shares a RoCE subnet, so none of that applies: no graph file, NCCL's own
 # algorithm choice, every device toward every peer, and subnet-aware routing alone puts each send on the device that
 # shares the receiver's subnet (one rail per subnet: a port and its PCIe twin addressed on two subnets both carry
-# traffic). Measured on four Sparks behind a MikroTik CRS804, one 200G cable each (README "4 Sparks").
+# traffic). Written for four Sparks behind one switch, one 200G cable each (README "4 Sparks").
 [[ "${_GLM_TP4_LOADED:-0}" == 1 ]] && return 0
 _GLM_TP4_LOADED=1
 
@@ -383,7 +383,7 @@ tp4_rank_env() {
   [[ -z "${NODE_GID[r]}" ]] || RANK_ENV+=(-e "NCCL_IB_GID_INDEX=${NODE_GID[r]}")
   if [[ "$FABRIC" == mesh ]]; then
     RANK_ENV+=(-e NCCL_CROSS_NIC=1 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1
-               -e "NCCL_MIN_NCHANNELS=$NCCL_CHANNELS" -e "NCCL_MAX_NCHANNELS=$NCCL_CHANNELS")
+               -e NCCL_IB_MERGE_NICS=0 -e "NCCL_MIN_NCHANNELS=$NCCL_CHANNELS" -e "NCCL_MAX_NCHANNELS=$NCCL_CHANNELS")
     [[ -z "$MESH_NCCL_ALGO" ]] || RANK_ENV+=(-e "NCCL_ALGO=$MESH_NCCL_ALGO")
     [[ -z "$RING_PREFIX" ]] || RANK_ENV+=(-e "NCCL_IB_SUBNET_PREFIX_LEN=$RING_PREFIX")
     RANK_MOUNTS=()

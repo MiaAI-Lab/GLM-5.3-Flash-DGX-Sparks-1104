@@ -46,6 +46,7 @@ detect_ring
 if [[ "$PREFILL_REDUCE" == auto ]]; then
   if [[ "$FABRIC" == mesh ]]; then PREFILL_REDUCE=split; else PREFILL_REDUCE=gather; fi
 fi
+[[ "$FABRIC" != ring || "$PREFILL_REDUCE" != split ]] || fail E_CONFIG 'PREFILL_REDUCE=split sends every rank'"'"'s prompt rows straight to every other rank, which a ring cannot carry: use gather or ring on a ring.'
 if [[ "$FABRIC" == mesh ]]; then FABRIC_DESC='a switch (mesh)'; else FABRIC_DESC='a ring'; fi
 
 step() { printf '\n[%s/6] %s\n' "$1" "$2"; }
@@ -59,7 +60,7 @@ URL="http://$API_HOST:$PORT"
 FIT_FILE="$STATE_DIR/context-fit-tp4.tsv"
 fit_key() {
   printf '%s|' "$PATCHES_HASH" "$MODEL_DIR" "$WORKER" "$WORKER2" "$WORKER3" "$TP" "$PARALLEL" "$KV" "$KV_PAGES" "$DENSE" "$HEAD" "$VISION" "$VISION_MAX_IMAGES" \
-    "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$HOST_CACHE_GIB" "$PREFILL_REDUCE" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
+    "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$HOST_CACHE_GIB" "$PREFILL_REDUCE" "$FABRIC" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
     | sha256sum | cut -c1-16
 }
 remembered_context() {
