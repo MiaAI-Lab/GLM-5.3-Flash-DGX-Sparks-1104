@@ -1650,5 +1650,17 @@ Decode equals the ring's; `split`, which a ring cannot carry, prefills ~30% fast
 during a cold prefill is the 4,096-row prompt chunk (the ring's mixed1 showed 2.6 s). With drafts off, four streams
 decoded at 91 ms a round against 22.7 ms for one (no batching gain without drafts; noted, not pursued).
 
+**More A/Bs (boots 7-10, Ablit, split):** `NCCL_CHANNELS=8` changed nothing (52.5 / 81.3 at one stream; prefill 2,390 /
+2,424 / 2,416 against 2,421 / 2,462 / 2,457 at 4); `MESH_NCCL_ALGO=Ring` nothing (above). Decode at world 4 is the engine's
+36-37 ms round, not an NCCL setting.
+
+**Prompt cache and retention (not switch-specific; worth knowing at TP=4).** With `PARALLEL=8` and the 1M window the page
+pool took 16,392 pages and the prompt cache got 4.4 GiB a rank (~0.7M tokens): three ~275k-token conversations filled and
+each resent with a short new turn retained **0 of 3** (every resend re-prefilled, 117 s). `CONTEXT=786432` leaves 12,296
+pages (6.3M tokens, one request up to 768k) and the cache takes its 16 GiB default: **3 of 3** retained, resends answered in
+0.5 s, decode unchanged. For agent sessions of several hundred thousand tokens the smaller window is the better trade on
+GB10; the README's "the page pool takes whole windows before the prompt cache" applies at four as at two.
+
 **Open:** a four-rank RoCE all-gather (roce.zig is two-rank) would take the decode-sized exchanges off NCCL on a mesh;
-`NCCL_CROSS_NIC=0` (rail-only) and 8 channels are untried A/Bs; `DENSE=q4` was not tried (rejected on quality above).
+`NCCL_CROSS_NIC=0` (rail-only) needs a launcher knob to test (the mesh branch sets 1); `DENSE=q4` was not tried (rejected
+on quality above).
