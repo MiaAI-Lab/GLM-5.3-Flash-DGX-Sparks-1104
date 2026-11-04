@@ -1,5 +1,19 @@
 # Changelog
 
+- **2026-11-04** -- engine patches `0107` and `0108`, for four Sparks on a switch. `0107`: the one-shot RoCE all-gather
+  (`zig/src/cuda/roce.zig`, `roce_gather.cu`) at any world instead of two: one RC queue pair per peer per HCA, a receive region
+  `[slot][world-1]` with a flag per peer per HCA, the shard written to every peer, the kernel waiting for `(world-1) x n_hca`
+  flags and copying each peer's stripes into rank-ordered slots; a connect-time probe writes a token to every peer and refuses
+  (`PeerUnreachable`) when one cannot be written to, so a ring never opens it; world 2 keeps the old layout bit for bit
+  (a test pins it). `tf-cuda-test roce-gather <rank> [world]` compares every size with `ncclAllGather` and times a call: on
+  four GB10s behind a CRS804, 16 KiB a rank 18.2 us against NCCL's 32.9, 32 KiB 22.0 against 39.4, 0 mismatches in 3,000
+  mixed calls. `0108`: the DFlash2 drafter MLP split across every rank (`ff = FF / world` when 256-aligned, a rank-ordered fp32
+  `df_sumn`), world 2 bit-identical to `df_sum2`. In the model (TP=4, greedy, Ablit): the per-layer gathers 4.77 -> 3.31 ms a
+  verify call, the drafter block 5.5 -> 3.5 ms a round, the decode round 36.4 -> 33.0 ms: one stream 53.8 / 83.0 -> 59.4 / 90.8
+  tok/s (prose / code), four streams 118 -> 131.5; the harness's greedy hashes are unchanged (`fab1d3b6894b`,
+  `e71492bf766b`), acceptance unchanged. `0108` alone moves nothing (its block overlaps other work) and is kept as exact and
+  lighter. `start-tp4.sh`: on a switch `MESH_ROCE=auto` turns `TF_ROCE` on when `0107` is in the image (`on` / `off` insist);
+  a ring stays on NCCL. Details: docs/speed/RESULTS.md, "Engine patches 0107 and 0108".
 - **2026-11-04** -- `./start-tp4.sh` on a switch: `FABRIC=auto|ring|mesh` (README "4 Sparks"). When every pair of the four
   Sparks shares a RoCE subnet (every ConnectX-7 port on one switch) the launcher runs them as a mesh: no NCCL graph files,
   NCCL's own algorithm choice (`MESH_NCCL_ALGO` pins it), every RoCE device toward every peer with `NCCL_CROSS_NIC=1`,

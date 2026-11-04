@@ -221,6 +221,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0094–0097 | **This pair's.** A 4,096-row prompt chunk with DFlash2's `MAX_CTX` to match (+7% prefill, byte-identical replies); the GB10's measured cost tables and draft-rule seed |
 | 0098–0102 | **This pair's,** env-gated, defaults behaviour-identical: `TF_GLM_DFLASH2_EDGE`, `TF_GLM_PROF` on shared windows, `TF_GLM_MM_STAGES`, `TF_GLM_DFLASH2_TCONF`, `TF_GLM_DFLASH2_Q32` (the decode campaign's exact knobs, each measured neutral) |
 | 0103–0104 | From the RTX recipe: a tool call after prose that quotes a tool-call opener is the call (with a guard so a call quoted inside a call's value is never invoked); GLM warm turns, so a user message after an agent loop resumes past the loop (8,192 of 9.3K tokens cached, was 4,096) |
+| 0107–0108 | The one-shot RoCE all-gather at any world (a mesh of four: one queue pair per peer per HCA, flags per peer, a connect-time probe that refuses an unreachable peer; world 2 unchanged bit for bit) and the DFlash2 drafter MLP split across every rank (exact `df_sumn`); `tf-cuda-test roce-gather` is the byte-and-time gate |
 | 0105 | An untyped tool parameter takes the JSON object or array the model wrote; text stays text (sibling recipe issue #180) |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
@@ -261,6 +262,13 @@ with eight streams (or `PARALLEL=6` at 1M) leaves the 16 GiB cache, and the same
 the launcher warns (`W_CACHE_SMALL`) when the cache is under 8 GiB. `split` prefill sends every rank's rows to every other
 rank at once, so a switch port sees three senders: check the NICs' `rx_prio*_discards` / `out_of_sequence` counters once
 after a long prompt (zero on the CRS804 at 200G). `MESH_NCCL_CROSS_NIC=0` pins rail to rail (untested; `1` measured).
+
+**RoCE gathers at four (engine patches 0107 and 0108).** With `0107` in the image the decode and verify all-gathers go over
+RoCE on a switch as they do on the pair (`MESH_ROCE=auto`): one queue pair per peer per HCA, every rank's shard written to
+every peer, the kernel waiting for all peers' flags. Measured on this kit: a 16 KiB-a-rank gather 18.2 us against NCCL's
+32.9 (`tf-cuda-test roce-gather <rank> 4`), the decode round 36.4 -> 33.0 ms, one stream 59.4 / 90.8 tok/s prose / code,
+four streams 131.5, the same greedy hashes. `0108` splits the DFlash2 drafter MLP across the four ranks (exact; lighter, no
+round change on its own). A ring never opens the RoCE path: the engine's connect-time probe refuses a peer it cannot write to.
 
 Same tokens as the ring: with the published checkpoint the harness's greedy hashes are the ring's (`b6ae240144bc` prose,
 `9b68d8a77151` code), drafts on or off, `split` or `gather`, and four streams equal one. The NCCL log of a
@@ -306,7 +314,7 @@ dense and head, DFlash2; greedy, the same harness as the pair's numbers under [P
 Rank 0 loads 45.6 GiB; each rank's NCCL connects only to its two neighbours. Greedy replies are repeatable run to
 run and the same with drafts off; they are not the pair's tokens (a different partition rounds differently).
 
-Settings beside the pair's: `WORKER2`, `WORKER3`, `MASTER_ADDR`, `SOCKET_IFNAME`, `PREFILL_REDUCE` (`auto`: `gather` on a ring, `split` on a switch), `FABRIC` (`auto`), `MESH_NCCL_ALGO` (empty), `MESH_NCCL_CROSS_NIC` (`1`),
+Settings beside the pair's: `WORKER2`, `WORKER3`, `MASTER_ADDR`, `SOCKET_IFNAME`, `PREFILL_REDUCE` (`auto`: `gather` on a ring, `split` on a switch), `FABRIC` (`auto`), `MESH_NCCL_ALGO` (empty), `MESH_NCCL_CROSS_NIC` (`1`), `MESH_ROCE` (`auto`: the RoCE all-gather on a switch when patch 0107 is in the image),
 `RING_NCCL_ALGO` (`Ring`), `NFS_MODEL_PATH`, `NFS_DFLASH2_PATH`, `NFS_SERVER1..3`. Logs: `logs/current/rank0..3.log`.
 
 ## Logs and stopping

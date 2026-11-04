@@ -1664,3 +1664,31 @@ GB10; the README's "the page pool takes whole windows before the prompt cache" a
 **Open:** a four-rank RoCE all-gather (roce.zig is two-rank) would take the decode-sized exchanges off NCCL on a mesh;
 `NCCL_CROSS_NIC=0` (rail-only) needs a launcher knob to test (the mesh branch sets 1); `DENSE=q4` was not tried (rejected
 on quality above).
+
+## Engine patches 0107 and 0108: RoCE gathers at four on the switch (2026-11-04, 17:00-18:10 CST, the same kit)
+
+**Pre-registered** (from `docs/speed/candidates/E1-E2-notes.md`): microbench GO = 0 mismatches against `ncclAllGather` over
+3,000 mixed 16/32/64 KiB calls on every rank and <= 25 us a call at 32 KiB; model GO = the harness hashes `fab1d3b6894b` /
+`e71492bf766b` unchanged with RoCE on and off, `TF_GLM_PROF` gathers under 4.77 ms, drafter block under 5.5 ms; KILL = any
+mismatch, a changed hash, a rank refusing to start.
+
+**Build.** Image `d46e73d4e405` = f350cd3e + 108 patches, compiled first try (`zig build` 442 s). Every rank logs
+`RoCE all-gather: 4 ranks, 2 HCA(s), shards up to 4096 KiB by RDMA writes`.
+
+**Microbench** (`tf-cuda-test roce-gather <rank> 4`, one container a Spark, the model stopped): all sizes 16 B - 512 KiB x 3
+seeds byte-equal to NCCL (27 of 33 cases by RoCE, the rest over the cap on NCCL as designed); 3,000 mixed calls, 0 mismatches,
+on all four ranks. us a call, RoCE / NCCL: 4 KiB 14.9 / 28.9; 8 KiB 14.2 / 30.1; 16 KiB 18.2 / 32.9; 32 KiB 22.0 / 39.4; 64 KiB
+28.7 / 57.3. **GO.**
+
+**Model boots** (Ablit, split, 768k x 8, greedy, the lab's acc.py from a desktop over the tunnel):
+
+| | gathers | 1 stream prose / code | 4 streams | round ms | gather_a + gather_b | drafter block 1 / 4 streams | hashes |
+|---|---|---:|---:|---:|---:|---:|---|
+| 74e19a63a9a5 (106 patches) | NCCL | 53.8 / 83.0 | 118 | 36.4 | 2.58 + 2.19 | 5.5 / 8.7 | fab1d3b6894b / e71492bf766b |
+| 0107+0108, TF_ROCE=1, prof | RoCE | 57.9 / 88.2 | 129.0 | 33.8 | 1.76 + 1.55 | 3.45 / 5.7 | same |
+| 0107+0108, TF_ROCE=0, prof | NCCL | 53.9 / 82.7 | 118.4 | 36.3 | - | 3.51 / 5.7 | same |
+| 0107+0108, TF_ROCE=1 | RoCE | **59.4 / 90.8** | **131.5** | **33.0** | | | same |
+
+**GO on every gate.** 0107 carries the gain; 0108 alone cuts the drafter block but not the round (it overlaps other work) and is
+kept as exact and lighter. Acceptance 53% / 72% unchanged. Open: the host spin proxy's CPU at eight streams was not profiled;
+`TF_ROCE_MAX_KB` stays 4096 (prefill-sized exchanges stay on NCCL).
