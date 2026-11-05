@@ -222,6 +222,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0098–0102 | **This pair's,** env-gated, defaults behaviour-identical: `TF_GLM_DFLASH2_EDGE`, `TF_GLM_PROF` on shared windows, `TF_GLM_MM_STAGES`, `TF_GLM_DFLASH2_TCONF`, `TF_GLM_DFLASH2_Q32` (the decode campaign's exact knobs, each measured neutral) |
 | 0103–0104 | From the RTX recipe: a tool call after prose that quotes a tool-call opener is the call (with a guard so a call quoted inside a call's value is never invoked); GLM warm turns, so a user message after an agent loop resumes past the loop (8,192 of 9.3K tokens cached, was 4,096) |
 | 0107–0108 | The one-shot RoCE all-gather at any world (a mesh of four: one queue pair per peer per HCA, flags per peer, a connect-time probe that refuses an unreachable peer; world 2 unchanged bit for bit) and the DFlash2 drafter MLP split across every rank (exact `df_sumn`); `tf-cuda-test roce-gather` is the byte-and-time gate |
+| 0109 | A prompt step beside a decoding stream takes `TF_GLM_CHUNK` rows (2,048 / 1,024) of the 4,096-row chunk, alone the whole chunk as before (upstream's `TF_GLM_CHUNK_SOLO` inverted for this pin's grid); the MTP head absorbs in the same pieces; `glm-solo-check` is the bit-equality gate. Decode pause beside a cold prefill 2.0 s -> 0.65 s at 1,024 |
 | 0105 | An untyped tool parameter takes the JSON object or array the model wrote; text stays text (sibling recipe issue #180) |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
@@ -314,7 +315,7 @@ dense and head, DFlash2; greedy, the same harness as the pair's numbers under [P
 Rank 0 loads 45.6 GiB; each rank's NCCL connects only to its two neighbours. Greedy replies are repeatable run to
 run and the same with drafts off; they are not the pair's tokens (a different partition rounds differently).
 
-Settings beside the pair's: `WORKER2`, `WORKER3`, `MASTER_ADDR`, `SOCKET_IFNAME`, `PREFILL_REDUCE` (`auto`: `gather` on a ring, `split` on a switch), `FABRIC` (`auto`), `MESH_NCCL_ALGO` (empty), `MESH_NCCL_CROSS_NIC` (`1`), `MESH_ROCE` (`auto`: the RoCE all-gather on a switch when patch 0107 is in the image),
+Settings beside the pair's: `WORKER2`, `WORKER3`, `MASTER_ADDR`, `SOCKET_IFNAME`, `PREFILL_REDUCE` (`auto`: `gather` on a ring, `split` on a switch), `FABRIC` (`auto`), `MESH_NCCL_ALGO` (empty), `MESH_NCCL_CROSS_NIC` (`1`), `MESH_ROCE` (`auto`: the RoCE all-gather on a switch when patch 0107 is in the image), `CHUNK_SOLO` (`0`; `1` = patch 0109's short prompt steps beside a decoder) and `CHUNK_BUSY` (`2048` or `1024`),
 `RING_NCCL_ALGO` (`Ring`), `NFS_MODEL_PATH`, `NFS_DFLASH2_PATH`, `NFS_SERVER1..3`. Logs: `logs/current/rank0..3.log`.
 
 ## Logs and stopping

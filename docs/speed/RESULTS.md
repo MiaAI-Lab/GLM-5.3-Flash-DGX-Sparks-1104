@@ -1692,3 +1692,36 @@ on all four ranks. us a call, RoCE / NCCL: 4 KiB 14.9 / 28.9; 8 KiB 14.2 / 30.1;
 **GO on every gate.** 0107 carries the gain; 0108 alone cuts the drafter block but not the round (it overlaps other work) and is
 kept as exact and lighter. Acceptance 53% / 72% unchanged. Open: the host spin proxy's CPU at eight streams was not profiled;
 `TF_ROCE_MAX_KB` stays 4096 (prefill-sized exchanges stay on NCCL).
+
+## Engine patch 0109: short prompt steps beside a decoder (2026-11-04, 20:00-22:40 CST, four Sparks on the switch)
+
+**Why.** `glm_gates`' stall gate: three decoders beside a cold ~200k prefill paused up to 1.96-2.02 s (p99 1.80-1.86) per 4,096-row
+chunk. Upstream's v1.2.1 answer (`TF_GLM_CHUNK_SOLO`, 04171ccf) does two things on a 2,048 grid: a double step alone and a single
+one beside a decoder. This pin's grid is already 4,096 (0094/0095) and a step alone is already a pair (0050-0062), so the port keeps the
+grid, buffers and kept-state cuts and adds only the missing half: beside a decoder a step takes `TF_GLM_CHUNK` rows of the chunk
+(`cuda_prompt_solo.zig`: rank 0's choice, every rank's rule; a busy step only where it rebases the DSA index ring where the whole chunk
+would; an off-grid start is finished in busy steps). Followers take the step length from rank 0's header.
+
+**v1 failed its own gate** (`glm-solo-check`, 22:47Z): the busy twin's state differed from the whole-chunk twin at byte 1,253,632 of
+568,878,592 on four prompts and the MTP base diverged on long ones. Two causes: the KDA record double buffer (busy steps flip its parity
+more often; the stale copy is never read — decode reads the current copy, rollback replays from it — so the test now compares only the
+records the next step reads, as upstream's test zeroes both copies), and a real one: `State.readyMtp/rebase` rebased the MTP index-key
+ring when a head pass would overflow, and a head pass was the step's rows, so 4,096 against 2,048 laid the ring out from different bases.
+**v2** absorbs the MTP head in `TF_GLM_CHUNK`-row pieces whenever the setting is on (whole, pair, busy alike); the drafter path
+(`--drafter`, this recipe's default) never absorbs the target MTP head, so served hashes could not move from it.
+
+**Gates (image `9a2e63370a40` = 0001-0109; pin+0108 and pin+0106 controls for the host suite):**
+
+| | result |
+|---|---|
+| `zig build test` | +5 tests over the pin+0108 control, the same pre-existing failures (one `test-glm-dflash-host` launch-record test fails on the pin without any of these patches) |
+| `glm-solo-check` world 4, `TF_GLM_CHUNK=2048` and `=1024` | **PASS on every rank**: 8 prompts (incl. kept states at chunks 1 and 3) equal their whole-chunk twins in first token, next window's logits and tokens, ring bases, records read next |
+| served, greedy hashes (acc.py) | `7a00f3a54e85` / `11e523fbec9a` at off, 2048, 1024 |
+| four concurrent prompts == solo at T=0 | 4/4 at both |
+| cold ~200k prefill beside 3 decoders | 95.3 s off; 97.7 s (2048, +2.5%); 99.9 s (1024, +4.8%) |
+| **worst decode pause / p99** | **1.96 / 1.80 s off; 1.17 / 0.98 (2048); 0.65 / 0.57 (1024)** |
+| cold prefill alone 25k / 51k / 100k | 2,389 / 2,456 / 2,479 off; 2,385 / 2,445 / 2,471 (2048) |
+| decode alone 1 stream | 64.0 / 101.6 off; 63.9 / 101.5; 63.7 / 101.3 |
+| retention 3 x ~275k (1024) | 3/3, resends 0.5-0.6 s |
+
+Shipped on this kit as `CHUNK_SOLO=1 CHUNK_BUSY=1024`; the recipe default stays off.

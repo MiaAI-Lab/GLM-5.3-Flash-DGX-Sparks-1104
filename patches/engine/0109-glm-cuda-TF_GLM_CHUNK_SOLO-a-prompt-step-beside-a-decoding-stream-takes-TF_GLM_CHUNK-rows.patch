@@ -1,4 +1,4 @@
-From 67bc09a46a635f0404fbbce3b9f02ee7b77c487d Mon Sep 17 00:00:00 2001
+From 22cc33702dcd4c051165a6aacc5486ccd90b1576 Mon Sep 17 00:00:00 2001
 From: Cameron Basham <cambash23@gmail.com>
 Date: Wed, 4 Nov 2026 21:20:50 -0600
 Subject: [PATCH] glm cuda: TF_GLM_CHUNK_SOLO: a prompt step beside a decoding
@@ -593,7 +593,7 @@ index f34cab408..e4c5a3296 100644
          fn absent(_: [:0]const u8) ?[]const u8 {
 diff --git a/zig/tests/cuda/glm_solo_tests.zig b/zig/tests/cuda/glm_solo_tests.zig
 new file mode 100644
-index 000000000..1217e9168
+index 000000000..97b6164b5
 --- /dev/null
 +++ b/zig/tests/cuda/glm_solo_tests.zig
 @@ -0,0 +1,189 @@
@@ -640,11 +640,11 @@ index 000000000..1217e9168
 +    var name: []const u8 = "before the first field";
 +    var best: usize = 0;
 +    const fixed = [_]struct { []const u8, u64 }{
-+        .{ "pos", st.pos_dev },             .{ "KDA conv windows", st.conv }, .{ "KDA records (both copies)", st.rec },
-+        .{ "KDA proj (window)", st.proj },  .{ "KDA save_k (window)", st.save_k }, .{ "KDA save_v (window)", st.save_v },
-+        .{ "KDA save_g (window)", st.save_g }, .{ "KDA save_b (window)", st.save_b },
-+        .{ "MTP latent rows", st.mtp_caches.lc }, .{ "MTP index-key ring", st.mtp_caches.ik }, .{ "MTP index-gate ring", st.mtp_caches.ig },
-+        .{ "MTP pooled keys", st.mtp_caches.pk }, .{ "MTP position", st.mtp_pos_dev }, .{ "prompt hidden (first-draft row)", st.prompt_hidden },
++        .{ "pos", st.pos_dev },                      .{ "KDA conv windows", st.conv },                         .{ "KDA records (both copies)", st.rec },
++        .{ "KDA proj (window)", st.proj },           .{ "KDA save_k (window)", st.save_k },                    .{ "KDA save_v (window)", st.save_v },
++        .{ "KDA save_g (window)", st.save_g },       .{ "KDA save_b (window)", st.save_b },                    .{ "MTP latent rows", st.mtp_caches.lc },
++        .{ "MTP index-key ring", st.mtp_caches.ik }, .{ "MTP index-gate ring", st.mtp_caches.ig },             .{ "MTP pooled keys", st.mtp_caches.pk },
++        .{ "MTP position", st.mtp_pos_dev },         .{ "prompt hidden (first-draft row)", st.prompt_hidden },
 +    };
 +    for (fixed) |f| {
 +        if (f[1] >= base and f[1] - base <= offset and f[1] - base >= best) {

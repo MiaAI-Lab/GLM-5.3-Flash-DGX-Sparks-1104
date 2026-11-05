@@ -1,5 +1,16 @@
 # Changelog
 
+- **2026-11-04** -- engine patch `0109`: a prompt step beside a decoding stream takes `TF_GLM_CHUNK` rows (2,048 or 1,024) of the
+  4,096-row chunk instead of the whole chunk; alone, the chunk (and the pair) run as before, and kept states stay on the 4,096-row grid.
+  Upstream's `TF_GLM_CHUNK_SOLO` (v1.2.1) ported onto this pin inverted: the pin already takes two chunks a step alone (0050-0062), it
+  lacked the short step beside a decoder. The MTP head absorbs in `TF_GLM_CHUNK`-row pieces whenever the setting is on, so its
+  index-key ring's base no longer follows the step length (found by `tf-cuda-test glm-solo-check`, which now compares only the KDA
+  records the next step reads and names the state region at the first differing byte). `CHUNK_SOLO=0|1` (default 0) and
+  `CHUNK_BUSY=2048|1024` in `scripts/config.sh`, plumbed by `start.sh` and `start-tp4.sh`. Measured on four DGX Sparks behind a switch
+  (TP=4, q6 dense, RoCE gathers): `glm-solo-check` PASS on every rank at 2048 and 1024; served, three decoders beside a cold ~200k
+  prefill: worst decode pause 1.96 s -> 1.17 s (2048) -> **0.65 s (1024)**, p99 1.80 -> 0.98 -> 0.57 s; that prefill 95.3 s -> 97.7 /
+  99.9 s (+2.5% / +4.8%); cold prefill alone and greedy hashes unchanged; four concurrent prompts equal solo; 3 of 3 ~275k conversations
+  resume. Details: docs/speed/RESULTS.md, "Engine patch 0109".
 - **2026-11-04** -- engine patches `0107` and `0108`, for four Sparks on a switch. `0107`: the one-shot RoCE all-gather
   (`zig/src/cuda/roce.zig`, `roce_gather.cu`) at any world instead of two: one RC queue pair per peer per HCA, a receive region
   `[slot][world-1]` with a flag per peer per HCA, the shard written to every peer, the kernel waiting for `(world-1) x n_hca`
