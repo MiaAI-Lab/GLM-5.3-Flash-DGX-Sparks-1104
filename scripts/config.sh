@@ -175,6 +175,15 @@ PARALLEL="${PARALLEL:-4}"                        # --parallel: streams at once (
 PREFILL_SHARE="${PREFILL_SHARE:-0.68}"
 # TENSORFOLD_PREFILL_BUDGET: prompt rows filled in one visit while a stream waits to decode (empty: no cap)
 PREFILL_BUDGET="${PREFILL_BUDGET:-}"
+# CHUNK_SOLO=1 (engine patch 0109, upstream's TF_GLM_CHUNK_SOLO=4096 ported onto this pin's 4,096-row chunk): a prompt
+# step beside a decoding stream takes CHUNK_BUSY rows of the chunk instead of the whole, so the streams decoding beside
+# a long prefill pause about CHUNK_BUSY / prefill-rate a step (4,096 rows: ~1.7 s of GPU time, measured 1.96-2.02 s
+# worst beside a cold ~200k prompt; 2048: ~0.85 s; 1024: ~0.42 s) and the prompt pays the expert trellis decode over
+# fewer rows while it shares (upstream: a 2048-row pass is ~7% dearer than 4096). Alone, nothing changes: whole chunks
+# and pairs (TF_GLM_PROMPT_PAIR), so cold prefill and the prompt cache's kept-state grid stay as measured. Same bytes
+# either way (docs/speed/candidates/0109-notes.md). 0 (default, upstream's unset): every step a whole chunk, as before.
+CHUNK_SOLO="${CHUNK_SOLO:-0}"
+CHUNK_BUSY="${CHUNK_BUSY:-2048}"                 # TF_GLM_CHUNK with CHUNK_SOLO=1: 2048 (upstream's busy pass) or 1024
 # auto: the largest window that fits. The first start tries CONTEXT_MAX (the model's 1,048,576), and when a rank
 # refuses it with its memory figures, starts once more with the window they allow; the window that served is kept in
 # STATE_DIR/context-fit.tsv for the next start with the same memory settings.
