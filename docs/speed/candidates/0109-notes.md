@@ -129,6 +129,27 @@ Also worth a look while measuring: a request that arrives during a busy step now
 (upstream's "first token of a short request sent into a 32K prompt" row), and the warm-turn resume TTFT (unchanged grid,
 so unchanged).
 
+## First GPU run (2026-11-04, image pin+0001-0109 v1, world 4, dc capacity 32768): `glm-solo-check` FAILED; diagnosed, fixed in v2
+
+Ranks 1-3 passed (they followed every step); rank 0's five failures were all in the **state comparison** (first token,
+next-window logits and tokens, rings' bases all equal), at two byte offsets of the 568,878,592-byte state arena:
+
+| Cases | First differing byte | Region (from `cuda_state.stateSizes`, 34 KDA layers x 16 heads a rank at TP=4) | Cause |
+| --- | --- | --- | --- |
+| 2049, 4097, 12288, 20487 | 1,253,632 = 256 (pos) + 34 x 9 x 2048 x 2 (conv) | the **KDA records**, `State.rec` = `[2][34 layers][16][128][128] fp32`, two copies | every prompt pass reads `recAt(cur)`, writes `recAt(1 - cur)` and flips `cur` (`cuda_forward.zig:290-304`). The busy twin makes more passes, so its parity and the **stale copy** (the state before its last pass) differ. The copy read next is the same. Never read later: a decode window reads `recAt(cur)` and, on a rollback, replays from it into `1 - cur` (`cuda_forward.zig:573-595`); a kept state carries `cur` with the arena (`Snap.cur`). The pin's pair check could compare `cur` because a pair makes two passes like two chunks; upstream's `glm_solo_tests` zeroes both copies and compares only the current one (`takeRecords`). **Test fix:** the same `takeRecords`, and `cur` no longer compared. |
+| 16384 (parity equal, so the records matched) and the MTP bases of 20487 / 16384 (16368 vs 14320, 12272 vs 14320) | 562,578,176 = the **MTP layer's index-key ring** + 256 (one `i_dim` row): arena end - prompt_hidden (8192) - mtp_pos (256) - pk (2,097,920) - ig (2,097,152) - ik (2,097,152) = 562,577,920 | `State.readyMtp` / `rebase(mtp)` (`cuda_state.zig:558-575`) rebases the MTP head's ring when a head pass would overflow it, to `mtp_len - 16`. The head's pass was the step's `nxt` rows: 4,095/4,096 a whole chunk against 2,047/2,048 a busy step, so the overflow lands on different rows, the ring is laid out from a different base, and its bytes (and the candidate pools the head's indexer reads from the base on) differ. Upstream met the same thing in its direction and split the head's pass into grid-chunk pieces (`prompt_solo.mtpRows`: "the head's ring holds a window more than a pass"). **Engine fix (v2):** `cuda_prompt_solo.mtpRows` runs the head over a step's next ids in `TF_GLM_CHUNK`-row passes whenever the setting is on (whole chunk, pair's chunks and busy steps alike; `prefillChunk` and `prompt_pair` both call it), so a whole chunk's head passes are the very passes its busy steps make and the MTP ring rebases on the same rows. Off, one pass as before. |
+
+Does v2 change the exactness argument? For the bytes that matter, no: the records read next were equal already, and
+the main rings' bases were equal in every case (`ringsAgree` held). It adds one claim: with the setting on, the MTP
+head absorbs a whole chunk in two 2,048-row passes instead of one 4,096-row pass. That is the same chunk-boundary
+statement as for the backbone (a row's result does not depend on which pass holds it), now applied to the MTP layer,
+and it is what `glm-solo-check` v2 verifies between its twins (whole-in-pieces against busy); against the setting
+**off** (one 4,096-row head pass) it is argued, not shown by this test. **In production it is moot: with `--drafter`
+(DFlash2, the recipe's default) the target MTP head's absorb never runs** (`cuda_engine.zig`: "the target MTP layer's
+caches are never read"), so the drafts, the verified tokens and the hashes cannot move from it; it matters only to
+`DRAFTER=mtp` and to the test. The v2 test also names the region of the first differing byte (`region()`), so a further
+failure says which buffer, not an offset.
+
 ## Not verified here
 
 - Nothing was compiled or run: no Zig toolchain, no GPU, no Docker. Reviewed by reading against the pin's code paths

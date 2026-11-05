@@ -1,4 +1,4 @@
-From 64280a8d73a469043078dd554cbb744003fafb14 Mon Sep 17 00:00:00 2001
+From 67bc09a46a635f0404fbbce3b9f02ee7b77c487d Mon Sep 17 00:00:00 2001
 From: Cameron Basham <cambash23@gmail.com>
 Date: Wed, 4 Nov 2026 21:20:50 -0600
 Subject: [PATCH] glm cuda: TF_GLM_CHUNK_SOLO: a prompt step beside a decoding
@@ -23,13 +23,22 @@ the kept-state cuts stay at 4,096, and a step beside a decoding stream takes a p
   busy steps is finished in them, so every whole chunk and every kept state starts on the grid. Not beside prompt
   logprobs, image rows or the 2048-row profiling bucket (upstream's exclusions); a cancel part way into a chunk keeps no
   state there (cuda_native.snap_grid).
+- The target MTP head (drafts without --drafter) absorbs a step's next ids in TF_GLM_CHUNK-row passes whenever the
+  setting is on (prompt_solo.mtpRows, for prefillChunk and prompt_pair alike), so a whole chunk's head passes are the
+  passes its busy steps make and the head's index ring rebases (State.readyMtp, at mtp_len - 16 when a pass would
+  overflow it) on the same rows either way: the first GPU run of glm-solo-check showed the MTP base at 16368 against
+  14320 and the MTP index-key ring laid out from it. Upstream's mtpRows is the same answer in its direction. With
+  --drafter (DFlash2) the head never absorbs, so serving is untouched by this.
 - No buffer grows for it (a busy step is a part of the 4,096-row buffers), so upstream's refusal beside --drafter
   (d229c4f0) has no counterpart: DFlash2 ingests each step's rows as it does a paired step's second chunk
   (dflash.promptRun keeps a step's rows from len - WIN on, whatever its width).
 - Exactness: a row's result does not depend on which pass holds it (cuda_exl3's note on the common experts, the ground
   patch 0094 shipped on with identical greedy replies at 2,048 -> 4,096; glm-pair-check for 8,192 against 4,096;
   upstream's glm-solo-check for 4,096 against 2,048 on main). glm-solo-check here runs busy twins against whole-chunk
-  twins: first token, next window's logits and tokens, the rings' bases, the marks called and every state byte equal.
+  twins: first token, next window's logits and tokens, the rings' bases, the MTP base, the marks called, the KDA records
+  read next and every other state byte equal. The KDA records' stale copy and State.cur are left out as upstream leaves
+  them: a prompt pass writes the other copy and flips, so twins with a different pass count differ there and nothing
+  reads it (a decode window reads recAt(cur) and replays from it); the first GPU run failed on exactly that byte.
 
 Expected: a stream decoding beside a cold ~200k prompt pauses about chunk_rows / prefill_rate a step (4,096 rows at
 ~2,450 tok/s: ~1.7 s of GPU time, measured 1.96-2.02 s; 2,048: ~0.85 s; 1,024: ~0.42 s), for the prompt's own cost of the
@@ -37,15 +46,16 @@ expert trellis decode amortised over fewer rows while it shares (upstream measur
 nothing changes: whole chunks and pairs, so cold prefill and the prompt cache's boundaries stay as measured.
 ---
  zig/src/families/glm/cuda.zig             |   2 +
- zig/src/families/glm/cuda_engine.zig      |  23 +++-
- zig/src/families/glm/cuda_follow.zig      |  35 ++++--
+ zig/src/families/glm/cuda_engine.zig      |  36 +++--
+ zig/src/families/glm/cuda_follow.zig      |  35 +++-
  zig/src/families/glm/cuda_lanes.zig       |   6 +-
- zig/src/families/glm/cuda_prompt_solo.zig | 109 +++++++++++++++++
- zig/src/families/glm/cuda_ranks.zig       |  28 ++++-
- zig/src/families/glm/cuda_ranks_test.zig  |  40 ++++++-
- zig/tests/cuda/glm_solo_tests.zig         | 139 ++++++++++++++++++++++
+ zig/src/families/glm/cuda_prompt_pair.zig |   9 +-
+ zig/src/families/glm/cuda_prompt_solo.zig | 146 +++++++++++++++++
+ zig/src/families/glm/cuda_ranks.zig       |  28 +++-
+ zig/src/families/glm/cuda_ranks_test.zig  |  40 ++++-
+ zig/tests/cuda/glm_solo_tests.zig         | 189 ++++++++++++++++++++++
  zig/tests/cuda/main.zig                   |   3 +
- 9 files changed, 369 insertions(+), 16 deletions(-)
+ 10 files changed, 461 insertions(+), 33 deletions(-)
  create mode 100644 zig/src/families/glm/cuda_prompt_solo.zig
  create mode 100644 zig/tests/cuda/glm_solo_tests.zig
 
@@ -70,7 +80,7 @@ index 5da590e68..150277a9d 100644
      _ = exl3;
      _ = vision;
 diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
-index ffb60e3af..460d8e6b3 100644
+index ffb60e3af..3e0c50566 100644
 --- a/zig/src/families/glm/cuda_engine.zig
 +++ b/zig/src/families/glm/cuda_engine.zig
 @@ -42,6 +42,7 @@ pub const max_shared = 16;
@@ -136,6 +146,26 @@ index ffb60e3af..460d8e6b3 100644
              return err;
          };
          stamp.end();
+@@ -501,17 +514,8 @@ pub const Engine = struct {
+         stamp = prof_mod.span(f.prof, e.stream, .mtp);
+         // With a drafter (DFlash2) every draft is its block's (cuda_lanes draftFn); the target MTP layer's caches are never
+         // read, so the prompt does not absorb into them (mtp_len stays 0, as snapshots and the next prompt expect).
+-        if (e.mtp and e.drafter == null) {
+-            const nxt = as_i32[1..];
+-            if (nxt.len > 0) { // decode._absorb_rows
+-                const mp = f.prof;
+-                defer f.prof = mp;
+-                f.prof = null; // the head's pass as one section
+-                try f.mtp(nxt, &.{e.bp.fnormed});
+-                f.prof = mp;
+-                try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
+-            }
+-        }
++        // decode._absorb_rows otherwise, in TF_GLM_CHUNK-row passes with the setting on (prompt_solo.mtpRows).
++        try prompt_solo.mtpRows(e, &f, as_i32[1..], e.bp.fnormed);
+         stamp.end();
+         if (f.prof) |p| p.mark(e.stream, .mtp);
+         stamp = prof_mod.span(f.prof, e.stream, .commit);
 diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
 index 543f1b27b..2c2116584 100644
 --- a/zig/src/families/glm/cuda_follow.zig
@@ -243,12 +273,32 @@ index e1bc1bd2e..445293a41 100644
      fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
          const self = of(ptr);
          const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
+diff --git a/zig/src/families/glm/cuda_prompt_pair.zig b/zig/src/families/glm/cuda_prompt_pair.zig
+index eb4a88d13..f52ce4653 100644
+--- a/zig/src/families/glm/cuda_prompt_pair.zig
++++ b/zig/src/families/glm/cuda_prompt_pair.zig
+@@ -156,12 +156,9 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel:
+     return first;
+ }
+ 
+-/// decode._absorb_rows of a chunk: the MTP head over its next ids `nxt` on its final-norm rows `hidden`.
+-fn mtpRows(e: *Engine, f: *fw.Forward, nxt: []const i32, hidden: u64) !void {
+-    if (!e.mtp or e.drafter != null or nxt.len == 0) return; // beside a drafter the head's caches are never read
+-    try f.mtp(nxt, &.{hidden});
+-    try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
+-}
++/// decode._absorb_rows of a chunk: the MTP head over its next ids `nxt` on its final-norm rows `hidden`; with
++/// TF_GLM_CHUNK_SOLO on, in TF_GLM_CHUNK-row passes, as a chunk's busy steps would make them (cuda_prompt_solo).
++const mtpRows = @import("cuda_prompt_solo.zig").mtpRows;
+ 
+ test "a prompt step takes the next chunk when it holds min_rows or more and no kept state starts there" {
+     const C = fw.prefill_rows;
 diff --git a/zig/src/families/glm/cuda_prompt_solo.zig b/zig/src/families/glm/cuda_prompt_solo.zig
 new file mode 100644
-index 000000000..64121d539
+index 000000000..ca13efb84
 --- /dev/null
 +++ b/zig/src/families/glm/cuda_prompt_solo.zig
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,146 @@
 +//! A prompt step beside a decoding stream (TF_GLM_CHUNK_SOLO=4096): TF_GLM_CHUNK rows of the 4,096-row chunk a step,
 +//! so a stream decoding beside a long prompt waits on a shorter pass; alone, a step takes the whole chunk (or a pair,
 +//! cuda_prompt_pair).
@@ -320,6 +370,30 @@ index 000000000..64121d539
 +    return ringsAgree(e.cur.st.base, e.cur.st.ring_rows, chunkAt(start), chunkRows(start, len), busy);
 +}
 +
++/// The rows one MTP head pass takes over a prompt step's `nxt` ids: with the setting on, TF_GLM_CHUNK rows, so a whole
++/// chunk's head passes are the same passes a split chunk's steps make and the head's index ring rebases (State.readyMtp,
++/// at mtp_len - window_rows when a pass would overflow it) at the same rows either way; off, the step's rows in one.
++pub fn mtpPiece(e: *const Engine, nxt: usize) usize {
++    return if (e.settings.chunk != 0) @min(nxt, @as(usize, e.settings.chunk)) else nxt;
++}
++
++/// decode._absorb_rows of a prompt step: the MTP head over its next ids `nxt` on its final-norm rows `hidden` (row i for
++/// nxt[i]), mtpPiece rows a pass, mtp_len advanced after each (upstream's mtpRows, in this tree's direction). Beside a
++/// drafter the head's caches are never read, so nothing runs (cuda_engine's note).
++pub fn mtpRows(e: *Engine, f: *fw.Forward, nxt: []const i32, hidden: u64) !void {
++    if (!e.mtp or e.drafter != null or nxt.len == 0) return;
++    const mp = f.prof;
++    defer f.prof = mp;
++    f.prof = null; // the head's passes as one section
++    var done: usize = 0;
++    while (done < nxt.len) {
++        const piece = nxt[done .. done + mtpPiece(e, nxt.len - done)];
++        try f.mtp(piece, &.{hidden + done * e.c.hidden * 2});
++        try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + piece.len);
++        done += piece.len;
++    }
++}
++
 +test "a busy step belongs to the chunk it starts in, and takes its rows to the chunk's end or the prompt's" {
 +    const C = fw.prefill_rows;
 +    try std.testing.expectEqual(@as(usize, 0), chunkAt(0));
@@ -345,6 +419,19 @@ index 000000000..64121d539
 +    try std.testing.expect(ringsAgree(0, R - C / 2, C, C / 2, C / 2)); // a half-chunk prompt tail fits whole
 +    try std.testing.expect(!ringsAgree(0, R - C / 4, C, C, C / 2)); // the second step would rebase at C + C / 2
 +    try std.testing.expect(ringsAgree(0, R - C / 4, C, C, C / 4 * 3 + 1)); // a first step past the ring's end rebases at C
++}
++
++test "the MTP head's pass over a step's next ids: the step's rows in one unset, TF_GLM_CHUNK rows a pass on" {
++    var e: Engine = undefined;
++    e.settings = .{};
++    try std.testing.expectEqual(@as(usize, fw.prefill_rows), mtpPiece(&e, fw.prefill_rows));
++    try std.testing.expectEqual(@as(usize, 300), mtpPiece(&e, 300));
++    e.settings.chunk = 2048;
++    try std.testing.expectEqual(@as(usize, 2048), mtpPiece(&e, fw.prefill_rows)); // a whole chunk's head passes: two, as its two busy steps make
++    try std.testing.expectEqual(@as(usize, 2048), mtpPiece(&e, fw.prefill_rows - 1)); // and the last id's row goes with the second
++    try std.testing.expectEqual(@as(usize, 300), mtpPiece(&e, 300));
++    e.settings.chunk = 1024;
++    try std.testing.expectEqual(@as(usize, 1024), mtpPiece(&e, 3000));
 +}
 +
 +test "TF_GLM_CHUNK takes a divisor of the chunk: 2048 or 1024" {
@@ -506,10 +593,10 @@ index f34cab408..e4c5a3296 100644
          fn absent(_: [:0]const u8) ?[]const u8 {
 diff --git a/zig/tests/cuda/glm_solo_tests.zig b/zig/tests/cuda/glm_solo_tests.zig
 new file mode 100644
-index 000000000..835db6eda
+index 000000000..1217e9168
 --- /dev/null
 +++ b/zig/tests/cuda/glm_solo_tests.zig
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,189 @@
 +//! GLM-5.3-Flash's busy prompt steps (TF_GLM_CHUNK_SOLO=4096: TF_GLM_CHUNK rows of a chunk a step beside a decoding
 +//! stream) against twins a whole chunk a step, on one Engine and its ranks. Adapted from upstream's glm_solo_tests
 +//! (#1823), whose solo pass doubles a 2,048-row grid; here the grid is 4,096 and the busy step divides it.
@@ -530,8 +617,56 @@ index 000000000..835db6eda
 +    }
 +};
 +
++/// The KDA records' copy a state reads next (State.cur), both copies cleared in `bytes`: every prompt pass writes the
++/// other copy and flips (cuda_forward line "a prompt chunk keeps every row: the layer commits now"), so after a prompt
++/// the stale copy holds the state before the last pass, which a decode window never reads (it reads recAt(cur) and
++/// replays from it into 1 - cur). Twins that took a different number of passes differ there and in `cur` legitimately;
++/// upstream's glm_solo_tests does the same.
++fn takeRecords(a: std.mem.Allocator, st: anytype, bytes: []u8) ![]const u8 {
++    const at = st.rec - st.arena.buf.ptr;
++    const one = st.kda_layers * st.rec_layer;
++    const out = try a.alloc(u8, one);
++    for (0..st.kda_layers) |li| { // each layer's current copy (State.cur is per layer)
++        const cur: usize = st.cur[li];
++        @memcpy(out[li * st.rec_layer ..][0..st.rec_layer], bytes[at + cur * one + li * st.rec_layer ..][0..st.rec_layer]);
++    }
++    @memset(bytes[at..][0 .. 2 * one], 0);
++    return out;
++}
++
++/// The state field a byte offset into the arena falls in, so a differing byte names its region.
++fn region(st: anytype, offset: usize) []const u8 {
++    const base = st.arena.buf.ptr;
++    var name: []const u8 = "before the first field";
++    var best: usize = 0;
++    const fixed = [_]struct { []const u8, u64 }{
++        .{ "pos", st.pos_dev },             .{ "KDA conv windows", st.conv }, .{ "KDA records (both copies)", st.rec },
++        .{ "KDA proj (window)", st.proj },  .{ "KDA save_k (window)", st.save_k }, .{ "KDA save_v (window)", st.save_v },
++        .{ "KDA save_g (window)", st.save_g }, .{ "KDA save_b (window)", st.save_b },
++        .{ "MTP latent rows", st.mtp_caches.lc }, .{ "MTP index-key ring", st.mtp_caches.ik }, .{ "MTP index-gate ring", st.mtp_caches.ig },
++        .{ "MTP pooled keys", st.mtp_caches.pk }, .{ "MTP position", st.mtp_pos_dev }, .{ "prompt hidden (first-draft row)", st.prompt_hidden },
++    };
++    for (fixed) |f| {
++        if (f[1] >= base and f[1] - base <= offset and f[1] - base >= best) {
++            best = f[1] - base;
++            name = f[0];
++        }
++    }
++    for (st.caches) |c| {
++        const layer = [_]struct { []const u8, u64 }{ .{ "DSA latent rows", c.lc }, .{ "DSA index-key ring", c.ik }, .{ "DSA index-gate ring", c.ig }, .{ "DSA pooled keys", c.pk } };
++        for (layer) |f| {
++            if (f[1] >= base and f[1] - base <= offset and f[1] - base >= best) {
++                best = f[1] - base;
++                name = f[0];
++            }
++        }
++    }
++    return name;
++}
++
 +/// `glm-solo-check`: prompts a step at a time, busy (as beside a decoding stream) and whole; first token, next window
-+/// and every state byte equal, and the kept-state marks called at the same chunks.
++/// and every state byte equal (the KDA records' stale copy and parity aside), and the kept-state marks called at the
++/// same chunks.
 +pub fn soloCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
 +    const glm = @import("glm_cuda");
 +    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
@@ -638,16 +773,18 @@ index 000000000..835db6eda
 +        const h1 = try a.alloc(u8, n);
 +        try st.arena.buf.download(0, h0);
 +        try tw.arena.buf.download(0, h1);
++        const r0 = try takeRecords(a, st, h0);
++        const r1 = try takeRecords(a, tw, h1);
 +        const diff = std.mem.indexOfDiff(u8, h0, h1);
-+        if (st.pos != tw.pos or st.mtp_len != tw.mtp_len or st.base != tw.base or st.mtp_base != tw.mtp_base or !std.mem.eql(u1, st.cur, tw.cur) or diff != null) {
-+            std.debug.print("FAIL solo: prompt of {d}: the busy state differs (pos {d}/{d}, rings' base {d}/{d}, MTP base {d}/{d}, first byte {?d} of {d})\n", .{ len, st.pos, tw.pos, st.base, tw.base, st.mtp_base, tw.mtp_base, diff, n });
++        if (st.pos != tw.pos or st.mtp_len != tw.mtp_len or st.base != tw.base or st.mtp_base != tw.mtp_base or !std.mem.eql(u8, r0, r1) or diff != null) {
++            std.debug.print("FAIL solo: prompt of {d}: the busy state differs (pos {d}/{d}, rings' base {d}/{d}, MTP base {d}/{d}, KDA records {s}, first byte {?d} of {d} in {s})\n", .{ len, st.pos, tw.pos, st.base, tw.base, st.mtp_base, tw.mtp_base, if (std.mem.eql(u8, r0, r1)) "equal" else "DIFFER", diff, n, if (diff) |o| region(tw, o) else "-" });
 +            failed = true;
 +        }
 +        try x.release(slots[0]);
 +        try x.release(slots[1]);
 +    }
 +    if (failed) return error.TestFailed;
-+    check.pass("busy prompt steps of {d} rows at TP={d}: {d} prompts, one with kept states at chunks 1 and 3, equal their twins a whole chunk a step in the first token, the next window's logits and tokens, the rings' bases, the marks called and every state byte", .{ B, world, cases.len });
++    check.pass("busy prompt steps of {d} rows at TP={d}: {d} prompts, one with kept states at chunks 1 and 3, equal their twins a whole chunk a step in the first token, the next window's logits and tokens, the rings' bases, the MTP base, the marks called, the KDA records read next and every other state byte", .{ B, world, cases.len });
 +}
 diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
 index 0c745206a..589aeee03 100644
