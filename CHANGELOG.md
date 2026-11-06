@@ -9,6 +9,14 @@
   (#12), the settings table's `HEAD` and `REASONING_EFFORT` defaults (#13), and the startup check's page count with
   `CACHE_FIRST=1` (#14), all by travellingsoldier85.
 
+- **2026-11-06** -- engine patch 0110: `KV_SHARD=1` (`TF_GLM_KV_SHARD`), opt-in, KV sharding at TP=2 by
+  Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)), toward upstream [#1431](https://github.com/ashhart/TensorFold/issues/1431). Each stream's FP8
+  latent rows live on its owner Spark alone, so the pool holds about twice the tokens (4,098 to 8,196 pages at the
+  defaults). On the pair: every greedy reply identical to unsharded across eight request sets (1-8 concurrent
+  streams, eight 30k contexts, a 102.5k conversation); decode -1.6% at one stream, -3.6% aggregate at eight; cold
+  first token unchanged; `tf-cuda-test glm-kv-shard-check` byte-identical to an unsharded twin over 10 paths, kept
+  states through the disk image included. With `CACHE_FIRST=1 PROMPT_CACHE_GIB=6 LEARN_GIB=30`: a 4.1 GiB cache and
+  3.15M tokens of pool a rank, and a 102.5k conversation resumed from disk after a restart in 1.13 s.
 - **2026-11-06** -- engine patch 0109: `LEARN_GIB` (`--learn-conversations`), opt-in, a backport of upstream
   [#1411](https://github.com/ashhart/TensorFold/pull/1411) by Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)). Kept prompt states also go to disk on
   the head Spark, every rank's part, so conversations survive eviction and restarts. On the pair at the served

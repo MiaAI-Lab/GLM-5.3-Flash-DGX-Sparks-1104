@@ -186,6 +186,11 @@ HOST_CACHE_GIB="${HOST_CACHE_GIB:-0}"
 # written while the disk has less free.
 LEARN_GIB="${LEARN_GIB:-0}"
 LEARN_MIN_FREE_GIB="${LEARN_MIN_FREE_GIB:-15}"
+# KV_SHARD=1 (engine patch 0110, TF_GLM_KV_SHARD): each stream's FP8 latent rows live on one Spark (its owner) instead
+# of both, so the same memory holds about twice the tokens; the other Spark's queries go to the owner for attention
+# (1-4% decode). Needs KV=fp8, KV pages, DFlash2 or no drafter, PARALLEL above 1. The pool then takes most of the
+# room: pair it with CACHE_FIRST=1 PROMPT_CACHE_GIB so long conversations stay kept. 0 (default): off, as before.
+KV_SHARD="${KV_SHARD:-0}"
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"     # --vision-max-images: images per request (engine default 4, at most 64)
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media

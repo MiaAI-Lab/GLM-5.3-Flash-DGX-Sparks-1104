@@ -19,7 +19,7 @@
 
 **Engine: TensorFold 1.1.9** (`tensorfold-native --version`), upstream commit
 [`f350cd3e`](https://github.com/ashhart/TensorFold/commit/f350cd3ea253a042e205746928271f9d8f71a82d) plus this recipe's
-109 engine patches (`patches/engine/`).
+110 engine patches (`patches/engine/`).
 
 This recipe serves GLM-5.3-Flash from an EXL3 checkpoint on **two NVIDIA DGX Sparks** (GB10, 128 GB unified memory
 each) at tensor parallel 2, one rank on each Spark, over their ConnectX-7 link. It uses TensorFold's native Zig/CUDA
@@ -49,7 +49,7 @@ The engine is TensorFold 1.1.9 at commit `f350cd3e` ([ashhart/TensorFold](https:
 
 ## What is checked
 
-109 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
+110 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
 reaches the worker by content; link discovery finds both PCIe twins of the cabled port and the RoCE v2 GID that
 holds each port's own IPv4; NCCL and the engine's RDMA all-gather run over the cable; the full 1,048,576-token window
 serves 8 streams beside a 3.6 GiB prompt cache; greedy replies are byte-stable across every change
@@ -183,6 +183,19 @@ prompt's first token comes about 47% later than at `1`. Replies are byte-identic
   costs a stream decoding beside it about 1% (34.57 against 34.77 tok/s). A state read from disk restarts DFlash2 at
   its mark, as `TF_GLM_SNAP_DRAFTER=0` does for one in memory. Damaged files fail their check and the turn prefills.
   About 0.5 GiB a 16k-token state, less for later turns, which share earlier turns' rows. Off: replies byte-identical.
+- **KV sharding: `KV_SHARD=1`** (engine patch 0110, `TF_GLM_KV_SHARD`, off by default). Each stream's FP8 latent rows
+  live on one Spark, its owner, instead of on both (the pooled index keys stay on both, as the indexer runs on both),
+  so a token costs 3,542 bytes a rank instead of 6,380 and the same memory holds about twice the tokens. The other
+  Spark's queries go to the owner for attention, so decode costs 1-4%. Measured on the pair (2026-11-06,
+  `PARALLEL=8`, 1M window, DFlash2, Ablit): at the defaults the pool goes from 4,098 to 8,196 pages (2.10M to 4.20M
+  tokens); decode 34.93 to 34.37 tok/s at one stream and 85.0 to 82.0 aggregate at eight; cold first token unchanged;
+  every greedy reply identical (decode, 1-8 concurrent streams, eight 30k contexts at once, a 102.5k conversation).
+  The pool then takes most of the room and the prompt cache gets 0.5-1.2 GiB, too little to keep a 100k-token
+  conversation (880 MiB on its owner), so **use it with `CACHE_FIRST=1 PROMPT_CACHE_GIB=6`**: a 4.1 GiB cache a
+  rank and 6,147 pages (3.15M tokens), both more than unsharded at the defaults (2.4 GiB, 2.10M). With `LEARN_GIB`
+  each Spark writes the rows it holds and a read lands on an owner chosen then: the 102.5k conversation resumed
+  after a restart with its first token in 1.13 s (1,013 MiB in 698 ms). A store written sharded is not read
+  unsharded or the reverse (its identity differs), so turning `KV_SHARD` on or off starts an empty one.
 - `HOST_CACHE_GIB=0` on GB10 (a pinned host tier takes the pool's own memory). The memory guard stops the pair in
   order when a Spark stays under 2.5 GiB available, and logs that to `logs/current/memguard.log`. To free memory:
   lower `PARALLEL`, `DENSE`/`HEAD` bits or `VISION=0`; raise `MEMORY_RESERVE_GIB` on out-of-memory errors.
@@ -228,6 +241,7 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 | `DENSE`, `HEAD` | `q8`, `bf16` | `bf16`, `q8`, `q6` or `q4` for the dense linears and the LM head; the pair's `local.sh` sets `HEAD=q8` |
 | `MEMORY_RESERVE_GIB`, `HOST_CACHE_GIB`, `PROMPT_CACHE_GIB` | `12`, `0`, empty | See [Memory](#memory-on-a-128-gb-unified-spark); the pair runs the reserve at 9.5 |
 | `LEARN_GIB`, `LEARN_MIN_FREE_GIB` | `0`, `15` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0109); see [Memory](#memory-on-a-128-gb-unified-spark) |
+| `KV_SHARD` | `0` | `1` keeps each stream's latent rows on one Spark (`TF_GLM_KV_SHARD`, patch 0110): about twice the tokens, 1-4% decode; use with `CACHE_FIRST=1 PROMPT_CACHE_GIB=6`, see [Memory](#memory-on-a-128-gb-unified-spark). Needs `KV=fp8`, KV pages, DFlash2 or no drafter |
 | `CACHE_FIRST` | `0` | `1` sets `PROMPT_CACHE_GIB` (required) aside before the streams' windows (`TF_PROMPT_CACHE_FIRST`, patch 0108), so the cap becomes the cache; see [Memory](#memory-on-a-128-gb-unified-spark) |
 | `WITH_VIDEO` | `0` | `1` builds `libtfvideo.so` (FFmpeg 9.0.2, static, LGPL; h264/hevc/vp8/vp9/mpeg4 in mp4/mkv) into its own image tag, so `VISION=1` serves `video_url` parts; a few minutes more at build |
 | `VISION`, `VISION_MAX_IMAGES`, `CHAT_TEMPLATE` | `1`, `50`, `auto` | Image input (`image_url` parts) on rank 0's tower, with `templates/glm-5.3-flash-vision.jinja`. `video_url` parts too with `WITH_VIDEO=1` (otherwise HTTP 500, issue 8); audio parts are unsupported and an mp4's audio track is ignored |
@@ -296,9 +310,9 @@ no `tools` field): the guard would remove the calls that client is waiting for.
 
 ## Engine patches
 
-`patches/engine/` holds 109 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
+`patches/engine/` holds 110 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0109 are this pair's own or ported from that recipe or from upstream. None is GB10-specific: the arch-gated kernels test
+0094-0110 are this pair's own or ported from that recipe or from upstream. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -318,6 +332,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0107 | `TF_TOOL_CALL_GUARD=1` (opt-in, off by default): tool-call markup never reaches the client as text. A request that offers no tools (none sent, or `tool_choice: "none"`) although its history called them gets a closing system note that tools are unavailable, and any `<tool_call>` the model writes anyway is hidden; a request that offers tools has calls to tools it did not offer, and malformed calls, hidden. Streamed or whole; each hide is logged (`tool-call guard:`). Off: replies byte-identical |
 | 0108 | `TF_PROMPT_CACHE_FIRST=1` (`CACHE_FIRST=1`, opt-in): the prompt cache is set aside before the room is counted in whole windows; off, the plan is as before. The startup log says when the room funds less cache than `--prompt-cache-gib` asks, and what frees more |
 | 0109 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411): kept prompt states on disk, every rank's part, written behind the request and read back (ahead of a queued turn when it can) after an eviction or a restart. On this stack the disk image copies 0015's two-tier lease page by page and rank 1's part travels the follow link of 0031. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
+| 0110 | KV sharding (`KV_SHARD=1`, `TF_GLM_KV_SHARD`, off by default) at TP=2, toward upstream [#1431](https://github.com/ashhart/TensorFold/issues/1431): each stream's FP8 latent rows on its owner rank, a second page table pointing off-owner at a discard page, owner-computed decode and verify (no new kernel), prompts on a borrowed twin, kept states carried to another owner in 32 MiB pieces, and 0109's disk image under it. Refused by name with the MTP drafter, `--parallel 1`, other KV caches, or a part under 131k tokens. `tf-cuda-test glm-kv-shard-check` checks it against an unsharded twin byte for byte. Off: replies byte-identical |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 
@@ -374,7 +389,7 @@ accounting are adapted from Mia's AI Lab's
 
 Patches 0103-0104 are ported from the lab's own [2x RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold).
 Full credits, including the authors of the carried upstream patches (Adam Hillson, ajensenwaud, Bizuayeu,
-SvangenStudios, with their names in each patch's `From:` line), are in [CREDITS.md](CREDITS.md). Patch 0109 is a backport of upstream #1411 by Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)). Required notices are
+SvangenStudios, with their names in each patch's `From:` line), are in [CREDITS.md](CREDITS.md). Patch 0109 is a backport of upstream #1411, and 0110 (KV sharding) is toward upstream #1431, both by Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)). Required notices are
 in [NOTICE.md](NOTICE.md).
 
 ## License
