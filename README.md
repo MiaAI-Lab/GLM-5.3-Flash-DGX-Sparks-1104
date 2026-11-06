@@ -19,7 +19,7 @@
 
 **Engine: TensorFold 1.1.9** (`tensorfold-native --version`), upstream commit
 [`f350cd3e`](https://github.com/ashhart/TensorFold/commit/f350cd3ea253a042e205746928271f9d8f71a82d) plus this recipe's
-110 engine patches (`patches/engine/`).
+111 engine patches (`patches/engine/`).
 
 This recipe serves GLM-5.3-Flash from an EXL3 checkpoint on **two NVIDIA DGX Sparks** (GB10, 128 GB unified memory
 each) at tensor parallel 2, one rank on each Spark, over their ConnectX-7 link. It uses TensorFold's native Zig/CUDA
@@ -337,9 +337,9 @@ the template as it is. A `CHAT_TEMPLATE` of your own is served as it is either w
 
 ## Engine patches
 
-`patches/engine/` holds 110 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
+`patches/engine/` holds 111 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0110 are this pair's own or ported from that recipe or from upstream. None is GB10-specific: the arch-gated kernels test
+0094-0111 are this pair's own or ported from that recipe or from upstream. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -360,6 +360,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0108 | `TF_PROMPT_CACHE_FIRST=1` (`CACHE_FIRST=1`, opt-in): the prompt cache is set aside before the room is counted in whole windows; off, the plan is as before. The startup log says when the room funds less cache than `--prompt-cache-gib` asks, and what frees more |
 | 0109 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411): kept prompt states on disk, every rank's part, written behind the request and read back (ahead of a queued turn when it can) after an eviction or a restart. On this stack the disk image copies 0015's two-tier lease page by page and rank 1's part travels the follow link of 0031. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
 | 0110 | KV sharding (`KV_SHARD=1`, `TF_GLM_KV_SHARD`, off by default) at TP=2, toward upstream [#1431](https://github.com/ashhart/TensorFold/issues/1431): each stream's FP8 latent rows on its owner rank, a second page table pointing off-owner at a discard page, owner-computed decode and verify (no new kernel), prompts on a borrowed twin, kept states carried to another owner in 32 MiB pieces, and 0109's disk image under it. Refused by name with the MTP drafter, `--parallel 1`, other KV caches, or a part under 131k tokens. `tf-cuda-test glm-kv-shard-check` checks it against an unsharded twin byte for byte. Off: replies byte-identical |
+| 0111 | Backported from upstream ashhart/TensorFold#2276 (`882ca0a7`, fixes #2256): a resumed turn that has not started its prompt pass is ranked by its uncached tail (`max(cached, reuse.at)`), not its whole prompt, so it no longer waits behind a cold prefill whose remaining rows are fewer than its whole prompt; the aging bound is kept, and a failed restore ranks by the whole prompt again. Scheduling order only: no token, sampling or arithmetic path changes |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 
