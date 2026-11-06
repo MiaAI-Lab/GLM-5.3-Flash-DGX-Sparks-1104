@@ -19,7 +19,7 @@
 
 **Engine: TensorFold 1.1.9** (`tensorfold-native --version`), upstream commit
 [`f350cd3e`](https://github.com/ashhart/TensorFold/commit/f350cd3ea253a042e205746928271f9d8f71a82d) plus this recipe's
-108 engine patches (`patches/engine/`).
+109 engine patches (`patches/engine/`).
 
 This recipe serves GLM-5.3-Flash from an EXL3 checkpoint on **two NVIDIA DGX Sparks** (GB10, 128 GB unified memory
 each) at tensor parallel 2, one rank on each Spark, over their ConnectX-7 link. It uses TensorFold's native Zig/CUDA
@@ -49,7 +49,7 @@ The engine is TensorFold 1.1.9 at commit `f350cd3e` ([ashhart/TensorFold](https:
 
 ## What is checked
 
-108 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
+109 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
 reaches the worker by content; link discovery finds both PCIe twins of the cabled port and the RoCE v2 GID that
 holds each port's own IPv4; NCCL and the engine's RDMA all-gather run over the cable; the full 1,048,576-token window
 serves 8 streams beside a 3.6 GiB prompt cache; greedy replies are byte-stable across every change
@@ -153,8 +153,8 @@ prompt's first token comes about 47% later than at `1`. Replies are byte-identic
   cache (1.2 GiB with 2.4 GiB less room, issue 7); the startup line is the check.
 - **What the cache keeps, at this pin** (issues 3 and 7): hits land on the 4,096-row prompt-chunk grid, so a
   4,870-token prompt resumes 4,096 and up to 4,095 trailing tokens are prefilled again each turn (about 2.5 s); the
-  cache is device memory only, and nothing survives a restart (the CUDA GLM family refuses `--learn-conversations`
-  at `f350cd3e`). A 1.2 GiB cache kept one conversation up to 252k tokens but not 378k, and two of eight ~38k
+  cache is device memory only, and without `LEARN_GIB` nothing survives a restart (the CUDA GLM family refuses
+  `--learn-conversations` at `f350cd3e`; engine patch 0109 adds it, see below). A 1.2 GiB cache kept one conversation up to 252k tokens but not 378k, and two of eight ~38k
   conversations recalled newest first. For many long-lived agent sessions, size `PARALLEL` and `CONTEXT` for the
   cache (see above) rather than for the stream count.
 - **Long agent sessions: `CACHE_FIRST=1 PROMPT_CACHE_GIB=12`** (engine patch 0108). The cache is set aside before
@@ -166,13 +166,23 @@ prompt's first token comes about 47% later than at `1`. Replies are byte-identic
   and three concurrent agent loops ran as fast as without it. Without it, the served config resumes 1 of 8 and not the
   long one. The trade: the streams together hold one window's tokens at a time instead of two, so a second
   request past ~1M tokens of live context waits. `PARALLEL=2 CONTEXT=524288 PROMPT_CACHE_GIB=32` also keeps them
-  (12.4 GiB), at two streams. There is no disk tier yet, so nothing survives a restart.
+  (12.4 GiB), at two streams. Add `LEARN_GIB` (below) so the states also survive eviction and restarts.
   With `CACHE_FIRST=1`, `PROMPT_CACHE_GIB` is a priority, not a floor: it is taken off the room only to count the
   streams' whole windows, and the cache then gets what those windows leave, up to the ask. So a larger ask can fund
   more cache than a smaller one, by costing the streams a window, and a lower `CONTEXT` alone can buy a second window
   instead of more cache. On a second pair (issue 16, 17.8-18.9 GiB of room) `CONTEXT=524288` funded 9.7 GiB with
   `PROMPT_CACHE_GIB=12` (two windows, 2,050 pages) and 12.9 GiB with `14` (one window, 1,032 pages). Read the page
   count and the funded cache in the startup line after every change.
+- **Conversations on disk: `LEARN_GIB=30`** (engine patch 0109, `--learn-conversations`, off by default). Kept prompt
+  states also go to disk in `CACHE_DIR/learn` on the head Spark, every rank's part, so a conversation whose device
+  copy was evicted, or that outlived a restart, resumes from disk instead of prefilling again. No state is written
+  while the disk has under `LEARN_MIN_FREE_GIB` (15) free. Measured on the pair (2026-11-06, `PARALLEL=8`, 1M window,
+  DFlash2, Ablit): an 18.7k-token conversation's next turn after a restart has its first token in 1.9 s (cold: 10.7 s)
+  and after an eviction in 2.5 s; a 102.5k-token one after a restart in 1.8 s (1,013 MiB read in 1.4 s; cold: 58.4 s).
+  Replies equal the in-memory resume's. A state is written behind the request (713 MiB in 1.5 s for 53k tokens) and
+  costs a stream decoding beside it about 1% (34.57 against 34.77 tok/s). A state read from disk restarts DFlash2 at
+  its mark, as `TF_GLM_SNAP_DRAFTER=0` does for one in memory. Damaged files fail their check and the turn prefills.
+  About 0.5 GiB a 16k-token state, less for later turns, which share earlier turns' rows. Off: replies byte-identical.
 - `HOST_CACHE_GIB=0` on GB10 (a pinned host tier takes the pool's own memory). The memory guard stops the pair in
   order when a Spark stays under 2.5 GiB available, and logs that to `logs/current/memguard.log`. To free memory:
   lower `PARALLEL`, `DENSE`/`HEAD` bits or `VISION=0`; raise `MEMORY_RESERVE_GIB` on out-of-memory errors.
@@ -217,6 +227,7 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 | `KV`, `KV_PAGES` | `fp8`, `on` | `--kv-cache`, one shared pool of 512-row pages with `CONTEXT` as one request's cap |
 | `DENSE`, `HEAD` | `q8`, `bf16` | `bf16`, `q8`, `q6` or `q4` for the dense linears and the LM head; the pair's `local.sh` sets `HEAD=q8` |
 | `MEMORY_RESERVE_GIB`, `HOST_CACHE_GIB`, `PROMPT_CACHE_GIB` | `12`, `0`, empty | See [Memory](#memory-on-a-128-gb-unified-spark); the pair runs the reserve at 9.5 |
+| `LEARN_GIB`, `LEARN_MIN_FREE_GIB` | `0`, `15` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0109); see [Memory](#memory-on-a-128-gb-unified-spark) |
 | `CACHE_FIRST` | `0` | `1` sets `PROMPT_CACHE_GIB` (required) aside before the streams' windows (`TF_PROMPT_CACHE_FIRST`, patch 0108), so the cap becomes the cache; see [Memory](#memory-on-a-128-gb-unified-spark) |
 | `WITH_VIDEO` | `0` | `1` builds `libtfvideo.so` (FFmpeg 9.0.2, static, LGPL; h264/hevc/vp8/vp9/mpeg4 in mp4/mkv) into its own image tag, so `VISION=1` serves `video_url` parts; a few minutes more at build |
 | `VISION`, `VISION_MAX_IMAGES`, `CHAT_TEMPLATE` | `1`, `50`, `auto` | Image input (`image_url` parts) on rank 0's tower, with `templates/glm-5.3-flash-vision.jinja`. `video_url` parts too with `WITH_VIDEO=1` (otherwise HTTP 500, issue 8); audio parts are unsupported and an mp4's audio track is ignored |
@@ -285,9 +296,9 @@ no `tools` field): the guard would remove the calls that client is waiting for.
 
 ## Engine patches
 
-`patches/engine/` holds 108 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
+`patches/engine/` holds 109 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0108 are this pair's own or ported from that recipe. None is GB10-specific: the arch-gated kernels test
+0094-0109 are this pair's own or ported from that recipe or from upstream. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -306,6 +317,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0105 | An untyped tool parameter takes the JSON object or array the model wrote; text stays text (sibling recipe issue #180) |
 | 0107 | `TF_TOOL_CALL_GUARD=1` (opt-in, off by default): tool-call markup never reaches the client as text. A request that offers no tools (none sent, or `tool_choice: "none"`) although its history called them gets a closing system note that tools are unavailable, and any `<tool_call>` the model writes anyway is hidden; a request that offers tools has calls to tools it did not offer, and malformed calls, hidden. Streamed or whole; each hide is logged (`tool-call guard:`). Off: replies byte-identical |
 | 0108 | `TF_PROMPT_CACHE_FIRST=1` (`CACHE_FIRST=1`, opt-in): the prompt cache is set aside before the room is counted in whole windows; off, the plan is as before. The startup log says when the room funds less cache than `--prompt-cache-gib` asks, and what frees more |
+| 0109 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411): kept prompt states on disk, every rank's part, written behind the request and read back (ahead of a queued turn when it can) after an eviction or a restart. On this stack the disk image copies 0015's two-tier lease page by page and rank 1's part travels the follow link of 0031. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 
@@ -362,7 +374,7 @@ accounting are adapted from Mia's AI Lab's
 
 Patches 0103-0104 are ported from the lab's own [2x RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold).
 Full credits, including the authors of the carried upstream patches (Adam Hillson, ajensenwaud, Bizuayeu,
-SvangenStudios, with their names in each patch's `From:` line), are in [CREDITS.md](CREDITS.md). Required notices are
+SvangenStudios, with their names in each patch's `From:` line), are in [CREDITS.md](CREDITS.md). Patch 0109 is a backport of upstream #1411 by Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)). Required notices are
 in [NOTICE.md](NOTICE.md).
 
 ## License

@@ -180,6 +180,12 @@ CACHE_FIRST="${CACHE_FIRST:-0}"
 # here and PROMPT_CACHE_GIB (device pages) is the one to raise. Unset or auto would pin a quarter of MemAvailable,
 # up to 16 GiB over the two ranks.
 HOST_CACHE_GIB="${HOST_CACHE_GIB:-0}"
+# LEARN_GIB (engine patch 0109, --learn-conversations): kept prompt states also go to disk under CACHE_DIR/learn,
+# every rank's part in rank 0's store, so a conversation resumes after its device copy is evicted or the pair
+# restarts. The GiB of disk the states may take; 0 (default): off, as before. LEARN_MIN_FREE_GIB: no state is
+# written while the disk has less free.
+LEARN_GIB="${LEARN_GIB:-0}"
+LEARN_MIN_FREE_GIB="${LEARN_MIN_FREE_GIB:-15}"
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"     # --vision-max-images: images per request (engine default 4, at most 64)
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media

@@ -32,7 +32,7 @@ URL="http://$API_HOST:$PORT"
 FIT_FILE="$STATE_DIR/context-fit.tsv"
 fit_key() {
   printf '%s|' "$PATCHES_HASH" "$MODEL_DIR" "$WORKER" "$TP" "$PARALLEL" "$KV" "$KV_PAGES" "$DENSE" "$HEAD" "$VISION" "$VISION_MAX_IMAGES" \
-    "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CACHE_FIRST" "$HOST_CACHE_GIB" "$ROCE" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
+    "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CACHE_FIRST" "$HOST_CACHE_GIB" "$LEARN_GIB" "$ROCE" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
     | sha256sum | cut -c1-16
 }
 remembered_context() {
@@ -130,6 +130,9 @@ build_serve_args() {
     [[ -z "$MTP_CONFIDENCE" ]] || SERVE_ARGS+=(--mtp-confidence "$MTP_CONFIDENCE")
   fi
   [[ -z "$PROMPT_CACHE_GIB" ]] || SERVE_ARGS+=(--prompt-cache-gib "$PROMPT_CACHE_GIB")
+  # LEARN_GIB: engine patch 0109 keeps the prompt states on disk too (rank 0's CACHE_DIR/learn holds every rank's part)
+  [[ "$LEARN_GIB" == 0 ]] || SERVE_ARGS+=(--learn-conversations --learn-dir /state/learn --learn-gib "$LEARN_GIB"
+    --learn-min-free-gib "$LEARN_MIN_FREE_GIB")
   read -r -a extra <<< "$SERVE_EXTRA_ARGS"
   SERVE_ARGS+=("${extra[@]}")
 }
@@ -303,7 +306,7 @@ launch() {
   log "Ranks:"
   show_ranks
   if [[ "$DRY_RUN" != 1 ]]; then
-    mkdir -p "$RUN_LOG_DIR" "$CACHE_DIR/home"
+    mkdir -p "$RUN_LOG_DIR" "$CACHE_DIR/home" "$CACHE_DIR/learn"
     ln -sfn -- "$RUN_LOG_DIR" "$LOG_DIR/current"
     wssh mkdir -p "$WORKER_CACHE_DIR/home" "$WORKER_STATE_DIR" \
       || fail E_START "Could not create $WORKER_CACHE_DIR on $(worker_host). It defaults to this Spark's home; when the logins differ, set WORKER_CACHE_DIR to a path under $(worker_host)'s own home in local.sh."

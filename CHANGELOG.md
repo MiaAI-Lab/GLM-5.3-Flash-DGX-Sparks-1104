@@ -9,6 +9,15 @@
   (#12), the settings table's `HEAD` and `REASONING_EFFORT` defaults (#13), and the startup check's page count with
   `CACHE_FIRST=1` (#14), all by travellingsoldier85.
 
+- **2026-11-06** -- engine patch 0109: `LEARN_GIB` (`--learn-conversations`), opt-in, a backport of upstream
+  [#1411](https://github.com/ashhart/TensorFold/pull/1411) by Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)). Kept prompt states also go to disk on
+  the head Spark, every rank's part, so conversations survive eviction and restarts. On the pair at the served
+  `PARALLEL=8` and 1M window: off, greedy hashes equal main's (6 of 6) and decode is unchanged (35.07 against 34.60
+  tok/s, 1,024 tokens); on, an 18.7k-token turn resumes after a restart in 1.9 s (cold 10.7 s), after an eviction in
+  2.5 s, queued behind a 52k-token prompt with its state read ahead, and with `"draft": false`; a 102.5k-token one
+  after a restart in 1.8 s (cold 58.4 s); every reply equal to the in-memory resume. Damaged state or block files are
+  refused and the turn prefills. Writing a state costs a stream decoding beside it about 1%. Host tests: the disk image
+  round trip on a device-only lease and on one that runs onto 0015's host pages.
 - **2026-11-06** -- engine patch 0108: `CACHE_FIRST=1` (`TF_PROMPT_CACHE_FIRST`), opt-in. The pool counted the room in
   whole windows before the prompt cache, so `PROMPT_CACHE_GIB` only capped the remainder (issue 7: crystal8194,
   tanchunsiong, unitea1992; issue 3). With it, the cache is set aside first and the streams share the pages left, one
