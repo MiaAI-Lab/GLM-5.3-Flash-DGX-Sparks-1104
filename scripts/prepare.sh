@@ -31,6 +31,7 @@ validate_config() {
   [[ "$KV" =~ ^(fp8|bf16)$ ]] || fail E_CONFIG 'KV must be fp8 or bf16 (--kv-cache).'
   [[ "$KV_PAGES" =~ ^(on|off|auto)$ ]] || fail E_CONFIG 'KV_PAGES must be on, off or auto (TF_KV_PAGES).'
   [[ "$CE_EXCHANGE" =~ ^[01]$ && "$ABSORB_MMA" =~ ^[01]$ && "$W8A8" =~ ^[01]$ ]] || fail E_CONFIG 'CE_EXCHANGE, ABSORB_MMA and W8A8 must be 0 or 1.'
+  [[ "$CHUNK_SOLO" =~ ^[01]$ && "$CHUNK_BUSY" =~ ^(2048|1024)$ ]] || fail E_CONFIG 'CHUNK_SOLO must be 0 or 1, and CHUNK_BUSY 2048 or 1024.'
   if [[ "$DENSE" == fp8 ]]; then
     warn W_DENSE 'The native engine has no FP8 dense weights: DENSE=fp8 is served as DENSE=q8 (8-bit codes, groups of 64).'
     DENSE=q8

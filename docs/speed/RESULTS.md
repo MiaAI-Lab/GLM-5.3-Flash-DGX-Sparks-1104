@@ -1482,3 +1482,29 @@ lane upstream now releases deferred around its trace is left decoding on this st
 on streams that cannot start; 0104 added the fill-queue yield checks), so every round carries a ghost stream. Not
 pursued further: the leak it fixes needs a failed trace, which the pair has never logged. 0106 stays in candidates as
 a record; the recipe is back at 105 patches; spark1's build tree likewise.
+
+## Patch 0108: busy prompt steps (`CHUNK_SOLO`), pair A/B (2026-11-06)
+
+Pair 6f90 + de02 (TP=2), Ablit q6 dense / q8 head, DFlash2, `--parallel 4`, window 262,144, RoCE on. Arm A is `main` (0001-0107);
+arm B adds 0108. Two images built from the recipe Dockerfile, run back to back on the same pair. Clocks: GPU locked
+`nvidia-smi -lgc 0,1900` (hardware max 3003 MHz), CPU no cap set (performance governor, cores at rated max 3.9 and 2.8 GHz).
+
+| | A | B, `CHUNK_SOLO=0` | B, busy 2048 | B, busy 1024 |
+|---|---:|---:|---:|---:|
+| worst decode pause beside a cold ~200k prefill, 3 decoders (p99) | 2.77 s (2.53) | 2.75 s (2.52) | 1.55 s (1.36) | **0.88 s (0.82)** |
+| that prefill's time | 143.3 s | 143.2 s | 144.6 s (+0.9%) | 151.3 s (+5.6%) |
+| greedy hashes, prose / code (`acc-1104.py`) | `d672c5cf4352` / `cd62e6f62fd3` | same | same | same |
+| 4 concurrent prompts == solo; disconnect clean | 4/4; ok | 4/4; ok | 4/4; ok | 4/4; ok |
+| retention, 3 conversations of ~77k tokens (`glm_retention.py`) | 3/3, resend 1.94-1.99 s | 3/3 | 3/3 | 3/3 |
+| cold prefill alone 20k / 40k / 79k (tok/s, 2 reps) | 1706-1725 / 1742-1748 / 1734-1741 | 1688-1719 / 1732-1746 / 1726-1734 | 1719 / 1742-1746 / 1741 | 1721 / 1741-1747 / 1739 |
+| decode alone, 1 stream prose / structured (tok/s) | 42.0 / 77.0 | 41.9 / 76.7 | 42.0 / 76.8 | 41.9 / 76.6 |
+| 4 streams, total (2 reps) | 78.5, 81.9 | 81.3, 79.6 | 82.1, 82.6 | 84.4, 80.9 |
+
+Pair-sized memory does not hold three 275k conversations (the model leaves about 17 GiB a rank), so retention here is three
+~77k ones: it checks that the kept-state grid and the cache are the same with the setting on, not the recipe's long-window
+figure. Not run on this pair: `tf-cuda-test glm-solo-check` (needs its decode-config fixture); it passed at TP=4 at both busy
+sizes on the four-Spark build the patch was developed on, 2026-11-04.
+
+Host tests (desktop, Zig 0.17.0, pin f350cd3e + 0001-0108 against the same without 0108): `test-glm-protocol-host`, `-startup-host`,
+`-prompt-settings-host` and `-admission-host` pass; the five failures `test-glm-dflash-host` (measured launch record) and
+`test-glm-snapshots-host` (four size cases) show are the same five with and without 0108.

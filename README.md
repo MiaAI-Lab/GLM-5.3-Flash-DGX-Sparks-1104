@@ -192,6 +192,7 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 | `DRAFTER`, `DRAFTER_BITS` | `dflash2`, `4` | `dflash2`, `mtp` (the checkpoint's own head) or `none` |
 | `PARALLEL` | `4` | `--parallel`; admitted only if it fits, `auto` serves up to 8. The pair runs 8: free at 1-4 streams, 94-95 tok/s at 6, 105-106 at 8 |
 | `PREFILL_SHARE`, `PREFILL_BUDGET` | `0.68`, empty | See [Prefill beside decoding](#prefill-beside-decoding) |
+| `CHUNK_SOLO`, `CHUNK_BUSY` | `0`, `2048` | `CHUNK_SOLO=1` (engine patch 0108): a prompt step beside a decoding stream takes `CHUNK_BUSY` rows (2048 or 1024) of the 4,096-row chunk, so a decoder's pause beside a long prefill is shorter. Alone, nothing changes. See [`docs/speed/candidates/0108-notes.md`](docs/speed/candidates/0108-notes.md) |
 | `CONTEXT`, `CONTEXT_MAX` | `auto`, `1048576` | See [CONTEXT=auto](#contextauto) |
 | `KV`, `KV_PAGES` | `fp8`, `on` | `--kv-cache`, one shared pool of 512-row pages with `CONTEXT` as one request's cap |
 | `DENSE`, `HEAD` | `q8`, `q8` | `bf16`, `q8`, `q6` or `q4` for the dense linears and the LM head |
@@ -264,7 +265,7 @@ no `tools` field): the guard would remove the calls that client is waiting for.
 
 `patches/engine/` holds 107 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0107 are this pair's own or ported from that recipe. None is GB10-specific: the arch-gated kernels test
+0094-0108 are this pair's own or ported from that recipe. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -282,6 +283,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0103–0104 | From the RTX recipe: a tool call after prose that quotes a tool-call opener is the call (with a guard so a call quoted inside a call's value is never invoked); GLM warm turns, so a user message after an agent loop resumes past the loop (8,192 of 9.3K tokens cached, was 4,096) |
 | 0105 | An untyped tool parameter takes the JSON object or array the model wrote; text stays text (sibling recipe issue #180) |
 | 0107 | `TF_TOOL_CALL_GUARD=1` (opt-in, off by default): tool-call markup never reaches the client as text. A request that offers no tools (none sent, or `tool_choice: "none"`) although its history called them gets a closing system note that tools are unavailable, and any `<tool_call>` the model writes anyway is hidden; a request that offers tools has calls to tools it did not offer, and malformed calls, hidden. Streamed or whole; each hide is logged (`tool-call guard:`). Off: replies byte-identical |
+| 0108 | `TF_GLM_CHUNK_SOLO=4096` + `TF_GLM_CHUNK=2048\|1024` (recipe `CHUNK_SOLO=1`, `CHUNK_BUSY`; off by default): a prompt step beside a decoding stream takes `TF_GLM_CHUNK` rows of the chunk; alone, whole chunks and pairs as before, and kept states stay on the 4,096-row grid. Same bytes (the DFlash2 drafter only proposes), so hashes are unchanged. |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 
