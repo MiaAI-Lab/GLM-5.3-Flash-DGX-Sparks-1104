@@ -53,6 +53,7 @@ validate_config() {
   [[ "$VISION_MAX_IMAGES" =~ ^[1-9][0-9]*$ && VISION_MAX_IMAGES -le 64 ]] || fail E_CONFIG 'VISION_MAX_IMAGES must be 1-64.'
   for key in THINKING VISION CLEAR_THINKING; do [[ "${!key}" =~ ^[01]$ ]] || fail E_CONFIG "$key must be 0 or 1."; done
   [[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || fail E_CONFIG 'REASONING_EFFORT must be low, medium, high, xhigh or empty.'
+  [[ "$EFFORT_LINE" =~ ^(thinking|always)$ ]] || fail E_CONFIG 'EFFORT_LINE must be thinking or always.'
   [[ "$DRAFTER_BITS" =~ ^[04]$ ]] || fail E_CONFIG 'DRAFTER_BITS must be 4 or 0 (bf16).'
   [[ -z "$MTP_DRAFTS" || ( "$MTP_DRAFTS" =~ ^[0-9]+$ && MTP_DRAFTS -le 64 ) ]] || fail E_CONFIG 'MTP_DRAFTS must be empty or 0-64.'
   [[ -z "$MTP_CONFIDENCE" ]] || { is_number "$MTP_CONFIDENCE" && python3 -c 'import sys; sys.exit(0 if 0 <= float(sys.argv[1]) <= 1 else 1)' "$MTP_CONFIDENCE"; } \

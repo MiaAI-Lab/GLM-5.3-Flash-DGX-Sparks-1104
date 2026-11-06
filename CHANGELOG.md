@@ -1,5 +1,20 @@
 # Changelog
 
+- **2026-11-06** -- `EFFORT_LINE=thinking` (default): the template's `<|system|>Reasoning Effort: Max` line with
+  thinking on only, as TensorFold v0.6.0's recipe wrote it; `always` serves the template as it is. The checkpoint's
+  template (and the vision copy) sets the line to Max unless a request's effort is low or high, so every prompt
+  carried it, thinking off included (7 tokens; `/tokenize` on a one-line user message: 27 against 20), and a
+  thinking-off reply reasoned in its answer. `start.sh` writes the chosen template to `.state/chat_template.jinja`
+  with its second line taking the effort from `reasoning_effort`, which the engine passes with thinking on and
+  leaves null with thinking off (prompt.zig), and serves that copy on both ranks; a template without the line the
+  checkpoint ships stops the start (`E_CONFIG`); `DRY_RUN=1` checks and writes nothing. Measured with sparkDash's
+  quality suite on this pair (755 items, greedy, fixed seed, `PARALLEL=4 KV=bf16`), the same image: QA 79.3% (119/150)
+  -> **86.0%** (129/150), the five "binary representation, digits only" items that ran out of their 64 tokens
+  mid-division and the four transposed string reversals answered as v0.6.0's run did (140 of 150 QA replies
+  byte-identical to that run, served `DENSE=fp8`); MMLU 91.2% (260/285) -> 88.4% (252/285), the line's visible
+  reasoning no longer helping the thinking-off letters (v0.6.0's run: 88.1%); reason, arith, track and GSM8K
+  byte-identical to the run before (their prompts think, so the line stays). No reply ends on `length` any more.
+  README: the setting, "The effort line", a troubleshooting row.
 - **2026-11-06** -- engine patch 0108: `CACHE_FIRST=1` (`TF_PROMPT_CACHE_FIRST`), opt-in. The pool counted the room in
   whole windows before the prompt cache, so `PROMPT_CACHE_GIB` only capped the remainder (issue 7: crystal8194,
   tanchunsiong, unitea1992; issue 3). With it, the cache is set aside first and the streams share the pages left, one

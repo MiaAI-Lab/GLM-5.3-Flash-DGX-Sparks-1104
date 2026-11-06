@@ -53,7 +53,8 @@ The engine is TensorFold 1.1.9 at commit `f350cd3e` ([ashhart/TensorFold](https:
 reaches the worker by content; link discovery finds both PCIe twins of the cabled port and the RoCE v2 GID that
 holds each port's own IPv4; NCCL and the engine's RDMA all-gather run over the cable; the full 1,048,576-token window
 serves 8 streams beside a 3.6 GiB prompt cache; greedy replies are byte-stable across every change
-([CHANGELOG.md](CHANGELOG.md)). Image input was checked by a user (issue 8: PNG, and four frames in order); video input
+([CHANGELOG.md](CHANGELOG.md)); sparkDash's quality suite scores the served template's effort line
+([The effort line](#the-effort-line)). Image input was checked by a user (issue 8: PNG, and four frames in order); video input
 needs the `WITH_VIDEO=1` image (checked here: a three-colour clip described in order). `W8A8` is stashed on quality.
 
 ## Performance
@@ -214,6 +215,7 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 | `WITH_VIDEO` | `0` | `1` builds `libtfvideo.so` (FFmpeg 9.0.2, static, LGPL; h264/hevc/vp8/vp9/mpeg4 in mp4/mkv) into its own image tag, so `VISION=1` serves `video_url` parts; a few minutes more at build |
 | `VISION`, `VISION_MAX_IMAGES`, `CHAT_TEMPLATE` | `1`, `50`, `auto` | Image input (`image_url` parts) on rank 0's tower, with `templates/glm-5.3-flash-vision.jinja`. `video_url` parts too with `WITH_VIDEO=1` (otherwise HTTP 500, issue 8); audio parts are unsupported and an mp4's audio track is ignored |
 | `THINKING`, `REASONING_EFFORT`, `MAX_TOKENS`, `CLEAR_THINKING` | `0`, `high`, `32768`, `1` | Request defaults; earlier turns' reasoning is dropped from the prompt |
+| `EFFORT_LINE` | `thinking` | The template's `<|system|>Reasoning Effort: Max` line with thinking on only, as TensorFold v0.6.0's recipe wrote it (the served template is written to `.state/chat_template.jinja`); `always` keeps the checkpoint's template, which writes it into every prompt and makes a thinking-off reply reason in its answer. See [The effort line](#the-effort-line) |
 | `ABSORB_MMA`, `W8A8` | `1`, `0` | Prompt numerics: `ABSORB_MMA` is free (+8.0%, identical answers); `W8A8` rounds activations and stays off |
 | `CE_EXCHANGE` | `0` | Needs CUDA IPC between ranks, which two Sparks do not have |
 | `SERVED_NAME`, `SERVE_EXTRA_ARGS`, `TENSORFOLD_API_KEY` | `GLM-5.3-Flash`, empty, unset | The model id clients send; more `serve` flags; a bearer key for every route but `/health` |
@@ -276,6 +278,30 @@ What it does, streamed or not:
 Leave it off for a client that reads tool calls out of the reply text itself (tools described in its own system prompt,
 no `tools` field): the guard would remove the calls that client is waiting for.
 
+## The effort line
+
+The checkpoint's chat template (and this recipe's vision copy of it) opens every prompt with
+`<|system|>Reasoning Effort: Max` unless a request's `reasoning_effort` is `low` or `high`: its second line maps
+anything else, an absent value included, to Max. The engine renders the template as written, so a thinking-off
+prompt carries the line too (7 tokens: `/tokenize` on a one-line user message counts 27 against 20 without it), and
+with thinking off the model reasons in its answer instead of answering. TensorFold v0.6.0's recipe, whose server
+rendered GLM's prompt in its own code, wrote the line with thinking on only.
+
+Measured with sparkDash's quality suite on this pair (greedy, seed fixed, the same 755 items; the v0.6.0 run served
+`DENSE=fp8 KV=bf16`): with the line in every prompt, QA 79.3% (119/150) against v0.6.0's 84.0%, with five
+"binary representation, digits only" items cut by `max_tokens` 64 mid-division and four string reversals transposed;
+MMLU 91.2% (260/285) against 88.1%, the longer visible reasoning helping under its 1,024-token budget. Replaying the
+server's exact prompt through `/v1/completions` with and without the line reproduces every one of those flips, and
+the thinking-on categories (reason, arith, track, GSM8K) render the same prompt on both servers. With
+`EFFORT_LINE=thinking`, the same image: QA 86.0% (129/150), 140 of 150 replies byte-identical to v0.6.0's; MMLU
+88.4% (252/285); reason, arith, track and GSM8K byte-identical to the run with the line, and no reply ends on
+`length`.
+
+`EFFORT_LINE=thinking` (default) writes the line with thinking on only: `start.sh` copies the chosen template to
+`.state/chat_template.jinja` with its second line taking the effort from `reasoning_effort`, which the engine passes
+with thinking on and leaves null with thinking off, and serves that copy on both ranks. `EFFORT_LINE=always` serves
+the template as it is. A `CHAT_TEMPLATE` of your own is served as it is either way.
+
 ## Engine patches
 
 `patches/engine/` holds 108 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
@@ -313,6 +339,7 @@ only ever stops containers labelled `tf.recipe=glm53-spark`.
 | Symptom | Cause and fix |
 | --- | --- |
 | `[E_WORKER]` | ssh, Docker or the NVIDIA runtime is not ready on the worker; the message names which |
+| A thinking-off reply works the sum out in its answer and `finish_reason` is `length` on a short `max_tokens` | The prompt carries the template's `Reasoning Effort: Max` line (`EFFORT_LINE=always`, or a `CHAT_TEMPLATE` of your own); `EFFORT_LINE=thinking` (default) writes it with thinking on only. `/tokenize` on a one-line user message shows it: 7 tokens more |
 | `[E_FABRIC]` | No directly reached address, or no RoCE v2 GID holding an IPv4 on the link's port: cable the Sparks on one subnet, or set `FABRIC_PEER` / `NCCL_IB_GID_INDEX` |
 | `[W_FABRIC]` a rail left out | The second rail does not carry a full-size ping; check the cable, the twin's address and MTU |
 | `[E_MEMORY]`, `[E_PORT]` | Less than `MIN_AVAIL_GIB` available (another rank, usually), or a port in use |

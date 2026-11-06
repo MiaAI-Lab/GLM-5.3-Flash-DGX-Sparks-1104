@@ -185,6 +185,14 @@ VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"     # --vision-max-images: images p
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media
 # branch writes GLM's image and video markers instead of a "cannot see" note); none = the checkpoint's; or a file path
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-auto}"
+# The template's "Reasoning Effort" line. The checkpoint's template (and the vision copy) sets it to Max unless a
+# request's effort is low or high, so every prompt carries `<|system|>Reasoning Effort: Max`, thinking off included,
+# and a thinking-off reply then reasons in its answer (a 64-token "digits only" question runs out of tokens mid-sum).
+# TensorFold v0.6.0's recipe wrote the line with thinking on only. thinking (default): the same here -- the served
+# template is written to STATE_DIR/chat_template.jinja from the chosen one, its line taken from reasoning_effort,
+# which the engine passes with thinking on only; always: the template as it is. CHAT_TEMPLATE=auto only; a template
+# of your own decides for itself.
+EFFORT_LINE="${EFFORT_LINE:-thinking}"
 THINKING="${THINKING:-0}"                        # --thinking / --no-thinking default; requests override
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"    # --reasoning-effort low|medium|high|xhigh (empty: omit); xhigh renders the checkpoint's trained "Reasoning Effort: Max" line
 MAX_TOKENS="${MAX_TOKENS:-32768}"                # --max-tokens default reply limit

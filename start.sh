@@ -111,6 +111,26 @@ case "$CHAT_TEMPLATE" in
   *) fail E_CONFIG 'CHAT_TEMPLATE must be auto, none or an absolute file path.' ;;
 esac
 [[ -z "$TEMPLATE_FILE" || -f "$TEMPLATE_FILE" ]] || fail E_CONFIG "Chat template not found: $TEMPLATE_FILE"
+# EFFORT_LINE=thinking: the served template is the chosen one (the checkpoint's own with VISION=0) with its effort line
+# set from reasoning_effort, which the engine passes with thinking on only (null with thinking off: prompt.zig), so a
+# thinking-off prompt no longer carries `<|system|>Reasoning Effort: Max`. Written to STATE_DIR every start; the base
+# line must be the one the checkpoint ships, else the start stops rather than serve a template it did not understand.
+if [[ "$CHAT_TEMPLATE" == auto && "$EFFORT_LINE" == thinking ]]; then
+  EFFORT_BASE=${TEMPLATE_FILE:-$MODEL_DIR/chat_template.jinja}
+  [[ -f "$EFFORT_BASE" ]] || fail E_CONFIG "Chat template not found: $EFFORT_BASE (EFFORT_LINE=thinking rewrites its effort line)."
+  [[ "$DRY_RUN" == 1 ]] || mkdir -p "$STATE_DIR"
+  python3 - "$EFFORT_BASE" "$STATE_DIR/chat_template.jinja" "$DRY_RUN" <<'PY' || fail E_CONFIG "EFFORT_LINE=thinking: $EFFORT_BASE has no effort line this recipe knows; set EFFORT_LINE=always or CHAT_TEMPLATE to a file."
+import sys
+base = "{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}"
+line = "{%- set effective_reasoning_effort = (reasoning_effort if reasoning_effort in ['low', 'high'] else 'max') if (reasoning_effort is defined and reasoning_effort is not none) else none -%}"
+src = open(sys.argv[1], encoding="utf-8").read()
+if src.count(base) != 1:
+    sys.exit(1)
+if sys.argv[3] != "1":  # DRY_RUN=1 checks the base and writes nothing
+    open(sys.argv[2], "w", encoding="utf-8").write(src.replace(base, line))
+PY
+  TEMPLATE_FILE="$STATE_DIR/chat_template.jinja"
+fi
 WORKER_TEMPLATE="$WORKER_STATE_DIR/chat_template.jinja"
 
 build_serve_args() {
