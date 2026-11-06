@@ -143,7 +143,8 @@ prompt's first token comes about 47% later than at `1`. Replies are byte-identic
   reserve kept free.
 - **The page pool takes whole 1M windows before the prompt cache**, so a larger room can silently leave the cache at
   zero and every chat turn re-reads its history. The 9.5 GiB reserve holds the pool at two windows; after a start,
-  rank 0's startup line must show `4098 pages`, `prompt cache: N GiB` and no `cannot keep one state` warning.
+  rank 0's startup line must show `4098 pages` (with `CACHE_FIRST=1 PROMPT_CACHE_GIB=12` below: one window,
+  `2056 pages` at `PARALLEL=8`), `prompt cache: N GiB` and no `cannot keep one state` warning.
 - **The cache is funded from the remainder**, so `PROMPT_CACHE_GIB` only caps it: room after the reserve, minus the
   pool, minus about 0.42 GiB of fixed state for each stream past the first (measured on issue 3). Eight streams at
   the 1M window leave 0.7-0.9 GiB whatever the cap says; `PARALLEL=4` at the same window funds an 8 GiB cap, and a
