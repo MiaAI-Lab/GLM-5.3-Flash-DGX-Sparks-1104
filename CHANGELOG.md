@@ -1,5 +1,6 @@
 # Changelog
 
+- **2026-11-06** -- engine patch 0108: `CHUNK_SOLO=1` (with `CHUNK_BUSY=2048|1024`), off by default: a prompt step beside a decoding stream takes `CHUNK_BUSY` rows of the 4,096-row chunk (upstream's `TF_GLM_CHUNK_SOLO`, ported to this pin's grid). On this pair (TP=2, Ablit, DFlash2, 4 streams, 262,144 window) the worst decode pause beside a cold ~200k prefill falls 2.77 -> 1.55 s (2048) and 0.88 s (1024) for that prefill taking 143 -> 145 s and 151 s; greedy hashes, concurrent == solo, retention (3 x 80k, 3/3), cold prefill alone and decode alone are unchanged. Numbers and method: `docs/speed/RESULTS.md`, `docs/speed/candidates/0108-notes.md`.
 - **2026-11-05** -- engine patch 0107: `TF_TOOL_CALL_GUARD=1`, opt-in. A Hermes agent showed raw
   `<tool_call>session_search<arg_key>…` text: its turn after two tool rounds was sent without `session_search`, and
   the server (as vLLM) keeps a call to a tool the request does not offer as text. With the guard, such a request gets a
