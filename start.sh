@@ -429,11 +429,12 @@ show_failure() {
   done
 }
 
-# The device prompt cache a rank's startup line ("… N streams at once, …, a 9.7 GiB prompt cache; …") funds, in GiB:
+# The device prompt cache a rank's startup line ("… N streams at once, …, a 9.7 GiB prompt cache; …"; "1 stream" for one)
+# funds, in GiB:
 # 0 for "no prompt cache" or a cache in host memory, empty when the log has no startup line.
 funded_cache_gib() {
   local line
-  line=$(grep -h 'streams at once' "$1" 2>/dev/null | tail -1) || true
+  line=$(grep -hE ' streams? at once' "$1" 2>/dev/null | tail -1) || true
   [[ -n "$line" ]] || return 0
   if [[ "$line" != *"GiB prompt cache in host memory"* && "$line" =~ ,\ a\ ([0-9][0-9.]*)\ GiB\ prompt\ cache ]]; then
     printf '%s\n' "${BASH_REMATCH[1]}"
@@ -458,7 +459,7 @@ check_cache_min() {
     if [[ -z "$got" ]]; then
       if (( r == 0 )); then
         stop_both
-        fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no startup line (\"streams at once\"), so the start cannot be checked; both ranks are stopped. Logs: $(last_archive)."
+        fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no startup line (\"N streams at once\"), so the start cannot be checked; both ranks are stopped. Logs: $(last_archive)."
       fi
       # Rank 1 follows rank 0's plan and prints no startup line on the pair: rank 0's line is the check.
       continue
@@ -641,7 +642,7 @@ if [[ "$DRY_RUN" != 1 ]]; then
     pool=$(grep -ho 'taking [0-9]* pages of 512 rows' "$RUN_LOG_DIR/rank0.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1)
     [[ -z "$pool" ]] || log "KV pool: $pool pages = $(( pool * 512 )) tokens shared by $PARALLEL streams (one request up to $CTX)."
     # A few MiB more fixed memory can quietly drop a stream.
-    grep -q "$PARALLEL streams at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
+    grep -qE "(^|[^0-9])$PARALLEL streams? at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_STREAMS "The engine serves fewer than PARALLEL=$PARALLEL streams at once; see the startup line in $RUN_LOG_DIR/rank0.log."
   elif (( ATTEMPT == 2 )); then
     log "Context: $CTX tokens, not the $CONTEXT asked; set CONTEXT=$CTX in scripts/local.sh to skip the refused start."

@@ -44,6 +44,9 @@ line ', a 9.7 GiB prompt cache' > "$f"; check 'device cache read' "$(funded_cach
 line ', no prompt cache' > "$f"; check 'no cache is 0' "$(funded_cache_gib "$f")" 0
 line ', a 3.0 GiB prompt cache in host memory with 64 MiB of device staging' > "$f"; check 'host cache is 0 on the device' "$(funded_cache_gib "$f")" 0
 : > "$f"; check 'no startup line is empty' "$(funded_cache_gib "$f")" ''
+one=${head/8 streams at once/1 stream at once}
+printf '%s, a 9.7 GiB prompt cache; own glue kernels\n' "$one" > "$f"
+check 'one stream (PARALLEL=1) is read' "$(funded_cache_gib "$f")" 9.7
 
 check 'off when empty' "$(run '' ', a 1.0 GiB prompt cache' ', a 1.0 GiB prompt cache')" 'status 0|'
 check 'both ranks fund enough' "$(run 9 ', a 9.7 GiB prompt cache' ', a 12.9 GiB prompt cache')" \
