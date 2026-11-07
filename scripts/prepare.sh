@@ -73,6 +73,8 @@ validate_config() {
   [[ "$CACHE_FIRST" =~ ^[01]$ ]] || fail E_CONFIG 'CACHE_FIRST must be 0 or 1.'
   [[ "$CACHE_FIRST" == 0 ]] || { [[ -n "$PROMPT_CACHE_GIB" ]] && at_least "$PROMPT_CACHE_GIB" 1; } \
     || fail E_CONFIG 'CACHE_FIRST=1 sets PROMPT_CACHE_GIB aside first: set PROMPT_CACHE_GIB to the GiB to keep (1 or more).'
+  [[ -z "$PROMPT_CACHE_MIN_GIB" ]] || is_number "$PROMPT_CACHE_MIN_GIB" \
+    || fail E_CONFIG 'PROMPT_CACHE_MIN_GIB must be empty (no check) or a number of GiB.'
   [[ "$WITH_VIDEO" =~ ^[01]$ ]] || fail E_CONFIG 'WITH_VIDEO must be 0 or 1.'
   [[ "$CONFIG_OVERLAY" =~ ^(auto|0)$ ]] || fail E_CONFIG 'CONFIG_OVERLAY must be auto or 0.'
   [[ "$TP" == 2 ]] || fail E_CONFIG "TP=$TP: ./start.sh wires two Sparks."

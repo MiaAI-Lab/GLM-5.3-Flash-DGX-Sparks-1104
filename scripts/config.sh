@@ -175,6 +175,11 @@ PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"         # --prompt-cache-gib of device 
 # getting what whole windows leave. For long agent sessions: PARALLEL streams and a cache that keeps them. Needs
 # PROMPT_CACHE_GIB. 0 (default): windows first, as before.
 CACHE_FIRST="${CACHE_FIRST:-0}"
+# PROMPT_CACHE_MIN_GIB: the smallest prompt cache a start may serve with, in GiB. The engine funds the cache from the
+# room at that start (it varies by a GiB or more between starts), and PROMPT_CACHE_GIB only caps it, even with
+# CACHE_FIRST=1. With a value here, start.sh reads rank 0's startup line (rank 0 sizes the pair by the smaller room of
+# the two ranks; rank 1 prints none) and stops both ranks (E_CACHE) before LIVE when it funds less. Empty: no check.
+PROMPT_CACHE_MIN_GIB="${PROMPT_CACHE_MIN_GIB:-}"
 # TF_GLM_HOST_CACHE_GIB, the kept prompt states' pinned host tier. On a discrete card that memory is free; on GB10 it
 # is the very memory the KV pool and the weights draw on, and a state in it costs a copy to restore, so the tier is off
 # here and PROMPT_CACHE_GIB (device pages) is the one to raise. Unset or auto would pin a quarter of MemAvailable,

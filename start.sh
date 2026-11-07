@@ -404,6 +404,43 @@ show_failure() {
   done
 }
 
+# The device prompt cache a rank's startup line ("… N streams at once, …, a 9.7 GiB prompt cache; …") funds, in GiB:
+# 0 for "no prompt cache" or a cache in host memory, empty when the log has no startup line.
+funded_cache_gib() {
+  local line
+  line=$(grep -h 'streams at once' "$1" 2>/dev/null | tail -1) || true
+  [[ -n "$line" ]] || return 0
+  if [[ "$line" != *"GiB prompt cache in host memory"* && "$line" =~ ,\ a\ ([0-9][0-9.]*)\ GiB\ prompt\ cache ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  else
+    printf '0\n'
+  fi
+}
+# The newest log archive stop.sh wrote (it removes the run directory once archived): the names carry a UTC stamp, so
+# the last in glob order is the newest.
+last_archive() {
+  local a=("$LOG_DIR"/glm53-spark-*.tar.gz)
+  if [[ -e "${a[-1]}" ]]; then printf '%s\n' "${a[-1]}"; else printf 'none written (see %s)\n' "$LOG_DIR"; fi
+}
+# PROMPT_CACHE_MIN_GIB: both ranks stop before LIVE when the pair funds less (the cap is not a floor, issue 16). Rank 0
+# sizes the pair by the smaller room of the two ranks and alone prints the startup line, so its line is checked.
+check_cache_min() {
+  [[ -n "$PROMPT_CACHE_MIN_GIB" ]] || return 0
+  local f="$RUN_LOG_DIR/rank0.log" got why
+  collect_logs
+  got=$(funded_cache_gib "$f")
+  if [[ -z "$got" ]]; then
+    why="PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no startup line (\"streams at once\"), so the start cannot be checked; both ranks are stopped."
+  elif ! at_least "$got" "$PROMPT_CACHE_MIN_GIB"; then
+    why="The pair funds a $got GiB prompt cache, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; both ranks are stopped. The cache is what the room leaves, capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, or with CACHE_FIRST=1 try a larger PROMPT_CACHE_GIB (it can cost the streams a whole window)."
+  else
+    log "Prompt cache: the pair funds $got GiB (rank 0's startup line; PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB)."
+    return 0
+  fi
+  stop_both
+  fail E_CACHE "$why Logs: $(last_archive)."
+}
+
 live_message() {
   brand_style
   printf '%sGLM-5.3-Flash-EXL3 is now LIVE! on port %s%s\n%sEndpoint: %s/v1%s\n' \
@@ -564,6 +601,7 @@ if [[ "$DRY_RUN" != 1 ]] && ! wait_ready; then
     wait_ready && break
   done
 fi
+[[ "$DRY_RUN" == 1 ]] || check_cache_min
 start_memguard
 finish_start
 if [[ "$DRY_RUN" != 1 ]]; then

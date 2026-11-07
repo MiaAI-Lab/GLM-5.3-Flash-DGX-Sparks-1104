@@ -1,5 +1,14 @@
 # Changelog
 
+- **2026-11-07** -- `PROMPT_CACHE_MIN_GIB`, opt-in (empty by default): `start.sh` reads the prompt cache rank 0's
+  startup line funds and, before LIVE, stops both ranks with `E_CACHE` when it is less. Rank 0 sizes the pair by the
+  smaller room of the two ranks and is the only rank that prints the line (rank 1 prints none; jds1-ai's run on #21),
+  so its line is the pair's. `PROMPT_CACHE_GIB` caps the cache but does not guarantee it, even with `CACHE_FIRST=1`:
+  the cache is what that start's room leaves after the streams' windows, and the room moved between 17.8 and 18.9 GiB
+  across starts with no config change (issue 16, jds1-ai). "no prompt cache" and a cache in host memory count as 0 on
+  the device; a rank 0 log with no startup line stops the start. Each `E_CACHE` names the log archive `stop.sh` just
+  wrote, since the stop removes the run directory. Test: `scripts/tests/cache-min.sh` (startup lines in the engine's
+  formats, the stop stubbed), run by `scripts/tests/run.sh`.
 - **2026-11-07** -- `scripts/tests/patch-numbers.sh`: a number in `patches/engine/` names one patch, checked by
   `scripts/tests/run.sh` (issue 15, travellingsoldier85's check). README: with `CACHE_FIRST=1`, `PROMPT_CACHE_GIB` is a
   priority, not a floor, and a larger ask can fund more cache by costing the streams a window (issue 16, jds1-ai's
@@ -8,7 +17,6 @@
   on the memory plan (issue 17). From outside PRs: `cache-replay.py` names warm turns 0104 and sends `SERVED_NAME`
   (#12), the settings table's `HEAD` and `REASONING_EFFORT` defaults (#13), and the startup check's page count with
   `CACHE_FIRST=1` (#14), all by travellingsoldier85.
-
 - **2026-11-06** -- engine patch 0108: `CACHE_FIRST=1` (`TF_PROMPT_CACHE_FIRST`), opt-in. The pool counted the room in
   whole windows before the prompt cache, so `PROMPT_CACHE_GIB` only capped the remainder (issue 7: crystal8194,
   tanchunsiong, unitea1992; issue 3). With it, the cache is set aside first and the streams share the pages left, one
