@@ -1,5 +1,13 @@
 # Changelog
 
+- **2026-11-07** -- `scripts/graft.py`, a partial Ablit overlay. The Ablit repository replaces `self_attn.o_proj` on
+  layers 15-43 and the MTP head, and `ABLIT=1` serves all of it. The tool copies the tensors for the layers you name
+  out of it into a copy of the published weights, byte for byte at the offsets the safetensors headers give, so no tree
+  is loaded and only the grafted shards are copied (164 GiB rebuilt in about 30 s; the rest is hardlinked). On the pair,
+  15 of 30 layers (15-29) passed the 32-prompt refusal suite drowzeys publishes, kept issue 9's exact-copy case and
+  decoded at the parent's rate, where the full overlay costs about 15% decode and reproduces the dropped digit.
+  `scripts/tests/graft.sh` covers it (only the named layers move, the parent is never rewritten, a missing layer or a
+  shape mismatch is refused), and `scripts/tests/run.sh` now parses every `scripts/*.py`, not just `cache-replay.py`.
 - **2026-11-07** -- The pair serves `SERVE_EXTRA_ARGS='--top-k 20'` (in its `scripts/local.sh`): a request that
   sends no `top_k` was drawn from the whole top-p 0.95 nucleus of `generation_config.json` (temperature 1.0, top_p
   0.95, no top_k: `serve`'s `--top-k` is unset by default), where the old deployment used 20. Raised by raw, malformed

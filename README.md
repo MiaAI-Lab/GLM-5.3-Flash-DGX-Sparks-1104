@@ -406,6 +406,26 @@ DFlash2 accepts fewer drafts on these weights; measure them at your own memory s
 One pair (issue 17) saw drafting turn into a net loss at `local.sh.example`'s `PARALLEL=4 MEMORY_RESERVE_GIB=12`, and
 about 15% below the published weights (74.6% against 79.8% accepted) at the served `PARALLEL=8` with `CACHE_FIRST=1`.
 
+### A partial overlay
+
+`ABLIT=1` serves the whole transplant. `scripts/graft.py` builds a tree of your own: it copies `self_attn.o_proj` for
+the layers you name out of the Ablit repository into a copy of the published weights, byte for byte and at the offsets
+each safetensors header gives, so neither tree is loaded, no framework is needed and nothing but the grafted shards is
+copied (the rest are hardlinks to the parent).
+
+```
+scripts/graft.py ~/.cache/aevonix-glm53/model ~/.cache/aevonix-glm53/model-ablit \
+    ~/.cache/aevonix-glm53/model-partial1529 --layers 15-29 --verify
+# then: MODEL_SOURCE=local MODEL_DIR=~/.cache/aevonix-glm53/model-partial1529
+```
+
+The Ablit repository replaces `self_attn.o_proj` on layers 15-43 and the MTP head (`ABLIT_META.json`), so a subset is a
+subset of that transplant rather than a new one; the graft rebuilds a 164 GiB tree in about 30 s. Measured on the pair:
+15 of 30 layers (15-29) passed all 32 prompts of the refusal suite drowzeys publishes for its Keys overlay, kept issue
+9's exact-copy case (the `LANTERN-ca6241dd2684` reply byte-exact), and decoded at the parent's rate (56.5 / 69.6 tok/s
+code against 59.7 / 62.4, inside this pair's 12% run-to-run spread), where the full 30-layer overlay measured about 15%
+below the parent on code and reproduces the dropped digit. Layer choice is per graft: rebuild the tree to change it.
+
 ## Credits
 
 TensorFold and its native engine are by Ash Hart and contributors
