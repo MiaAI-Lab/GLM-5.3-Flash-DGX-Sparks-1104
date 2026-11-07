@@ -632,10 +632,11 @@ if [[ "$DRY_RUN" != 1 ]]; then
   if [[ "$CONTEXT" == auto ]]; then
     remember_context "$FIT_KEY" "$CTX"
     log "Context: $CTX tokens (kept for the next start with these settings; delete $FIT_FILE to probe again)."
-    pool=$(grep -ho 'taking [0-9]* pages of 512 rows' "$RUN_LOG_DIR/rank0.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1)
+    # Windows (KV_PAGES=off, or auto with KV=fp8) have no pages line, so no pool to report and no pipefail exit.
+    pool=$(grep -ho 'taking [0-9]* pages of 512 rows' "$RUN_LOG_DIR/rank0.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1) || true
     [[ -z "$pool" ]] || log "KV pool: $pool pages = $(( pool * 512 )) tokens shared by $PARALLEL streams (one request up to $CTX)."
-    # A few MiB more fixed memory can quietly drop a stream.
-    grep -q "$PARALLEL streams at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
+    # A few MiB more fixed memory can quietly drop a stream. One stream reads "1 stream at once"; auto names no count.
+    [[ "$PARALLEL" == auto ]] || grep -qE "(^|[^0-9])$PARALLEL streams? at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_STREAMS "The engine serves fewer than PARALLEL=$PARALLEL streams at once; see the startup line in $RUN_LOG_DIR/rank0.log."
   elif (( ATTEMPT == 2 )); then
     log "Context: $CTX tokens, not the $CONTEXT asked; set CONTEXT=$CTX in scripts/local.sh to skip the refused start."
