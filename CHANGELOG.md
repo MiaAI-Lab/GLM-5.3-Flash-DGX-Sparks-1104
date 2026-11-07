@@ -1,5 +1,15 @@
 # Changelog
 
+- **2026-11-07** -- engine patch 0111, backported from upstream ashhart/TensorFold#2276 (`882ca0a7`, devopsfortunato;
+  fixes ashhart/TensorFold#2256): `remaining()` in `core/lane_host_fill.zig` counted only `stream.cached`, which stays
+  0 until the backend restores a kept state in the job's first prompt step, so a resumed turn with a long cached
+  history was ranked as a whole cold prompt and waited behind a cold prefill whose remaining rows were fewer than its
+  whole prompt. It now counts `max(stream.cached, stream.reuse.at)` for a job that has not begun filling and whose
+  restore has not failed. Scheduling order only. Measured on a pair (laidick, 108-patch tree, `PARALLEL=3`, 1M window,
+  `CACHE_FIRST=1 PROMPT_CACHE_GIB=32`): a cached 375k turn queued while a cold 60k prompt filled, with a cold 355k
+  prompt queued before it, got its first token in 8.4 s against 41.0 s; the 60k prompt took 45.3 s against 37.2 s,
+  the 355k one 278 s in both; every reply byte-identical. Host: `test-lane-api-host` 405/405 (404/405 with the old
+  `remaining()`), `test-glm-scheduling-host` 40/40.
 - **2026-11-07** -- The pair serves `SERVE_EXTRA_ARGS='--top-k 20'` (in its `scripts/local.sh`): a request that
   sends no `top_k` was drawn from the whole top-p 0.95 nucleus of `generation_config.json` (temperature 1.0, top_p
   0.95, no top_k: `serve`'s `--top-k` is unset by default), where the old deployment used 20. Raised by raw, malformed

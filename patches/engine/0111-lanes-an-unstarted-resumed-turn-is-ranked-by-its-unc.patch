@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: devopsfortunato <57877156+devopsfortunato@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 19:34:35 +0000
+Subject: [PATCH] lanes: an unstarted resumed turn is ranked by its uncached
+ tail
+
+Backport of ashhart/TensorFold#2276 (882ca0a7, fixes ashhart/TensorFold#2256) onto f350cd3e: remaining() counts max(stream.cached, stream.reuse.at) for a job that has not begun filling and whose restore has not failed, so a resumed turn with a long cached history is no longer ranked as a whole cold prompt. The aging bound is kept; a failed restore ranks by the whole prompt again. CHANGELOG.md hunk left out.
+---
+ zig/src/core/lane_host_fill.zig               |  3 ++
+ zig/src/core/lane_host_fill_aging_test.zig    |  3 ++
+ zig/src/core/lane_host_fill_progress_test.zig | 31 +++++++++++++++++++
+ 3 files changed, 37 insertions(+)
+
+diff --git a/zig/src/core/lane_host_fill.zig b/zig/src/core/lane_host_fill.zig
+index 934b634..e76e331 100644
+--- a/zig/src/core/lane_host_fill.zig
++++ b/zig/src/core/lane_host_fill.zig
+@@ -41,6 +41,9 @@ fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
+ fn remaining(h: *const LaneHost, j: *const LaneHost.Job) u64 {
+     const completed = if (j.fill_began and h.core.backend.vtable.reports_fill)
+         @max(j.stream.cached, j.stream.fill_at.load(.monotonic))
++    else if (!j.fill_began and !j.stream.reuse_failed)
++        // an unstarted job's cache hit is known at admission; a rejected restore leaves the whole prompt
++        @max(j.stream.cached, j.stream.reuse.at)
+     else
+         j.stream.cached;
+     return j.stream.prompt_len -| completed;
+diff --git a/zig/src/core/lane_host_fill_aging_test.zig b/zig/src/core/lane_host_fill_aging_test.zig
+index 3030eee..98f3128 100644
+--- a/zig/src/core/lane_host_fill_aging_test.zig
++++ b/zig/src/core/lane_host_fill_aging_test.zig
+@@ -11,6 +11,9 @@ fn job(h: *Host, r: *const api.Request) Host.Job {
+     var j: Host.Job = .{ .host = h, .id = 1, .request = r, .sink = .{ .ctx = h, .event = event } };
+     j.stream.prompt_len = r.prompt.len;
+     j.stream.cached = 0;
++    // the ranking reads the stream defaults this test never sets
++    j.stream.reuse = .{};
++    j.stream.reuse_failed = false;
+     return j;
+ }
+ 
+diff --git a/zig/src/core/lane_host_fill_progress_test.zig b/zig/src/core/lane_host_fill_progress_test.zig
+index 5849619..7e96ad5 100644
+--- a/zig/src/core/lane_host_fill_progress_test.zig
++++ b/zig/src/core/lane_host_fill_progress_test.zig
+@@ -13,6 +13,9 @@ fn job(h: *Host, request: *const api.Request, cached: u32, progress: u32, began:
+     result.stream.prompt_len = request.prompt.len;
+     result.stream.cached = cached;
+     result.stream.fill_at = .init(progress);
++    // stream defaults a test job never sets: the ranking reads them before a pass starts
++    result.stream.reuse = .{};
++    result.stream.reuse_failed = false;
+     return result;
+ }
+ test "prefill remaining: progress reports cached floors and stale cursors preserve stable priority" {
+@@ -49,6 +52,34 @@ test "prefill remaining: progress reports cached floors and stale cursors preser
+         try t.expectEqual(@as(usize, if (c.winner == 1) 0 else 1), second.fill_wait);
+     }
+ }
++// an unstarted resumed turn ranks by its uncached tail; a rejected restore ranks its whole prompt
++test "prefill remaining: an unstarted resumed turn is ranked by its uncached tail" {
++    var target: lanes.fake.Fake = .{ .gpa = a };
++    var cfg = try lanes.Config.init(std.testing.allocator, .{}, 1, 0);
++    defer cfg.deinit(std.testing.allocator);
++    var core: lanes.Engine = undefined;
++    core.cfg = &cfg;
++    var vt = target.stepped().vtable.*;
++    core.backend = .{ .ptr = &target, .vtable = &vt };
++    var host = Host.init(a, t.io, &core, .{ .lanes = 2 });
++    defer host.filling.deinit(a);
++    const tokens: [32]u32 = @splat(3);
++    const resumed: api.Request = .{ .prompt = &tokens, .max_tokens = 1 };
++    const cold: api.Request = .{ .prompt = tokens[0..16], .max_tokens = 1 };
++    for ([_]bool{ true, false }) |reports| {
++        vt.reports_fill = reports;
++        var first = job(&host, &resumed, 0, 0, false);
++        first.stream.reuse.at = 30;
++        var second = job(&host, &cold, 0, 0, false);
++        host.filling.clearRetainingCapacity();
++        try host.filling.appendSlice(a, &.{ &first, &second });
++        try t.expectEqual(@as(usize, 0), fill.next(&host));
++        first.stream.reuse_failed = true;
++        host.filling.clearRetainingCapacity();
++        try host.filling.appendSlice(a, &.{ &first, &second });
++        try t.expectEqual(@as(usize, 1), fill.next(&host));
++    }
++}
+ test "prefill remaining: foreground preference yields to aging and keeps equal-age ties stable" {
+     var target: lanes.fake.Fake = .{ .gpa = a };
+     var cfg = try lanes.Config.init(std.testing.allocator, .{}, 1, 0);
+-- 
+2.47.1
+
