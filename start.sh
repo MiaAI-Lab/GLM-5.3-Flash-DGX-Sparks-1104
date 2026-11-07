@@ -441,6 +441,12 @@ funded_cache_gib() {
     printf '0\n'
   fi
 }
+# The newest log archive stop.sh wrote (it removes the run directory once archived): the names carry a UTC stamp, so
+# the last in glob order is the newest.
+last_archive() {
+  local a=("$LOG_DIR"/glm53-spark-*.tar.gz)
+  if [[ -e "${a[-1]}" ]]; then printf '%s\n' "${a[-1]}"; else printf 'none written (see %s)\n' "$LOG_DIR"; fi
+}
 # PROMPT_CACHE_MIN_GIB: both ranks stop before LIVE when a startup line funds less (the cap is not a floor, issue 16).
 check_cache_min() {
   [[ -n "$PROMPT_CACHE_MIN_GIB" ]] || return 0
@@ -452,14 +458,14 @@ check_cache_min() {
     if [[ -z "$got" ]]; then
       if (( r == 0 )); then
         stop_both
-        fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no startup line (\"streams at once\"), so the start cannot be checked; both ranks are stopped. See $f."
+        fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no startup line (\"streams at once\"), so the start cannot be checked; both ranks are stopped. Logs: $(last_archive)."
       fi
       # Rank 1 follows rank 0's plan and prints no startup line on the pair: rank 0's line is the check.
       continue
     fi
     if ! at_least "$got" "$PROMPT_CACHE_MIN_GIB"; then
       stop_both
-      fail E_CACHE "Rank $r funds a $got GiB prompt cache, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; both ranks are stopped. The cache is what the room leaves, capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, or with CACHE_FIRST=1 try a larger PROMPT_CACHE_GIB (it can cost the streams a whole window). See $f."
+      fail E_CACHE "Rank $r funds a $got GiB prompt cache, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; both ranks are stopped. The cache is what the room leaves, capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, or with CACHE_FIRST=1 try a larger PROMPT_CACHE_GIB (it can cost the streams a whole window). Logs: $(last_archive)."
     fi
     log "Prompt cache: rank $r funds $got GiB (PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB)."
   done
