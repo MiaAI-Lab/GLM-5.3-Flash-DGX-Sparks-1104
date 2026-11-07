@@ -320,9 +320,14 @@ launch() {
   # can have different ids, and rank 1 writes to a state folder its own login owns. Root or another
   # UID:GID crosses as given.
   if [[ "$CONTAINER_USER" == "$(id -u):$(id -g)" ]]; then
-    worker_ug=$(wssh sh -c 'printf "%s:%s\n" "$(id -u)" "$(id -g)"') && [[ "$worker_ug" =~ ^[0-9]+:[0-9]+$ ]] \
-      || fail E_WORKER "Could not read the login's ids on $(worker_host)."
-    worker_user_args=(--user "$worker_ug")
+    if worker_ug=$(wssh sh -c 'printf "%s:%s\n" "$(id -u)" "$(id -g)"') && [[ "$worker_ug" =~ ^[0-9]+:[0-9]+$ ]]; then
+      worker_user_args=(--user "$worker_ug")
+    elif [[ "$DRY_RUN" == 1 ]]; then  # a placeholder, as step 4 shows for the link; only a real start reads worker_ug
+      warn W_WORKER "Cannot read the login's ids on $(worker_host), so the plan shows a placeholder for rank 1's --user."
+      worker_ug=''; worker_user_args=(--user '<worker uid:gid>')
+    else
+      fail E_WORKER "Could not read the login's ids on $(worker_host)."
+    fi
   fi
   RUN_LOG_DIR="$LOG_DIR/run-$(date -u +%Y%m%dT%H%M%SZ)-$$-$ATTEMPT"
   log "Ranks:"
