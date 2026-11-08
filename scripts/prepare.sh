@@ -56,6 +56,7 @@ validate_config() {
   [[ "$EFFORT_LINE" =~ ^(thinking|always)$ ]] || fail E_CONFIG 'EFFORT_LINE must be thinking or always.'
   [[ "$EXTRA_EOS" =~ ^[^[:space:],]+(,[^[:space:],]+)*$ ]] \
     || fail E_CONFIG 'EXTRA_EOS must be none or a comma-separated list of tokens, e.g. <|assistant|>.'
+  [[ "$THINK_OFF_SPLIT" =~ ^[0-9]+$ ]] || fail E_CONFIG 'THINK_OFF_SPLIT must be 0 (off) or a token count, e.g. 1024.'
   [[ "$DRAFTER_BITS" =~ ^[04]$ ]] || fail E_CONFIG 'DRAFTER_BITS must be 4 or 0 (bf16).'
   [[ -z "$MTP_DRAFTS" || ( "$MTP_DRAFTS" =~ ^[0-9]+$ && MTP_DRAFTS -le 64 ) ]] || fail E_CONFIG 'MTP_DRAFTS must be empty or 0-64.'
   [[ -z "$MTP_CONFIDENCE" ]] || { is_number "$MTP_CONFIDENCE" && python3 -c 'import sys; sys.exit(0 if 0 <= float(sys.argv[1]) <= 1 else 1)' "$MTP_CONFIDENCE"; } \

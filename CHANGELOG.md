@@ -1,5 +1,20 @@
 # Changelog
 
+- **2026-11-08** -- engine patch 0113, `THINK_OFF_SPLIT` (default 1024, `TF_THINK_OFF_SPLIT`): with thinking off,
+  GLM-5.3 sometimes drafts in its hidden-reasoning voice anyway ("We need ... Let's extract.") and writes `</think>`
+  before its answer, so the draft and the marker were the reply's content. A thinking-off chat reply that writes the
+  close token within its first `THINK_OFF_SPLIT` tokens now has the text before it as `reasoning_content` and the
+  text after it as `content`, as a thinking reply does. A streamed reply's content waits until the token, the end or
+  the hold, so streamed and whole replies split alike; a close after the hold stays text; raw completions, the JSON
+  channel and logprobs requests are never split; `0` is off. sparkDash long-32k-2 (thinking off, 1,024 tokens): a
+  505-token draft in `reasoning_content`, `content` the 16 lines and no `</think>`, 16/16, streamed and whole
+  identical; long-32k-1 (no draft) unchanged. sparkDash QA, arith, MMLU (thinking off) and track (thinking on), 515
+  replies, byte-identical to the runs before: no reply there closes a think block. Scores do not change (sparkDash
+  already scores the text after `</think>`); the draft still costs its tokens. Tests: `think_off_split.zig` (the
+  decision) and `think_off_split_test.zig` (the chat route, whole and streamed, token by token and batched: a closed
+  draft splits, an ordinary or longer-than-the-hold reply and a late close are unchanged, the setting off is as
+  before, thinking replies split as before), `zig build test-think-off-split-host`; the server suite
+  (`test-server-cpu`, 895 tests) passes. README: the setting, the patch row, a troubleshooting row.
 - **2026-11-08** -- engine patch 0112, `EXTRA_EOS` (default `<|assistant|>`, `TF_EXTRA_EOS`): tokens that end a reply
   besides the checkpoint's EOS ids. GLM-5.3's `generation_config.json` lists `<|endoftext|>`, `<|user|>` and
   `<|observation|>` (154820, 154827, 154829) but not `<|assistant|>` (154828), which the model can write to close a
