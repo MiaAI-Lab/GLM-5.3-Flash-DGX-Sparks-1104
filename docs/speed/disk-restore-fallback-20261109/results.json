@@ -1,0 +1,261 @@
+{
+  "recipe_base": "841e7497e27e9a462da93343d4a4c0d20c7583c9",
+  "engine_pin": "f350cd3ea253a042e205746928271f9d8f71a82d",
+  "upstream": "12d61cb6b96c968aab76b8c53444380e66a76f53",
+  "paired_repeats_per_cell": 1,
+  "arms": [
+    {
+      "label": "control-full-learn-01",
+      "binary_sha256": "0de4883ad5d6bffd9c6a0eeca0b20f2a2f8490c7eb29fd5d0fc5f6b4dd50caea",
+      "phase": "frozen 111-patch baseline",
+      "mode": "learn",
+      "original_service_restored": true,
+      "cases": [
+        {
+          "case": "cold",
+          "ttft_s": 10.656999999890104,
+          "elapsed_s": 14.343999999808148,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 0,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "seed-prefix-300",
+          "ttft_s": 3.797000000020489,
+          "elapsed_s": 4.1560000001918525,
+          "content_sha256": "e768a8069539063c72a7c51a1f7b5ec96ade31dfda1f41c97a23d629eeecfac1",
+          "input_tokens": 6166,
+          "output_tokens": 8,
+          "cached_tokens": 0,
+          "token_sha256": "f6e3274874ab1fcb31d58261656c6c90c17906a6cdd7801b1da0a0843cabd8c4"
+        },
+        {
+          "case": "seed-prefix-600",
+          "ttft_s": 5.125,
+          "elapsed_s": 5.547000000020489,
+          "content_sha256": "e768a8069539063c72a7c51a1f7b5ec96ade31dfda1f41c97a23d629eeecfac1",
+          "input_tokens": 12712,
+          "output_tokens": 8,
+          "cached_tokens": 4096,
+          "token_sha256": "f6e3274874ab1fcb31d58261656c6c90c17906a6cdd7801b1da0a0843cabd8c4"
+        },
+        {
+          "case": "ram-warm",
+          "ttft_s": 1.7349999998696148,
+          "elapsed_s": 4.9689999998081475,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 16384,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "restart-healthy",
+          "ttft_s": 2.2189999998081475,
+          "elapsed_s": 5.437999999849126,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 16384,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "one-damaged",
+          "ttft_s": 11.030999999959022,
+          "elapsed_s": 14.577999999979511,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 0,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "two-damaged",
+          "ttft_s": 11.046999999787658,
+          "elapsed_s": 14.609999999869615,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 0,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        }
+      ]
+    },
+    {
+      "label": "disk-full-learn-01",
+      "binary_sha256": "fab34ef0692508091d419fa5049f38b428350efe07e0feecd7ce406bca9c4e08",
+      "phase": "frozen 111-patch baseline",
+      "mode": "learn-seeded",
+      "original_service_restored": true,
+      "cases": [
+        {
+          "case": "restart-healthy",
+          "ttft_s": 2.2340000001713634,
+          "elapsed_s": 5.437000000150874,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 16384,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "one-damaged",
+          "ttft_s": 4.733999999938533,
+          "elapsed_s": 8.311999999918044,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 12288,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "two-damaged",
+          "ttft_s": 11.234000000171363,
+          "elapsed_s": 14.875,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 0,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        }
+      ]
+    },
+    {
+      "label": "disk-shard-01",
+      "binary_sha256": "fab34ef0692508091d419fa5049f38b428350efe07e0feecd7ce406bca9c4e08",
+      "phase": "frozen 111-patch baseline",
+      "mode": "learn-shard",
+      "original_service_restored": true,
+      "cases": [
+        {
+          "case": "cold",
+          "ttft_s": 10.686999999918044,
+          "elapsed_s": 14.483999999938533,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 0,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "seed-prefix-300",
+          "ttft_s": 3.8130000000819564,
+          "elapsed_s": 4.077999999979511,
+          "content_sha256": "e768a8069539063c72a7c51a1f7b5ec96ade31dfda1f41c97a23d629eeecfac1",
+          "input_tokens": 6166,
+          "output_tokens": 8,
+          "cached_tokens": 0,
+          "token_sha256": "f6e3274874ab1fcb31d58261656c6c90c17906a6cdd7801b1da0a0843cabd8c4"
+        },
+        {
+          "case": "seed-prefix-600",
+          "ttft_s": 5.1560000001918525,
+          "elapsed_s": 5.4850000001024455,
+          "content_sha256": "e768a8069539063c72a7c51a1f7b5ec96ade31dfda1f41c97a23d629eeecfac1",
+          "input_tokens": 12712,
+          "output_tokens": 8,
+          "cached_tokens": 4096,
+          "token_sha256": "f6e3274874ab1fcb31d58261656c6c90c17906a6cdd7801b1da0a0843cabd8c4"
+        },
+        {
+          "case": "ram-warm",
+          "ttft_s": 1.7339999999385327,
+          "elapsed_s": 5.0149999998975545,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 16384,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "restart-healthy",
+          "ttft_s": 2.047000000020489,
+          "elapsed_s": 5.313000000081956,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 16384,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "one-damaged",
+          "ttft_s": 4.405999999959022,
+          "elapsed_s": 7.952999999979511,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 12288,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "two-damaged",
+          "ttft_s": 11.046000000089407,
+          "elapsed_s": 14.625,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 0,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        }
+      ]
+    },
+    {
+      "label": "disk-current-learn-01",
+      "binary_sha256": "b083fb7bef995372fd6dcc21495c481fa405334bb798cbeea962bb2eb31f7849",
+      "phase": "latest-main integration, no new paired control",
+      "mode": "learn-seeded",
+      "original_service_restored": true,
+      "cases": [
+        {
+          "case": "restart-healthy",
+          "ttft_s": 2.218000000109896,
+          "elapsed_s": 5.436999999918044,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 16384,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "one-damaged",
+          "ttft_s": 4.687999999849126,
+          "elapsed_s": 8.25,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 12288,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        },
+        {
+          "case": "two-damaged",
+          "ttft_s": 11.296999999787658,
+          "elapsed_s": 14.906999999890104,
+          "content_sha256": "1719d796b821d9962af00df7e0dd83ed309c523b1dde6d187e296b474d51c100",
+          "input_tokens": 19294,
+          "output_tokens": 128,
+          "cached_tokens": 0,
+          "token_sha256": "81bf153f9dea1917b70bad88609ebccb41a5b64714e66d39525c1b38cbb56e29"
+        }
+      ]
+    }
+  ],
+  "latest_integration": {
+    "recipe_base": "d4226a1bd62a7d264f116fc4736106a037090365",
+    "base_patch_count": 112,
+    "candidate_patch_count": 113,
+    "candidate_engine_commit": "71d6d7a2cdc4d74771b51e33a401794494cf0854",
+    "strict_application": true,
+    "modified_source_hashes_matched": 11,
+    "host_passed": 619,
+    "host_skipped": 2,
+    "new_tool_parser_guard_checks_passed": 58,
+    "correctness_cases": 18,
+    "full_sha_reference_equal": true,
+    "tool_loop_smoke_exit": 0,
+    "lean_base_findings": 1043,
+    "lean_candidate_findings": 1043,
+    "lean_new_findings": 0
+  }
+}
