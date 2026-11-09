@@ -1,5 +1,26 @@
 # Changelog
 
+- **2026-11-09** -- engine patch 0112 and `LEARN_DAILY_GIB`: long agent conversations can now be kept on disk
+  (recipe issue [#35](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/issues/35)). The rows store stages an
+  owned copy of a kept state before the I/O thread writes it, under a fixed 1 GiB permit, and GLM never sized it, so a
+  save charged more than that was skipped with `StagingFull` however large `LEARN_GIB` was. On this pair the boundary
+  sat at about 135k tokens (135,168 written and read back, 139,264 refused; 58 skips in three hours, the largest
+  376,832 tokens), and a 380k-520k session re-prefilled its whole prompt on every turn that way: 183 s to first token,
+  minutes under two-stream contention. 0112 carries upstream's `coldCharge` sizing
+  ([#2382](https://github.com/ashhart/TensorFold/pull/2382), the Metal/Qwen3.8 fix) to GLM's CUDA disk open, toward
+  [#2337](https://github.com/ashhart/TensorFold/pull/2337): the permit is one whole cold state at the engine's
+  capacity, never past the RAM store's budget (5,705 MiB here), and the startup line names it
+  (`... a 5705 MiB write permit for one state at 1048640 tokens`). `LEARN_DAILY_GIB` (`--learn-daily-gib`) exposes the
+  store's write budget, which the engine defaults to 32 GiB a day: two sessions of this size spend that in hours and
+  every later save is skipped with `DailyBudgetSpent` while `LEARN_GIB` still has room, the second half of issue #35.
+  `start.sh` prints the cap and the daily budget beside the KV pool line. Measured on the pair (2026-11-09,
+  `PARALLEL=8`, 1M window, `CACHE_FIRST=1 PROMPT_CACHE_GIB=6 LEARN_GIB=100 LEARN_DAILY_GIB=100 KV_SHARD=1`): a
+  385,024-token state written in 16.5 s (2,559 MiB this state), a 520,192-token state read back from disk in 3.2 s
+  (3,556 MiB), per-turn first token 183-250 s to 2.7-9 s, no `StagingFull` since the restart, host MemAvailable 13 GiB
+  through the writes. A cold 500k prompt costs about 650 s with two streams prefilling; that is prefill arithmetic,
+  not the permit. One caveat: the store's identity hashes the state capacity, so a context that re-fits to a different
+  token count opens a new directory and leaves the earlier imprints unreadable but still counted against `LEARN_GIB`.
+  Off: replies byte-identical.
 - **2026-11-08** -- engine patch 0111: the image build's nvcc prints no compiler warning. A clean-machine build showed
   49 warning lines that the builds in docs/speed's logs had carried for days: two fp8 expert prompt kernels declared a
   kernel-local `RW` their bodies never read, `prefill_attention.cu`'s `SMEM_MAX` had no reader anywhere,

@@ -1,0 +1,83 @@
+From c5370130c43a2db8e0b804ba2b1658a16715eade Mon Sep 17 00:00:00 2001
+From: MaverickKB <17356410+MaverickKB@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:02:59 -0500
+Subject: [PATCH 1/2] engine patch 0111: GLM's disk write permit takes one
+ whole state at the served capacity
+
+The rows store stages an owned copy of a kept state before the I/O thread writes it, under a fixed 1 GiB permit. A save charged more than that was skipped with StagingFull, and GLM never sized the permit, so a long agent conversation (385k-520k tokens here charges 2.5-3.5 GiB) could never imprint however large --learn-gib was. Measured on the pair: 135,168-token states written and read back, 139,264 and up skipped, 58 StagingFull lines in three hours.
+
+Backports upstream d3c03e5f (Qwen3.8-27B): rows_write.coldCharge prices one cold state, and cuda_glm_disk.attach takes coldCharge at the engine capacity, never past the RAM store budget (5705 MiB here).
+
+Verified on the pair 2026-11-09: imprint 385,024 tokens in 16.5 s, and 520,192 tokens read back from disk in 3.2 s; per-turn TTFT for those sessions went from 183-250 s to 2.7-9 s; zero StagingFull since.
+
+Note: the store identity hashes the state capacity, so this start at 1,048,640 tokens opened a new store directory and left the old 30 GiB one unreadable but counted against --learn-gib.
+---
+ ...-write-permit-takes-one-whole-state-.patch | 56 +++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+ create mode 100644 patches/engine/0111-glm-cuda-the-disk-write-permit-takes-one-whole-state-.patch
+
+diff --git a/patches/engine/0111-glm-cuda-the-disk-write-permit-takes-one-whole-state-.patch b/patches/engine/0111-glm-cuda-the-disk-write-permit-takes-one-whole-state-.patch
+new file mode 100644
+index 0000000..60d592b
+--- /dev/null
++++ b/patches/engine/0111-glm-cuda-the-disk-write-permit-takes-one-whole-state-.patch
+@@ -0,0 +1,56 @@
++--- a/zig/src/core/rows_write.zig
+++++ b/zig/src/core/rows_write.zig
++@@ -269,7 +269,7 @@
++     var bytes = newBytes(r, &promised, prepared, metadata, &count);
++     var charge: u64 = 0;
++     while (true) {
++-        charge = bytes + @sizeOf(io.Job) + count * @sizeOf(io.File) + prepared.wants.len * @sizeOf(Want) + 4 * @sizeOf([]const u8);
+++        charge = charged(bytes, count, prepared.wants.len);
++         if (!w.fits(charge)) return if (may_wait and w.busy(charge)) error.StagingBusy else error.StagingFull;
++         const reserved = w.reserved();
++         if (!r.budget(bytes + reserved)) return error.DailyBudgetSpent;
++@@ -312,6 +312,26 @@
++     w.submit(j);
++ }
++ 
+++/// A staged job's charge: its files' bytes and the bookkeeping the worker holds beside them.
+++fn charged(bytes: u64, files: usize, wants: usize) u64 {
+++    return bytes + @sizeOf(io.Job) + files * @sizeOf(io.File) + wants * @sizeOf(Want) + 4 * @sizeOf([]const u8);
+++}
+++
+++/// The most staging a state of `at` tokens charges: none of its blocks on disk, spans and starts at most one a token.
+++pub fn coldCharge(r: *const Rows, at: u32) !u64 {
+++    if (at == 0) return 0;
+++    const ps = try r.parts(r.gpa, at);
+++    defer r.gpa.free(ps);
+++    var groups: [8]u32 = undefined;
+++    var blocks: usize = 0;
+++    for (try image.groups(ps, &groups)) |g| {
+++        const w = image.wholeBlocks(at, r.keying.block, g);
+++        blocks += w.end - w.first;
+++    }
+++    const metadata = 4 * (4 + 4 * @as(u64, at));
+++    return charged(image.imageBytes(ps) + metadata + (blocks + 1) * @sizeOf(file.Trailer), blocks + 1, blocks);
+++}
+++
++ /// Whether the state's block is for this job to write: the disk lacks it and no job in flight is writing it.
++ fn lacks(r: *const Rows, promised: *const io.Promised, want: Want) bool {
++     const n = chain.stem(want.name);
++--- a/zig/src/native/cuda_glm_disk.zig
+++++ b/zig/src/native/cuda_glm_disk.zig
++@@ -179,9 +179,14 @@
++     }.bytes;
++     // spill stays off: an eviction would gather on rank 0 mid-pass while the other ranks wait in the gate's all-reduce
++     const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid });
+++    // The write permit must take one whole state at the engine's capacity: a cold save of a long agent
+++    // conversation charges its own image plus every block it names, and a permit that holds only part of it
+++    // skips the save with StagingFull, so the conversation can never imprint however large --learn-gib is.
+++    // Never past the RAM store's budget (rows_write.coldCharge, as upstream's attach() sizes it).
+++    r.staging_bytes = @max(r.staging_bytes, @min(rows.write.coldCharge(r, sh.capacity) catch 0, store.budget));
++     r.prefill_rate = p.rate;
++     store.disk = r;
++-    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts)", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len });
+++    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts; a {d} MiB write permit for one state at {d} tokens)", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len, r.staging_bytes >> 20, sh.capacity });
++ }
++ 
++ test {
+-- 
+2.43.0
+

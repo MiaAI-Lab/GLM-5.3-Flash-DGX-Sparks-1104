@@ -191,6 +191,11 @@ HOST_CACHE_GIB="${HOST_CACHE_GIB:-0}"
 # written while the disk has less free.
 LEARN_GIB="${LEARN_GIB:-0}"
 LEARN_MIN_FREE_GIB="${LEARN_MIN_FREE_GIB:-15}"
+# LEARN_DAILY_GIB (--learn-daily-gib): what the disk store may write a day under its root, every model and build
+# together. The engine's own default is 32 GiB, which a pair serving long agent sessions spends in hours: a ~500k-token
+# conversation charges about 2.5 GiB on its first save, and after the budget is gone every later save is skipped with
+# DailyBudgetSpent even while LEARN_GIB has room. 0 (default): keep the engine's default.
+LEARN_DAILY_GIB="${LEARN_DAILY_GIB:-0}"
 # KV_SHARD=1 (engine patch 0110, TF_GLM_KV_SHARD): each stream's FP8 latent rows live on one Spark (its owner) instead
 # of both, so the same memory holds about twice the tokens; the other Spark's queries go to the owner for attention
 # (1-4% decode). Needs KV=fp8, KV pages, DFlash2 or no drafter, PARALLEL above 1. The pool then takes most of the

@@ -19,7 +19,7 @@
 
 **Engine: TensorFold 1.1.9** (`tensorfold-native --version`), upstream commit
 [`f350cd3e`](https://github.com/ashhart/TensorFold/commit/f350cd3ea253a042e205746928271f9d8f71a82d) plus this recipe's
-110 engine patches (`patches/engine/`).
+112 engine patches (`patches/engine/`).
 
 This recipe serves GLM-5.3-Flash from an EXL3 checkpoint on **two NVIDIA DGX Sparks** (GB10, 128 GB unified memory
 each) at tensor parallel 2, one rank on each Spark, over their ConnectX-7 link. It uses TensorFold's native Zig/CUDA
@@ -49,7 +49,7 @@ The engine is TensorFold 1.1.9 at commit `f350cd3e` ([ashhart/TensorFold](https:
 
 ## What is checked
 
-110 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
+112 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
 reaches the worker by content; link discovery finds both PCIe twins of the cabled port and the RoCE v2 GID that
 holds each port's own IPv4; NCCL and the engine's RDMA all-gather run over the cable; the full 1,048,576-token window
 serves 8 streams beside a 3.6 GiB prompt cache; greedy replies are byte-stable across every change
@@ -184,6 +184,13 @@ prompt's first token comes about 47% later than at `1`. Replies are byte-identic
   costs a stream decoding beside it about 1% (34.57 against 34.77 tok/s). A state read from disk restarts DFlash2 at
   its mark, as `TF_GLM_SNAP_DRAFTER=0` does for one in memory. Damaged files fail their check and the turn prefills.
   About 0.5 GiB a 16k-token state, less for later turns, which share earlier turns' rows. Off: replies byte-identical.
+  Two limits decide whether a long conversation imprints at all, and both bit this pair's 380k and 500k agent sessions:
+  the write permit (engine patch 0112, below) and `LEARN_DAILY_GIB`, the store's write budget a day. The engine's
+  default budget is 32 GiB, which two such sessions spend in hours while `LEARN_GIB` still has room, after which every
+  save is skipped with `DailyBudgetSpent`. Measured on the pair (2026-11-09, `PARALLEL=8`, 1M window,
+  `CACHE_FIRST=1 PROMPT_CACHE_GIB=6 LEARN_GIB=100 LEARN_DAILY_GIB=100 KV_SHARD=1`): a 385k-token state written in
+  16.5 s (2,559 MiB), a 520k one read back in 3.2 s (3,556 MiB), and those sessions' per-turn first token went from
+  183-250 s to 2.7-9 s. A cold 500k prompt still costs about 650 s with two streams prefilling.
 - **KV sharding: `KV_SHARD=1`** (engine patch 0110, `TF_GLM_KV_SHARD`, off by default). Each stream's FP8 latent rows
   live on one Spark, its owner, instead of on both (the pooled index keys stay on both, as the indexer runs on both),
   so a token costs 3,542 bytes a rank instead of 6,380 and the same memory holds about twice the tokens. The other
@@ -241,7 +248,7 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 | `KV`, `KV_PAGES` | `fp8`, `on` | `--kv-cache`, one shared pool of 512-row pages with `CONTEXT` as one request's cap |
 | `DENSE`, `HEAD` | `q8`, `bf16` | `bf16`, `q8`, `q6` or `q4` for the dense linears and the LM head; the pair's `local.sh` sets `HEAD=q8` |
 | `MEMORY_RESERVE_GIB`, `HOST_CACHE_GIB`, `PROMPT_CACHE_GIB` | `12`, `0`, empty | See [Memory](#memory-on-a-128-gb-unified-spark); the pair runs the reserve at 9.5 |
-| `LEARN_GIB`, `LEARN_MIN_FREE_GIB` | `0`, `15` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0109); see [Memory](#memory-on-a-128-gb-unified-spark) |
+| `LEARN_GIB`, `LEARN_MIN_FREE_GIB`, `LEARN_DAILY_GIB` | `0`, `15`, `0` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0109); `LEARN_DAILY_GIB` is what the store may write a day (`--learn-daily-gib`; 0 keeps the engine's 32 GiB default, which long agent sessions spend in hours); the write permit is one whole state at the served context (patch 0112). See [Memory](#memory-on-a-128-gb-unified-spark) |
 | `KV_SHARD` | `0` | `1` keeps each stream's latent rows on one Spark (`TF_GLM_KV_SHARD`, patch 0110): about twice the tokens, 1-4% decode; use with `CACHE_FIRST=1 PROMPT_CACHE_GIB=6`, see [Memory](#memory-on-a-128-gb-unified-spark). Needs `KV=fp8`, KV pages, DFlash2 or no drafter |
 | `CACHE_FIRST` | `0` | `1` sets `PROMPT_CACHE_GIB` (required) aside before the streams' windows (`TF_PROMPT_CACHE_FIRST`, patch 0108), so the cache comes first, still capped by what the room leaves (set `PROMPT_CACHE_MIN_GIB` to enforce a floor); see [Memory](#memory-on-a-128-gb-unified-spark) |
 | `PROMPT_CACHE_MIN_GIB` | empty | The smallest prompt cache a start may serve with. `start.sh` reads each rank's startup line and stops both ranks before LIVE (`E_CACHE`) when one funds less; the cache is what that start's room leaves, so `PROMPT_CACHE_GIB` caps it but does not guarantee it, even with `CACHE_FIRST=1` (issue 16). Empty: no check |
@@ -337,9 +344,9 @@ the template as it is. A `CHAT_TEMPLATE` of your own is served as it is either w
 
 ## Engine patches
 
-`patches/engine/` holds 111 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
+`patches/engine/` holds 112 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0111 are this pair's own or ported from that recipe or from upstream. None is GB10-specific: the arch-gated kernels test
+0094-0112 are this pair's own or ported from that recipe or from upstream. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -361,6 +368,8 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0109 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411): kept prompt states on disk, every rank's part, written behind the request and read back (ahead of a queued turn when it can) after an eviction or a restart. On this stack the disk image copies 0015's two-tier lease page by page and rank 1's part travels the follow link of 0031. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
 | 0110 | KV sharding (`KV_SHARD=1`, `TF_GLM_KV_SHARD`, off by default) at TP=2, toward upstream [#1431](https://github.com/ashhart/TensorFold/issues/1431): each stream's FP8 latent rows on its owner rank, a second page table pointing off-owner at a discard page, owner-computed decode and verify (no new kernel), prompts on a borrowed twin, kept states carried to another owner in 32 MiB pieces, and 0109's disk image under it. Refused by name with the MTP drafter, `--parallel 1`, other KV caches, or a part under 131k tokens. `tf-cuda-test glm-kv-shard-check` checks it against an unsharded twin byte for byte. Off: replies byte-identical |
 | 0111 | **This pair's.** The clean image build prints no compiler warning: two fp8 expert kernels' unread kernel-local `RW`, `prefill_attention`'s readerless `SMEM_MAX`, `glm_mm`'s `Tile` `SMEM` member no instantiation uses, and `flashnext_fact` / `flashnext_attn` unroll loops that sat behind an `if constexpr` they could not reach (now behind the inverted guard, so each instantiation compiles only its reachable side). No arithmetic, launch shape or output changes: all six files' fatbins compile byte-identical |
+
+| 0112 | GLM's disk write permit takes one whole state at the served context (toward upstream [#2337](https://github.com/ashhart/TensorFold/pull/2337); carries the `coldCharge` sizing from [#2382](https://github.com/ashhart/TensorFold/pull/2382)): `rows_write.coldCharge` prices one cold state and `cuda_glm_disk.attach` sets the permit to it, never past the RAM store's budget (5,705 MiB on this pair), so states over about 135k tokens can be written instead of skipped with `StagingFull`. The engine's startup line names the permit. Off: replies byte-identical |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 

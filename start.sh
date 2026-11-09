@@ -153,6 +153,8 @@ build_serve_args() {
   # LEARN_GIB: engine patch 0109 keeps the prompt states on disk too (rank 0's CACHE_DIR/learn holds every rank's part)
   [[ "$LEARN_GIB" == 0 ]] || SERVE_ARGS+=(--learn-conversations --learn-dir /state/learn --learn-gib "$LEARN_GIB"
     --learn-min-free-gib "$LEARN_MIN_FREE_GIB")
+  # LEARN_DAILY_GIB: the engine's default write budget is 32 GiB a day, spent in hours by long agent sessions.
+  [[ "$LEARN_GIB" == 0 || "$LEARN_DAILY_GIB" == 0 ]] || SERVE_ARGS+=(--learn-daily-gib "$LEARN_DAILY_GIB")
   read -r -a extra <<< "$SERVE_EXTRA_ARGS"
   SERVE_ARGS+=("${extra[@]}")
 }
@@ -634,6 +636,7 @@ if [[ "$DRY_RUN" != 1 ]]; then
     log "Context: $CTX tokens (kept for the next start with these settings; delete $FIT_FILE to probe again)."
     pool=$(grep -ho 'taking [0-9]* pages of 512 rows' "$RUN_LOG_DIR/rank0.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1)
     [[ -z "$pool" ]] || log "KV pool: $pool pages = $(( pool * 512 )) tokens shared by $PARALLEL streams (one request up to $CTX)."
+    [[ "$LEARN_GIB" == 0 ]] || log "Disk store: $LEARN_GIB GiB cap, $([[ "$LEARN_DAILY_GIB" == 0 ]] && echo 'engine default 32' || echo "$LEARN_DAILY_GIB") GiB of writes a day; the engine prints its write permit with 'conversation states on disk'."
     # A few MiB more fixed memory can quietly drop a stream.
     grep -q "$PARALLEL streams at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_STREAMS "The engine serves fewer than PARALLEL=$PARALLEL streams at once; see the startup line in $RUN_LOG_DIR/rank0.log."

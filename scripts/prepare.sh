@@ -78,6 +78,7 @@ validate_config() {
   [[ "$KV_SHARD" =~ ^[01]$ ]] || fail E_CONFIG 'KV_SHARD must be 0 or 1 (TF_GLM_KV_SHARD).'
   [[ "$KV_SHARD" == 0 || ( "$KV" == fp8 && "$DRAFTER" != mtp ) ]] || fail E_CONFIG 'KV_SHARD=1 needs KV=fp8 and DRAFTER=dflash2 or none.'
   is_number "$LEARN_MIN_FREE_GIB" || fail E_CONFIG 'LEARN_MIN_FREE_GIB must be a number of GiB.'
+  is_number "$LEARN_DAILY_GIB" || fail E_CONFIG 'LEARN_DAILY_GIB must be a number of GiB per day (0: the engine default, 32).'
   [[ -z "$PROMPT_CACHE_MIN_GIB" ]] || is_number "$PROMPT_CACHE_MIN_GIB" \
     || fail E_CONFIG 'PROMPT_CACHE_MIN_GIB must be empty (no check) or a number of GiB.'
   [[ "$WITH_VIDEO" =~ ^[01]$ ]] || fail E_CONFIG 'WITH_VIDEO must be 0 or 1.'
