@@ -218,7 +218,7 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `SM`, `ZIG_CPU` | `121`, `native` | GB10's target; `baseline` builds an image that runs elsewhere |
-| `TF_REPO`, `TF_REF`, `ZIG_VERSION`, `ZIG_SHA256`, `NCCL_WHEEL` | pinned | All hashed into the image tag |
+| `TF_REPO`, `TF_REF`, `ZIG_VERSION`, `ZIG_SHA256`, `NCCL_WHEEL` | pinned | All hashed into the image tag | — version landscape and the verified upgrade procedure: [docs/tensorfold-versions.md](docs/tensorfold-versions.md)
 | `IMAGE`, `IMAGE_REPO`, `DOCKER_BUILD_FLAGS`, `CONTAINER_NAME` | `tensorfold-glm53-spark:<hash>`, `glm53-spark` | |
 | `MEMGUARD`, `MEMGUARD_FLOOR_GIB`, `MEMGUARD_HOLD_S`, `MEMGUARD_INTERVAL_S`, `MIN_AVAIL_GIB` | `1`, `2.5`, `4`, `2`, `100` | See [Memory](#memory-on-a-128-gb-unified-spark) |
 | `DATA_DIR`, `CACHE_DIR`, `LOG_DIR`, `LOG_KEEP` | `~/.cache/aevonix-glm53`, `DATA_DIR/zig-home`, `logs`, `10` | Downloads, the ranks' `HOME`, run logs |
