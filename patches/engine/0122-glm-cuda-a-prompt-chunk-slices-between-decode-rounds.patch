@@ -1,0 +1,1184 @@
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 53764bf..e2e5ed8 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -23,6 +23,7 @@ const kv_shard = @import("cuda_kv_shard.zig");
+ const kv_attn = @import("cuda_kv_shard_attn.zig");
+ const kv_keep = @import("cuda_kv_shard_keep.zig");
+ const l2pf_mod = @import("cuda_l2pf.zig");
++const taps_mod = @import("cuda_taps.zig");
+ pub const Options = @import("cuda_engine_types.zig").Options;
+ 
+ /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
+@@ -78,6 +79,211 @@ test "GLM heads: no MTP layer and no drafter loads no head and decodes plain; DF
+     };
+ }
+ 
++/// A prompt chunk's per-layer costs by row band (the Python family's sliced-fill LayerCosts): the calibration chunk's
++/// CUDA events fill the first band, later chunks drift an EWMA scale; `stop` cuts greedily to the budget -- a layer
++/// slower than it runs alone (CUDA kernels cannot be preempted, so the setting is a target), the fewest slices that
++/// greed takes, each cut nearest the mean slice cost.
++pub const LayerCosts = struct {
++    gpa: std.mem.Allocator = undefined,
++    layers: usize = 0,
++    scale: f64 = 1, // the calibration against the chunks that run
++    overhead_ms: f64 = 0, // a slice's host cost around its layers (EWMA)
++    bands: std.ArrayListUnmanaged(Band) = .empty, // by rows ascending; the first chunk's rows calibrates it
++    cut: []f64 = &.{}, // `stop`'s scratch: a cost a layer, then the tail's (its last layer holds it)
++
++    const Band = struct { rows: usize, ms: []f64 }; // one cost a layer, then the chunk tail's
++
++    pub fn ready(c: *const LayerCosts) bool {
++        return c.bands.items.len != 0;
++    }
++
++    pub fn deinit(c: *LayerCosts) void {
++        for (c.bands.items) |b| c.gpa.free(b.ms);
++        c.bands.deinit(c.gpa);
++        if (c.cut.len > 0) c.gpa.free(c.cut);
++        c.* = .{};
++    }
++
++    /// A chunk's per-layer timings at `rows` become that row band (ms[layers] its tail, 0 before one is measured);
++    /// the first band sets the layer count, and a band's first reading stands (the scale tracks its drift).
++    pub fn calibrate(c: *LayerCosts, rows: usize, ms: []const f64) !void {
++        if (rows == 0 or ms.len == 0 or c.bandAt(rows) != null) return;
++        if (c.bands.items.len == 0) {
++            c.layers = ms.len - 1;
++            c.cut = try c.gpa.alloc(f64, ms.len);
++        } else if (ms.len != c.layers + 1) return error.BadCosts;
++        for (ms) |v| if (!(v >= 0) or std.math.isNan(v)) return error.BadCosts;
++        const mine = try c.gpa.dupe(f64, ms);
++        errdefer c.gpa.free(mine);
++        const at = for (c.bands.items, 0..) |b, i| {
++            if (b.rows > rows) break i;
++        } else c.bands.items.len;
++        try c.bands.insert(c.gpa, at, .{ .rows = rows, .ms = mine });
++    }
++
++    fn bandAt(c: *LayerCosts, rows: usize) ?*Band {
++        for (c.bands.items) |*b| if (b.rows == rows) return b;
++        return null;
++    }
++
++    /// The bands' interpolation at `rows` into `out` (clamped past either end, as the Python family's costs()).
++    fn costsAt(c: *LayerCosts, rows: usize, out: []f64) void {
++        const bs = c.bands.items;
++        var lo: usize = 0;
++        var hi: usize = bs.len - 1;
++        for (bs, 0..) |b, i| {
++            if (b.rows <= rows) lo = i;
++            if (b.rows >= rows) {
++                hi = i;
++                break;
++            }
++        }
++        if (bs[lo].rows == bs[hi].rows) {
++            @memcpy(out, bs[lo].ms);
++            return;
++        }
++        const t = @as(f64, @floatFromInt(rows - bs[lo].rows)) / @as(f64, @floatFromInt(bs[hi].rows - bs[lo].rows));
++        for (out, bs[lo].ms, bs[hi].ms) |*o, a, b| o.* = a + t * (b - a);
++    }
++
++    /// A `rows` chunk's tail took `ms` (its layers past runRange: the head passes, the draws, the commit).
++    pub fn observeTail(c: *LayerCosts, rows: usize, ms: f64) void {
++        if (!(ms >= 0) or std.math.isNan(ms)) return;
++        if (c.bandAt(rows)) |b| {
++            const old = b.ms[c.layers];
++            b.ms[c.layers] = if (old > 0) 0.8 * old + 0.2 * ms else ms;
++        }
++    }
++
++    /// A slice's host cost around its layers (EWMA): stop() spends the budget net of it.
++    pub fn observeOverhead(c: *LayerCosts, ms: f64) void {
++        if (!(ms >= 0) or std.math.isNan(ms)) return;
++        c.overhead_ms = 0.8 * c.overhead_ms + 0.2 * ms;
++    }
++
++    /// The slice [lo, hi) took `ms` of GPU time: the EWMA scale tracks the calibration's drift (clamped 0.5..8, and
++    /// only the layers' time -- the tail and the host's dispatch must not inflate every layer's prediction).
++    pub fn observe(c: *LayerCosts, rows: usize, lo: usize, hi: usize, ms: f64) void {
++        if (!(ms > 0) or std.math.isNan(ms) or hi <= lo) return;
++        c.costsAt(rows, c.cut);
++        var predicted: f64 = 0;
++        for (c.cut[lo..@min(hi, c.layers)]) |v| predicted += v;
++        if (predicted > 0) c.scale = std.math.clamp(c.scale * (0.8 + 0.2 * ms / predicted), 0.5, 8);
++    }
++
++    /// Greedy's end from `start`: layers while they fit `cap`, always one (a layer slower than the budget alone).
++    fn greedyEnd(c: *LayerCosts, start: usize, cap: f64) usize {
++        var end = start + 1;
++        var ms = c.cut[start];
++        while (end < c.layers and ms + c.cut[end] <= cap) : (end += 1) ms += c.cut[end];
++        return end;
++    }
++
++    fn piecesFrom(c: *LayerCosts, start: usize, cap: f64) usize {
++        var n: usize = 0;
++        var at = start;
++        while (at < c.layers) {
++            at = c.greedyEnd(at, cap);
++            n += 1;
++        }
++        return n;
++    }
++
++    /// The next slice's end layer from `lo`: greedy gives the minimum slice count; among the first cuts that keep it,
++    /// the one nearest the mean slice cost (ties: the deepest), so no tiny tail trails several near-budget stalls.
++    pub fn stop(c: *LayerCosts, rows: usize, lo: usize, budget: f64) usize {
++        if (lo >= c.layers or !(budget > 0)) return lo + 1;
++        c.costsAt(rows, c.cut);
++        for (c.cut[0..c.layers]) |*v| v.* *= c.scale;
++        c.cut[c.layers - 1] += c.cut[c.layers] * c.scale; // the tail rides the chunk's last layer
++        const cap = @max(0.001, budget - c.overhead_ms);
++        const end = c.greedyEnd(lo, cap);
++        const count = c.piecesFrom(lo, cap);
++        var left: f64 = 0; // the layers past lo, for the mean and each cut's distance from it
++        for (c.cut[lo..c.layers]) |v| left += v;
++        const target = left / @as(f64, @floatFromInt(count));
++        var best = end;
++        var best_gap = blk: {
++            var sum: f64 = 0;
++            for (c.cut[lo..end]) |v| sum += v;
++            break :blk @abs(sum - target);
++        };
++        var hi = lo + 1;
++        while (hi < end) : (hi += 1) {
++            if (c.piecesFrom(hi, cap) > count - 1) continue;
++            var sum: f64 = 0;
++            for (c.cut[lo..hi]) |v| sum += v;
++            const gap = @abs(sum - target);
++            if (gap <= best_gap) { // equal gaps take the deeper cut, as the Python family's -hi
++                best = hi;
++                best_gap = gap;
++            }
++        }
++        return best;
++    }
++};
++
++test "GLM sliced fill: LayerCosts cuts inside the budget, greedy's fewest slices, a slow layer alone" {
++    const a = std.testing.allocator;
++    var c: LayerCosts = .{ .gpa = a };
++    defer c.deinit();
++    try c.calibrate(4096, &.{ 1, 1, 1, 1, 1, 1, 1, 1, 0 });
++    try std.testing.expect(c.ready());
++    // 2.5 ms takes two of the 1 ms layers: four equal slices over the eight
++    var hi: usize = 0;
++    var slices: usize = 0;
++    var worst: f64 = 0;
++    while (hi < 8) : (slices += 1) {
++        const end = c.stop(4096, hi, 2.5);
++        try std.testing.expect(end > hi and end <= 8);
++        var ms: f64 = 0;
++        for (c.cut[hi..end]) |v| ms += v;
++        worst = @max(worst, ms);
++        hi = end;
++    }
++    try std.testing.expectEqual(@as(usize, 4), slices); // greedy's minimum, 8 layers / 2
++    try std.testing.expect(worst <= 2.5); // and every slice inside the budget
++    // a layer slower than the budget runs alone: the 10 ms one cannot divide
++    var s: LayerCosts = .{ .gpa = a };
++    defer s.deinit();
++    try s.calibrate(4096, &.{ 1, 1, 10, 1, 1, 1, 1, 1, 0 });
++    try std.testing.expectEqual(@as(usize, 2), s.stop(4096, 0, 2.5));
++    try std.testing.expectEqual(@as(usize, 3), s.stop(4096, 2, 2.5)); // the slow layer's slice alone
++    var n: usize = 0;
++    hi = 0;
++    while (hi < 8) : (n += 1) hi = s.stop(4096, hi, 2.5);
++    try std.testing.expectEqual(@as(usize, 5), n); // 2 + 1 + 2 + 2 + 1: still greedy's count
++    // a slice that overran its prediction scales the rest; the host's overhead narrows the next cut
++    s.observe(4096, 0, 2, 4); // 2 ms predicted, 4 taken: 1.2
++    try std.testing.expectApproxEqRel(@as(f64, 1.2), s.scale, 1e-9);
++    s.observeOverhead(0.5);
++    try std.testing.expectApproxEqRel(@as(f64, 0.1), s.overhead_ms, 1e-9);
++    try std.testing.expectEqual(@as(usize, 1), s.stop(4096, 0, 1.6)); // 1.6 - 0.1 of host cost: no two scaled layers fit
++    // the tail rides the last layer once measured, and a second row band interpolates between the two
++    s.observeTail(4096, 3);
++    _ = s.stop(4096, 6, 100); // cut[7] now holds the scaled layer and tail: (1 + 3) * 1.2
++    try std.testing.expectApproxEqRel(@as(f64, 4.8), s.cut[7], 1e-9);
++    var t: LayerCosts = .{ .gpa = a };
++    defer t.deinit();
++    try t.calibrate(4096, &.{ 1, 1, 1, 1, 1, 1, 1, 1, 0 });
++    try t.calibrate(8192, &.{ 2, 2, 2, 2, 2, 2, 2, 2, 6 });
++    try std.testing.expectEqual(@as(usize, 2), t.stop(6000, 0, 3.05)); // between the bands: 1.46 a layer, two fit
++}
++
++/// A prompt chunk suspended between its layers (TF_GLM_FILL_SLICE_MS): its ids duped (a step's slice may outlive the
++/// caller's buffer), the next layer `j`, and the flags its first slice ran the forward with. One at a time, and only
++/// its slot's steps resume it -- a slice never commits part-way, so kept states stay on the chunk grid they keep.
++pub const PartialFill = struct {
++    slot: u32,
++    start: usize,
++    len: usize,
++    j: usize,
++    rows: usize,
++    part: []u32,
++    split: bool,
++    taps: ?taps_mod.Taps = null,
++};
++
+ pub const Engine = struct {
+     gpa: std.mem.Allocator,
+     io: std.Io,
+@@ -142,6 +348,9 @@ pub const Engine = struct {
+     kv_stage: ?cuda.DeviceBuffer = null, // ...and a resume's carry pieces (cuda_kv_shard_keep.piece_bytes)
+     kv_ctx: kv_attn.Ctx = undefined, // ...their place for the forward (read only with settings.kv_shard.on)
+     l2pf: ?l2pf_mod.L2pf = null, // TF_GLM_L2PF: the prefetch's side stream, kernels and table, made after the weights tile
++    partial: ?PartialFill = null, // TF_GLM_FILL_SLICE_MS: the one prompt chunk between its layers (its slot bound to run it)
++    slice_costs: LayerCosts = .{}, // its per-layer costs: the first chunk calibrates by events, later ones the EWMA scale
++    slice_cal: ?[]cuda.Event = null, // that chunk's events, one a layer (freed once the costs are in)
+ 
+     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
+@@ -198,7 +407,7 @@ pub const Engine = struct {
+         for (layers, 0..) |*l, i| l.* = @intCast(i);
+         const sel = heads(o.drafts, o.drafter, c.mtp); // every rank alike: the same config and options (cuda_ranks)
+         if (o.drafts and !sel.drafts and rank == 0) std.log.warn("glm: the checkpoint has no MTP layer (num_nextn_predict_layers 0) and no --drafter is given: decoding without drafts", .{});
+-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false };
++        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false, .slice_costs = .{ .gpa = gpa } };
+         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
+         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
+         const Tile = struct {
+@@ -281,6 +490,12 @@ pub const Engine = struct {
+     pub fn deinit(e: *Engine) void {
+         e.stream.synchronize() catch {};
+         if (e.side) |x| x.s.synchronize() catch {}; // shared-expert work still in flight reads buffers and weights freed below
++        if (e.partial) |*p| e.gpa.free(p.part); // a chunk left between its layers: host memory alone
++        e.slice_costs.deinit();
++        if (e.slice_cal) |ev| {
++            for (ev) |*x| x.deinit();
++            e.gpa.free(ev);
++        }
+         e.gpa.free(e.packs.ptrs);
+         e.gpa.free(e.packs.bits);
+         if (e.drafter) |dr| dr.deinit();
+@@ -441,6 +656,7 @@ pub const Engine = struct {
+ 
+     /// Frees slot `slot`'s sequence (slot 0 stays, and a paged one gives its pages back) and binds slot 0.
+     pub fn release(e: *Engine, slot: u32) void {
++        _ = e.dropPartialOf(slot); // a chunk the stream left between its layers goes uncommitted, on every rank
+         if (e.images) |v| v.release(slot);
+         const paged = if (e.pages) |p| p.paged(slot) else false;
+         if (paged) e.pages.?.close(slot) else if (slot != 0) e.free(slot);
+@@ -504,6 +720,12 @@ pub const Engine = struct {
+ 
+     /// One step of a `len`-id prompt pass: `part` from `start` plus the next id; first token at the end, else null. A step
+     /// is a chunk, two (prompt_pair), or settings.chunk rows of one beside a decoding stream (chunk_busy, prompt_solo).
++    /// A prompt chunk's prof by its rows (TF_GLM_PROF=1: one a row class, its label with it).
++    fn promptProfAt(rows: usize) usize {
++        return if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3;
++    }
++    const prompt_prof_labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
++
+     pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
+         const split = e.index_split; // this step's alone
+         e.index_split = false;
+@@ -529,9 +751,8 @@ pub const Engine = struct {
+         if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
+         const as_i32: []const i32 = @ptrCast(part);
+         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
+-        f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
+-        const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
+-        if (f.prof) |p| try p.beginPrompt(e.stream, labels[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
++        f.prof = e.prompt_profs[promptProfAt(rows)];
++        if (f.prof) |p| try p.beginPrompt(e.stream, prompt_prof_labels[promptProfAt(rows)], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
+         if (f.prof) |p| e.profiling_prompt = p;
+         defer if (f.prof != null) {
+             e.profiling_prompt = null;
+@@ -583,6 +804,168 @@ pub const Engine = struct {
+         return first;
+     }
+ 
++    /// The next slice's end layer of the bound slot's chunk (rank 0 picks it; the step's header carries it to the
++    /// other ranks): the first chunk with slicing calibrates whole -- a CUDA event a layer, no server-startup probe
++    /// as the Python family's -- and the rest cut where the learned costs say.
++    pub fn sliceHi(e: *Engine, rows: usize, lo: usize, budget: f64) !usize {
++        const layers = e.w.layers.len;
++        if (lo >= layers) return error.BadSlice;
++        if (e.slice_costs.ready()) return e.slice_costs.stop(rows, lo, budget);
++        if (e.slice_cal == null) {
++            const ev = try e.gpa.alloc(cuda.Event, layers + 1);
++            errdefer e.gpa.free(ev);
++            var made: usize = 0;
++            errdefer for (ev[0..made]) |*x| x.deinit();
++            for (ev) |*x| {
++                x.* = try cuda.Event.init(e.d, true); // timing events: the ms between them is the layer's cost
++                made += 1;
++            }
++            e.slice_cal = ev;
++        }
++        return layers;
++    }
++
++    /// `slot`'s suspended chunk drops without its commit (a cancel between slices, or a release): its layers already
++    /// wrote their caches, so the sequence waits for its next begin's reset or a kept state's restore, as a chunk
++    /// cancelled at its gate does. Returns whether one was held (both ranks hold the same one, by its slot).
++    pub fn dropPartialOf(e: *Engine, slot: u32) bool {
++        if (e.partial) |*p| if (p.slot == slot) {
++            e.gpa.free(p.part);
++            e.partial = null;
++            return true;
++        };
++        return false;
++    }
++
++    /// One slice of a prompt chunk's layers (TF_GLM_FILL_SLICE_MS, the Leader's chunkpart step): the chunk at `start`
++    /// opens with prefillChunk's head through the gate, then runs its layers [j, hi) -- a suspended chunk resuming at
++    /// its `j` -- and hi == the layer count finishes it with prefillChunk's tail and commit, exactly as the whole
++    /// chunk would (a slice never commits part-way, so kept states stay on the chunk grid). `hi` is rank 0's sliceHi
++    /// pick, every rank running the same range: the kernels, their arguments and their order are prefillChunk's.
++    pub fn prefillChunkSlice(e: *Engine, part: []const u32, start: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks, hi: usize) !?u32 {
++        const t0 = std.Io.Clock.awake.now(e.io).toNanoseconds();
++        const layers = e.w.layers.len;
++        if (hi == 0 or hi > layers) return error.BadSlice;
++        var one: [1]fw.Rank = undefined;
++        var f = e.view(&e.bp, &one);
++        var rows: usize = undefined;
++        var lo: usize = undefined;
++        if (e.partial) |p| { // a suspended chunk's next slice: the flags as its first slice ran them
++            if (p.slot != e.slot or p.start != start or p.len != len or p.j >= hi) return error.BadChunk;
++            rows = p.rows;
++            lo = p.j;
++            f.index_split = p.split;
++            f.taps = p.taps;
++            f.prof = e.prompt_profs[promptProfAt(rows)];
++            e.profiling_prompt = f.prof; // the chunk's prof stays open across its slices; foreign steps must not mark it
++        } else { // the chunk's first slice: prefillChunk's head, through the gate
++            const split = e.index_split; // this step's alone
++            e.index_split = false;
++            if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
++            if (start >= len or start % fw.prefill_rows != 0) return error.BadChunk;
++            rows = @min(len - start, fw.prefill_rows);
++            if (part.len != @min(len - start, rows + 1)) return error.BadChunk; // paired steps run whole (Leader.chunk)
++            f.index_split = split;
++            if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
++            if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
++            f.prof = e.prompt_profs[promptProfAt(rows)];
++            if (f.prof) |p| try p.beginPrompt(e.stream, prompt_prof_labels[promptProfAt(rows)], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
++            if (f.prof) |p| e.profiling_prompt = p;
++            errdefer if (e.profiling_prompt) |p| {
++                p.prompt.?.invalid = true;
++                p.end();
++                e.profiling_prompt = null;
++            };
++            var stamp = prof_mod.span(f.prof, e.stream, .gate);
++            e.gate(cancel) catch |err| {
++                if (err == error.Cancelled) try snapshots.interrupted(e, marks, @intCast(start));
++                return err;
++            };
++            stamp.end();
++            if (f.prof) |p| p.mark(e.stream, .gate);
++            e.partial = .{ .slot = e.slot, .start = start, .len = len, .j = 0, .rows = rows, .part = try e.gpa.dupe(u32, part), .split = split, .taps = f.taps };
++        }
++        errdefer _ = e.dropPartialOf(e.slot);
++        errdefer if (e.profiling_prompt) |p| { // a slice that failed ends the chunk's prof as a failed whole one
++            p.prompt.?.invalid = true;
++            p.end();
++            e.profiling_prompt = null;
++        };
++        f.slice_cal = e.slice_cal;
++        const as_i32: []const i32 = @ptrCast(e.partial.?.part[0..rows]);
++        const t1 = std.Io.Clock.awake.now(e.io).toNanoseconds();
++        try f.runRange(as_i32, lo, hi);
++        try e.stream.synchronize(); // the slice done before the host returns to its decode rounds
++        if (e.slice_cal) |ev| if (!e.slice_costs.ready()) { // the calibration chunk's events: one cost a layer
++            const costs = try e.gpa.alloc(f64, layers + 1);
++            defer e.gpa.free(costs);
++            for (0..layers) |j| costs[j] = try ev[j].elapsedMs(ev[j + 1]);
++            costs[layers] = 0; // the tail, learned as tails run
++            try e.slice_costs.calibrate(rows, costs);
++            for (ev) |*x| x.deinit();
++            e.gpa.free(ev);
++            e.slice_cal = null;
++        };
++        if (e.share.rank == 0) if (e.slice_costs.ready()) { // the slice's cost, and the host's around it
++            const ms = @as(f64, @floatFromInt(std.Io.Clock.awake.now(e.io).toNanoseconds() - t1)) / 1e6;
++            e.slice_costs.observe(rows, lo, hi, ms);
++            e.slice_costs.observeOverhead(@as(f64, @floatFromInt(t1 - t0)) / 1e6);
++        };
++        e.partial.?.j = hi;
++        if (hi < layers) {
++            e.profiling_prompt = null; // between slices the chunk's prof takes no other step's spans
++            return null;
++        }
++        const t2 = std.Io.Clock.awake.now(e.io).toNanoseconds();
++        // the chunk's tail and commit, as prefillChunk runs them
++        const held = e.partial.?;
++        e.index_splits += @intFromBool(held.split);
++        var stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
++        if (e.prompt_logprobs) |p| if (held.part.len > 1) try prompt_lp.run(e, p, held.part[1..]);
++        stamp.end();
++        stamp = prof_mod.span(f.prof, e.stream, .drafter);
++        if (e.drafter) |dr| try dr.prompt(e, e.slot, held.start, rows, held.len);
++        if (e.drafter) |dr| if (held.start + rows == held.len) try dr.ringDigest(e, e.slot, held.len);
++        stamp.end();
++        stamp = prof_mod.span(f.prof, e.stream, .draw);
++        const last = held.start + rows == held.len;
++        var first: ?u32 = null;
++        if (last) {
++            var t: [1]u32 = undefined;
++            try e.draw(e.bp.logits, 1, held.len, 0, &t);
++            first = t[0];
++        }
++        stamp.end();
++        if (f.prof) |p| p.mark(e.stream, .draw);
++        if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
++        stamp = prof_mod.span(f.prof, e.stream, .mtp);
++        // With a drafter (DFlash2) every draft is its block's (cuda_lanes draftFn); the target MTP layer's caches are never
++        // read, so the prompt does not absorb into them (mtp_len stays 0, as snapshots and the next prompt expect).
++        if (e.mtp and e.drafter == null) {
++            const nxt: []const i32 = @ptrCast(held.part[1..]); // the whole chunk's tail absorbs part[1..], lookahead id included
++            if (nxt.len > 0) { // decode._absorb_rows
++                const mp = f.prof;
++                defer f.prof = mp;
++                f.prof = null; // the head's pass as one section
++                try f.mtp(nxt, &.{e.bp.fnormed});
++                f.prof = mp;
++                try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
++            }
++        }
++        stamp.end();
++        if (f.prof) |p| p.mark(e.stream, .mtp);
++        stamp = prof_mod.span(f.prof, e.stream, .commit);
++        try f.commit(rows);
++        stamp.end();
++        if (f.prof) |p| p.mark(e.stream, .commit);
++        if (f.prof) |p| p.end();
++        e.profiling_prompt = null;
++        e.gpa.free(held.part);
++        e.partial = null;
++        if (e.share.rank == 0) if (e.slice_costs.ready()) e.slice_costs.observeTail(rows, @as(f64, @floatFromInt(std.Io.Clock.awake.now(e.io).toNanoseconds() - t2)) / 1e6);
++        return first;
++    }
++
+     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
+     pub fn gate(e: *Engine, cancel: ?Cancel) !void {
+         try snapshots.gate(e);
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 3cbd0e6..fb28b20 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -13,20 +13,20 @@ const sparse = @import("cuda_sparse.zig");
+ const prompt_solo = @import("cuda_prompt_solo.zig");
+ const Engine = engine.Engine;
+ 
+-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout };
++pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, chunkpart, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout };
+ 
+ /// One step as it crosses: 64 bytes, then `n` u32 ids.
+ pub const Header = extern struct {
+     kind: u32,
+     n: u32 = 0, // ids that follow
+-    depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts; begin: its twin's ids (KV shard)
+-    flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2), a busy step of TF_GLM_CHUNK rows (4); verify, shared: whole rows
+-    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
+-    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
++    depth: u32 = 0, // draft: drafts to chain; chunk, chunkpart: where the chunk starts; shared: its parts; begin: its twin's ids (KV shard)
++    flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk, chunkpart: prompt_logprobs (1); chunk, chunkpart: indexer rows split (2), a busy step of TF_GLM_CHUNK rows (4); verify, shared: whole rows
++    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length; chunkpart: the slice's end layer (0: the chunk is cancelled)
++    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; chunkpart: the kept state's id (its position is the chunk's start, 0: none); snapshots: the host tier asked
+     temperature: f64 = 0,
+     top_p: f64 = 0,
+     min_p: f64 = 0,
+-    top_k: u32 = 0, // begin: top_k; chunk: the prompt's length
++    top_k: u32 = 0, // begin: top_k; chunk, chunkpart: the prompt's length
+     slot: u32 = 0, // the stream's sequence the step runs on (Engine.bind)
+ 
+     comptime {
+@@ -286,6 +286,41 @@ pub const Leader = struct {
+         sh.parts.counts.checks += 1;
+     }
+ 
++    /// One slice of a prompt chunk on every rank (Engine.prefillChunkSlice, TF_GLM_FILL_SLICE_MS): the chunk at
++    /// `start` opens with its ids, a suspended one resumes without them, rank 0's sliceHi picking the end layer the
++    /// header carries (both ranks run the same range, their gathers in step). A paired step runs whole, as pairing
++    /// spans the chunk (x.chunk); `ids` empty advances whatever chunk is held (the lane host's drain of another
++    /// stream's). Returns the chunk's outcome once its last slice commits it.
++    pub fn chunkSliced(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, budget: f64, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
++        try x.flush();
++        if (x.e.partial) |p| { // a suspended chunk's next slice: the slot bound to it, its ids held
++            if (p.slot != x.e.slot or p.start != start) return error.BadChunk;
++            const hi = try x.e.sliceHi(p.rows, p.j, budget);
++            try x.send(.{ .kind = @backingInt(Kind.chunkpart), .flags = x.rows() | @as(u32, @intFromBool(p.split)) << 1, .a = hi, .depth = @intCast(p.start), .top_k = @intCast(p.len) }, &.{});
++            const first = try x.e.prefillChunkSlice(p.part, p.start, p.len, null, cancel, marks, hi);
++            return .{ .first = first, .rows = p.rows };
++        }
++        if (start >= ids.len) return error.BadChunk;
++        if (pair and x.e.pairedAt(start, ids.len, from, marks)) return x.chunk(ids, start, true, from, cancel, marks);
++        const chunk_rows = @min(ids.len - start, engine.prompt_rows);
++        const part = ids[start..@min(ids.len, start + chunk_rows + 1)];
++        const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world);
++        const hi = try x.e.sliceHi(chunk_rows, 0, budget);
++        try x.send(.{ .kind = @backingInt(Kind.chunkpart), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .a = hi, .seed = if (from) |r| r.id else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
++        x.e.index_split = split;
++        const first = try x.e.prefillChunkSlice(part, start, ids.len, from, cancel, marks, hi);
++        return .{ .first = first, .rows = chunk_rows };
++    }
++
++    /// A chunk suspended between its slices is cancelled (a 0 end layer in the header): every rank drops its slot's
++    /// without the commit, and the states kept so far stand -- snapshots.interrupted's one gate, as a gate's cancel.
++    pub fn cancelSlice(x: Leader, start: usize, marks: ?engine.Marks) !void {
++        try x.flush();
++        try x.send(.{ .kind = @backingInt(Kind.chunkpart), .a = 0, .depth = @intCast(start) }, &.{});
++        _ = x.e.dropPartialOf(x.e.slot);
++        try @import("cuda_snapshots.zig").interrupted(x.e, marks, @intCast(start));
++    }
++
+     /// `bits`: the rows' grammar words (structured output, with Engine.structured), else 0.
+     pub fn verify(x: Leader, ids: []const u32, out: []u32, bits: u64) !void {
+         try x.flush();
+@@ -381,13 +416,13 @@ pub const Leader = struct {
+ /// A prompt step whose rows go through the head (Leader.rows): this rank's columns join each pass's broadcasts.
+ fn promptRows(h: Header) bool {
+     const kind: Kind = @fromBackingInt(@intCast(h.kind));
+-    return (kind == .prefill or kind == .chunk) and h.flags & 1 != 0;
++    return (kind == .prefill or kind == .chunk or kind == .chunkpart) and h.flags & 1 != 0;
+ }
+ 
+ /// A prompt chunk whose indexer rows split across the ranks (Leader.chunk): this rank picks for its block of rows.
+ fn indexSplit(h: Header) bool {
+     const kind: Kind = @fromBackingInt(@intCast(h.kind));
+-    return kind == .chunk and h.flags & 2 != 0;
++    return (kind == .chunk or kind == .chunkpart) and h.flags & 2 != 0;
+ }
+ 
+ /// A prompt step beside a decoding stream (Leader.chunk, cuda_prompt_solo): TF_GLM_CHUNK rows of its chunk, not the whole.
+@@ -460,6 +495,30 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+                 else => return err,
+             };
+         },
++        .chunkpart => {
++            const hi: usize = @intCast(h.a);
++            const start: usize = h.depth;
++            if (hi == 0) { // rank 0 cancelled the chunk between its slices: its slot's partial drops, no commit
++                _ = e.dropPartialOf(h.slot);
++                try @import("cuda_snapshots.zig").interrupted(e, null, @intCast(start));
++                return true;
++            }
++            if (e.partial) |p| { // the slice the header ends: this rank's copy of the chunk resumes at its own j
++                if (p.slot != h.slot or p.start != start or p.len != h.top_k) return error.BadStep;
++                _ = e.prefillChunkSlice(p.part, start, h.top_k, null, null, null, hi) catch |err| switch (err) {
++                    error.Cancelled => {},
++                    else => return err,
++                };
++            } else {
++                if (h.n == 0) return error.BadStep; // a resume without the chunk this rank holds
++                const from: ?engine.Resume = if (h.seed != 0) .{ .id = h.seed, .at = start } else null; // its at is the chunk's start
++                e.index_split = indexSplit(h);
++                _ = e.prefillChunkSlice(ids_in, start, h.top_k, from, null, null, hi) catch |err| switch (err) {
++                    error.Cancelled => {},
++                    else => return err,
++                };
++            }
++        },
+         .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
+             e.discard_draws = true;
+             defer e.discard_draws = false;
+@@ -597,10 +656,12 @@ test "a link whose host allocation fails frees its device buffer" {
+     try std.testing.expectEqual(@as(usize, 1), Mock.frees);
+     try std.testing.expectEqual(before, cuda.usage(false).device);
+ }
+-test "flag 1 asks for prompt rows on prefill and chunk steps only (begin's is sampling, draft's from the prompt)" {
++test "flag 1 asks for prompt rows on prefill, chunk and chunkpart steps only (begin's is sampling, draft's from the prompt)" {
+     try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.chunk), .flags = 1, .depth = 2048, .top_k = 4000 }));
+     try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.prefill), .flags = 1 }));
++    try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.chunkpart), .flags = 1, .a = 12, .depth = 2048, .top_k = 4000 }));
+     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.chunk), .depth = 2048, .top_k = 4000 }));
++    try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.chunkpart), .a = 12, .depth = 2048, .top_k = 4000 }));
+     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.begin), .flags = 1, .seed = 7 }));
+     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.draft), .flags = 1, .depth = 3 }));
+ }
+@@ -613,11 +674,13 @@ test "flag 1 on verify and shared steps draws from whole rows; a prompt step's f
+     try std.testing.expect(!structuredStep(.{ .kind = @backingInt(Kind.begin), .flags = 1 }));
+ }
+ 
+-test "flag 2 on a chunk splits its indexer rows across the ranks, beside flag 1's prompt rows; elsewhere it does not" {
++test "flag 2 on a chunk or a chunkpart splits its indexer rows across the ranks, beside flag 1's prompt rows; elsewhere it does not" {
+     try std.testing.expect(indexSplit(.{ .kind = @backingInt(Kind.chunk), .flags = 2, .depth = 65536, .top_k = 70000 }));
++    try std.testing.expect(indexSplit(.{ .kind = @backingInt(Kind.chunkpart), .flags = 2, .a = 12, .depth = 65536, .top_k = 70000 }));
+     try std.testing.expect(indexSplit(.{ .kind = @backingInt(Kind.chunk), .flags = 3, .depth = 65536, .top_k = 70000 }));
+     try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.chunk), .flags = 3, .depth = 65536, .top_k = 70000 }));
+     try std.testing.expect(!indexSplit(.{ .kind = @backingInt(Kind.chunk), .flags = 1, .depth = 65536, .top_k = 70000 }));
++    try std.testing.expect(!indexSplit(.{ .kind = @backingInt(Kind.chunkpart), .flags = 1, .a = 12, .depth = 65536, .top_k = 70000 }));
+     try std.testing.expect(!indexSplit(.{ .kind = @backingInt(Kind.prefill), .flags = 2 }));
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 4ba2db4..02fe20b 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -238,6 +238,7 @@ pub const Forward = struct {
+     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt pass's absorb_q and expand_v on tensor cores
+     kv: ?*const kv_attn.Ctx = null, // TF_GLM_KV_SHARD: owner-computed attention's exchange room (null: unsharded)
+     l2pf: ?*const l2pf_mod.L2pf = null, // TF_GLM_L2PF: a decode window's sites read their next weights into L2
++    slice_cal: ?[]const cuda.Event = null, // TF_GLM_FILL_SLICE_MS: the calibration chunk's events, one a layer (ev[0] before the embed)
+ 
+     /// TF_GLM_L2PF on this forward: a decode window of this process's one rank (a prompt chunk reads at full rate).
+     pub fn prefetch(f: *const Forward) ?*const l2pf_mod.L2pf {
+@@ -432,13 +433,19 @@ pub const Forward = struct {
+     const tapPieces = @import("cuda_forward_pieces.zig").tapPieces;
+     const shareTaps = @import("cuda_forward_pieces.zig").shareTaps;
+ 
+-    /// forward.pieced_layers: a prompt chunk's layers with exchanges in row pieces; same kernels and bits as unpieced.
+-    fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize) !void {
++    /// forward.pieced_layers: a prompt chunk's layers [j0, j1) with exchanges in row pieces; same kernels and bits
++    /// as unpieced. A resumed range (j0 > 0) starts where the last slice's glue left the rows; the layer-0 pre and
++    /// the taps' sharing belong to the whole range's ends alone.
++    fn piecedRange(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize, j0: usize, j1: usize) !void {
+         const layers = f.ranks[0].w.layers;
+-        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
+         var li: usize = 0;
+         var di: usize = 0;
+-        for (layers, 0..) |_, j| {
++        for (layers[0..j0]) |l| switch (l.mixer) { // a resumed range's counts start where its layers do
++            .kda => li += 1,
++            .mla => di += 1,
++        };
++        if (j0 == 0) for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
++        for (layers[j0..j1], j0..) |_, j| {
+             prof_mod.context(f.prof, j, null, .mixer);
+             for (f.ranks) |r| if (r.segs.len > 0) try shared.mixer(f, r, r.w.layers[j], li, di, R, null) else try f.mixer(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null);
+             try f.exchangePieces(p, j, .mixer, cut);
+@@ -448,56 +455,77 @@ pub const Forward = struct {
+             try f.exchangePieces(p, j, .ffn, cut);
+             try f.gluePieces(p, j, .ffn, cut);
+             if (f.taps) |t| try f.tapPieces(t, j, cut);
++            if (f.slice_cal) |ev| try ev[j + 1].record(f.stream);
+             switch (layers[j].mixer) {
+                 .kda => li += 1,
+                 .mla => di += 1,
+             }
+         }
+-        if (f.taps) |t| try f.shareTaps(t, cut);
++        if (j1 == layers.len) if (f.taps) |t| try f.shareTaps(t, cut);
+     }
+ 
+     pub const pairBody = @import("cuda_forward_pair.zig").pairBody;
+ 
+     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
+     pub fn run(f: *const Forward, ids: []const i32) !void {
++        return f.runRange(ids, 0, f.ranks[0].w.layers.len);
++    }
++
++    /// `run` over the layers [j0, j1) of `ids` (a sliced prompt chunk, TF_GLM_FILL_SLICE_MS, resumes at j0 > 0 on the
++    /// rows the last slice left in the buffers): the prolog and the finish belong to the whole range's ends alone, so
++    /// a slice moves only where the host returns between layers--the kernels, their arguments and their order are
++    /// `run`'s, and the commit stays where it was.
++    pub fn runRange(f: *const Forward, ids: []const i32, j0: usize, j1: usize) !void {
+         const R = ids.len;
+-        for (f.ranks) |r| {
+-            if (R == 0 or R > r.b.rows) return error.BadWindow;
+-            if (r.segs.len == 0) {
+-                try r.st.ready(f.stream, R);
+-                r.st.pending = R;
+-                r.st.prompt = r.b.prefill;
+-            } else try shared.begin(r, R, f.stream);
+-            try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
++        const layers = f.ranks[0].w.layers;
++        if (j0 >= j1 or j1 > layers.len) return error.BadRange;
++        if (j0 == 0) {
++            for (f.ranks) |r| {
++                if (R == 0 or R > r.b.rows) return error.BadWindow;
++                if (r.segs.len == 0) {
++                    try r.st.ready(f.stream, R);
++                    r.st.pending = R;
++                    r.st.prompt = r.b.prefill;
++                } else try shared.begin(r, R, f.stream);
++                try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
++            }
++            const c = &f.ranks[0].w.config;
++            const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
++            if (f.slice_cal) |ev| try ev[0].record(f.stream); // the calibration's first layer cost holds the embed too
++            for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
++            if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
++            embed_stamp.end();
++            if (f.prof) |p| p.mark(f.stream, .embed);
+         }
+-        const c = &f.ranks[0].w.config;
+-        const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
+-        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
+-        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
+-        embed_stamp.end();
+-        if (f.prof) |p| p.mark(f.stream, .embed);
+         var cut: [max_pieces][2]usize = undefined;
+         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
+         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
+-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+-        try f.finish(R);
+-        if (f.prof) |p| p.mark(f.stream, .head);
++        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.piecedRange(f.pieces.?, R, cut[0..pieces], j0, j1) else try f.wholeRange(R, j0, j1);
++        if (j1 == layers.len) {
++            try f.finish(R);
++            if (f.prof) |p| p.mark(f.stream, .head);
++        }
+     }
+ 
+-    /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
+-    fn whole(f: *const Forward, R: usize) !void {
++    /// The unpieced loop over the layers [j0, j1) (and the stream mean): each site's partials whole, then the glue.
++    fn wholeRange(f: *const Forward, R: usize, j0: usize, j1: usize) !void {
+         const c = &f.ranks[0].w.config;
++        const layers = f.ranks[0].w.layers;
+         const pf = f.prefetch();
+         var li: usize = 0;
+         var di: usize = 0;
+-        for (f.ranks[0].w.layers, 0..) |_, j| {
++        for (layers[0..j0]) |l| switch (l.mixer) { // a resumed range's counts start where its layers do
++            .kda => li += 1,
++            .mla => di += 1,
++        };
++        for (layers[j0..j1], j0..) |_, j| {
+             prof_mod.context(f.prof, j, null, .mixer);
+             for (f.ranks) |r| {
+                 const l = r.w.layers[j];
+                 try f.pre(r, l.attn_hc, l.in_norm, R);
+                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
+             }
+-            if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
++            if (f.prof) |p| p.mark(f.stream, if (layers[j].mixer == .kda) .kda else .mla);
+             if (pf) |p| try p.fork(f.stream, j, .f);
+             try f.gather(R);
+             if (f.prof) |p| p.mark(f.stream, .gather_a);
+@@ -508,19 +536,22 @@ pub const Forward = struct {
+                 try f.pre(r, l.ffn_hc, l.post_norm, R);
+                 try f.ffn(r, l, R, slot(r, R));
+             }
+-            if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
++            if (f.prof) |p| p.mark(f.stream, if (layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
+             if (pf) |p| try p.fork(f.stream, j, .n);
+             try f.gather(R);
+             for (f.ranks) |r| try f.post(r, R);
+             if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
+             if (f.prof) |p| p.mark(f.stream, .gather_b);
+-            switch (f.ranks[0].w.layers[j].mixer) {
++            if (f.slice_cal) |ev| try ev[j + 1].record(f.stream);
++            switch (layers[j].mixer) {
+                 .kda => li += 1,
+                 .mla => di += 1,
+             }
+         }
+-        for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+-        if (pf) |p| try p.join(f.stream);
++        if (j1 == layers.len) {
++            for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
++            if (pf) |p| try p.join(f.stream);
++        }
+     }
+ 
+     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 95c0dcd..dbc979b 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -53,6 +53,7 @@ pub const Lanes = struct {
+     x: follow.Leader,
+     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
+     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
++    fill_slice_ms: f64 = 0, // TF_GLM_FILL_SLICE_MS: a prompt chunk's layers run a slice about this cheap at a time (0: whole chunks)
+     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
+     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
+     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+@@ -222,6 +223,7 @@ pub const Lanes = struct {
+ 
+     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+         const self = of(ptr);
++        try self.drainPartial(); // a suspended chunk would run under the whole pass's own (a warm turn finds one)
+         const from = try self.opening(s);
+         try self.images(s, from);
+         var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
+@@ -232,6 +234,16 @@ pub const Lanes = struct {
+         self.lanes.getPtr(s).?.first = self.take(first);
+     }
+ 
++    /// A suspended chunk finishes before a whole prompt pass starts (whole mode, or a warm turn over steps mode:
++    /// both run alone, so the drain costs no interleaving).
++    fn drainPartial(self: *Lanes) !void {
++        const e = self.x.e;
++        if (e.partial) |p| {
++            try self.x.bind(p.slot);
++            while (e.partial != null) _ = try self.x.chunkSliced(&.{}, p.start, false, null, std.math.inf(f64), null, null);
++        }
++    }
++
+     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+         const self = of(ptr);
+         if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
+@@ -262,10 +274,30 @@ pub const Lanes = struct {
+         for (ss, firsts) |s, t| self.lanes.getPtr(s).?.first = self.take(t);
+     }
+ 
+-    /// One step of the stream's prompt pass (other rounds run between): a chunk, a pair alone, or part of a chunk beside
++    /// One step of the stream's prompt pass (other rounds run between): a slice of a chunk while
++    /// TF_GLM_FILL_SLICE_MS holds one open, else a chunk, a pair alone, or part of a chunk beside
+     /// decoders (Leader.chunk); true once the first token is drawn.
+     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+         const self = of(ptr);
++        const e = self.x.e;
++        const mine: ?u32 = if (self.lanes.getPtr(s)) |l| l.slot else null;
++        if (mine != null) if (self.lanes.getPtr(s).?.first != null and self.lanes.getPtr(s).?.fill == null) return true; // its prompt ended inside another stream's step
++        // another stream's suspended chunk first, one slice of it: this round's wait stays bounded by a slice, and
++        // the filling stream's own prompt begins only once no chunk is held (its buffers are the engine's one set)
++        if (e.partial) |p| if (mine == null or p.slot != mine.?) {
++            try self.x.bind(p.slot);
++            const drained = try self.x.chunkSliced(&.{}, p.start, false, null, self.fill_slice_ms, null, null);
++            if (e.partial == null) { // the slice finished the chunk: its own stream's fill stands where the chunk left it
++                var it = self.lanes.valueIterator();
++                while (it.next()) |l| if (l.slot == p.slot) {
++                    if (drained.first) |f| {
++                        l.first = self.take(f);
++                        l.fill = null;
++                    } else l.fill = p.start + p.rows;
++                };
++            }
++            return false;
++        };
+         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
+         const from = if (going == null) try self.opening(s) else null;
+         if (going == null) try self.images(s, from);
+@@ -277,13 +309,17 @@ pub const Lanes = struct {
+         try sink.prepare();
+         self.x.e.prompt_logprobs = sink.want();
+         defer self.x.e.prompt_logprobs = null;
+-        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
++        const step = if (self.fill_slice_ms > 0)
++            try self.x.chunkSliced(s.prompt(), at, !self.othersDecode(s), from, self.fill_slice_ms, .{ .ptr = s, .check = cancelled }, marksOf(s))
++        else
++            try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+         if (step.first) |first| {
+             l.first = self.take(first);
+             l.fill = null;
+             return true;
+         }
+-        l.fill = at + step.rows;
++        // a suspended chunk's rows stand at its start until its last slice commits them
++        l.fill = if (e.partial) |p| p.start else at + step.rows;
+         if (s.settle_step) try self.x.e.stream.synchronize(); // its tail would land in the next decode round's time
+         return false;
+     }
+@@ -293,6 +329,12 @@ pub const Lanes = struct {
+         const l = self.lanes.getPtr(s) orelse return;
+         const at = l.fill orelse return;
+         if (at <= s.cached or s.reuse.hook == null) return;
++        // a chunk suspended between its layers drops without its commit: no rerun to cancel at a gate (its layers
++        // already ran), the states kept so far standing as at one -- one step, every rank the same
++        if (self.x.e.partial) |p| if (p.slot == l.slot and p.start == at) {
++            try self.x.bind(l.slot);
++            return self.x.cancelSlice(at, marksOf(s));
++        };
+         try self.x.bind(l.slot);
+         _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
+             if (err == error.Cancelled) return;
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index c9238a1..c7046e7 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -175,6 +175,20 @@ pub fn roceBytes(text: ?[]const u8) !usize {
+ const startup = @import("cuda_start.zig");
+ const paging = startup.paging;
+ 
++/// TF_GLM_FILL_SLICE_MS in milliseconds, read once as the lanes are made (0, unset or ill-formed: off): a prompt
++/// chunk's layers then run a slice about this cheap at a time, the decode rounds between the slices -- rank 0 alone
++/// reads it, its steps carrying each slice's end layer to the other ranks.
++fn fillSlice() f64 {
++    const v = std.c.getenv("TF_GLM_FILL_SLICE_MS") orelse return 0;
++    const ms = std.fmt.parseFloat(f64, std.mem.span(v)) catch {
++        std.log.warn("TF_GLM_FILL_SLICE_MS={s}: not a number; prompt chunks run whole", .{std.mem.span(v)});
++        return 0;
++    };
++    if (ms > 0 and std.math.isFinite(ms)) return ms;
++    if (ms != 0) std.log.warn("TF_GLM_FILL_SLICE_MS={s}: finite milliseconds over 0; prompt chunks run whole", .{std.mem.span(v)});
++    return 0;
++}
++
+ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+     _ = kernels; // our own kernels: a captured set is not used
+     const p = try place();
+@@ -329,7 +343,7 @@ fn finishRank(a: OpenArgs) !Loaded {
+         }
+     }.get;
+     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
+-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .mtp_confidence = o.mtp_confidence };
++    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .fill_slice_ms = fillSlice(), .mtp_confidence = o.mtp_confidence };
+     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
+     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
+     return .{
+diff --git a/zig/tests/cuda/glm_lanes_tests.zig b/zig/tests/cuda/glm_lanes_tests.zig
+index 07bac91..a3301f6 100644
+--- a/zig/tests/cuda/glm_lanes_tests.zig
++++ b/zig/tests/cuda/glm_lanes_tests.zig
+@@ -214,6 +214,92 @@ pub fn concurrentCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, ra
+     if (c.failed) return error.TestFailed;
+ }
+ 
++/// `glm-lanes-sliced`: TF_GLM_FILL_SLICE_MS fills run a slice a step -- the first chunk calibrating whole -- with the
++/// decode rounds between the slices (the fill's share debt paid at a slice's grain); every stream equals its solo
++/// run, and another stream's step advances a suspended chunk by one slice alone.
++pub fn slicedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
++    const glm = @import("glm_cuda");
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const dc = try std.json.parseFromSliceLeaky(struct { capacity: usize = 8192 }, a, try std.Io.Dir.cwd().readFileAlloc(gpu.io, dc_path, a, .limited(1 << 26)), .{ .ignore_unknown_fields = true });
++    var lib = try cuda.nccl.Library.open();
++    defer lib.close();
++    const comm = try openComm(gpu, &lib, rank, world, id_path);
++    defer _ = lib.api.ncclCommDestroy(comm);
++    var problem: []const u8 = "";
++    const set = glm.ranks.Settings.read(&glm.ranks.environment, &problem) catch |err| {
++        std.debug.print("REFUSE {s}\n", .{problem});
++        return err;
++    };
++    const C = glm.engine.prompt_rows;
++    const capacity = @max(dc.capacity, 3 * C);
++    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .drafts = true, .settings = set });
++    defer e.deinit();
++    var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, capacity);
++    defer link.deinit();
++    if (rank != 0) {
++        try glm.follow.follow(e, &link);
++        check.pass("rank {d} followed rank 0's sliced fills to the end, one slice a step", .{rank});
++        return;
++    }
++    var gl: glm.lanes.Lanes = .{ .x = .{ .e = e, .link = &link }, .fill_slice_ms = 2.0 };
++    defer gl.deinit();
++    var cfg = try lanes.Config.init(gpu.gpa, gl.facts(), glm.lanes.max_rows, glm.lanes.max_rows - 1);
++    defer cfg.deinit(gpu.gpa);
++    var wall: lanes.backend.WallClock = .{ .io = gpu.io };
++    var le = lanes.Engine.init(gpu.gpa, &cfg, gl.backend(), wall.clock());
++    defer le.deinit();
++    defer gl.x.end() catch {};
++    var c: Cover = .{ .gpa = gpu.gpa, .a = a, .le = &le };
++
++    const long = try a.alloc(u32, 2 * C + 300); // two chunks and a tail: the second cuts where the first calibrated
++    for (long, 0..) |*u, j| u.* = @intCast(100 + (j * 7919 + 11) % 5000);
++    const short = try a.alloc(u32, 64);
++    for (short, 0..) |*u, j| u.* = @intCast(100 + (j * 31 + 3) % 5000);
++    const solo_long = try c.run(.{ .prompt = long, .max_new = 64 });
++    const solo_short = try c.run(.{ .prompt = short, .max_new = 64 });
++
++    // a sliced fill beside a decoding stream: a decode round between its slices, the streams' replies their solos'
++    var s = try lanes.Stream.init(gpu.gpa, .{ .id = "sliced", .prompt = long, .max_new = 64 });
++    defer s.deinit(gpu.gpa);
++    var d = try lanes.Stream.init(gpu.gpa, .{ .id = "decoder", .prompt = short, .max_new = 64 });
++    defer d.deinit(gpu.gpa);
++    try le.addStream(&d);
++    var between: u32 = 0;
++    while (true) {
++        if (try le.fillStream(&s, between == 0)) break;
++        between += 1; // this round decodes while the fill waits on its next slice, as the share's debt is paid down
++        if (le.activeCount() > 0) try le.step();
++    }
++    while (le.activeCount() > 0) try le.step();
++    try c.expect(between > 0, "a sliced fill left {d} decode rounds between its slices (the first chunk calibrates whole)", .{between});
++    try c.expect(std.mem.eql(u32, s.emitted(), solo_long.ids), "the sliced fill's reply equals its solo run's ({d} ids)", .{s.emitted().len});
++    try c.expect(std.mem.eql(u32, d.emitted(), solo_short.ids), "the decoding stream's reply beside it equals its solo run's ({d} ids)", .{d.emitted().len});
++
++    // another stream's step advances a suspended chunk by one slice, and no further: its own prompt waits on it
++    gl.fill_slice_ms = 0.001; // a layer a slice, so a chunk stays suspended across steps
++    var held = try lanes.Stream.init(gpu.gpa, .{ .id = "held", .prompt = long, .max_new = 8 });
++    defer held.deinit(gpu.gpa);
++    var next = try lanes.Stream.init(gpu.gpa, .{ .id = "next", .prompt = short, .max_new = 64 });
++    defer next.deinit(gpu.gpa);
++    _ = try le.fillStream(&held, true); // its first chunk: calibration is done, so this one slices
++    const p = gl.x.e.partial orelse return check.expect(false, "a sliced fill suspends its chunk between layers", .{});
++    const j0 = p.j;
++    const held_slot = gl.lanes.getPtr(&held).?.slot;
++    try c.expect(p.slot == held_slot and j0 > 0, "the fill suspends slot {d}'s chunk past layer {d}", .{ p.slot, j0 });
++    const started = try le.fillStream(&next, true); // advances the held chunk one slice, its own prompt unstarted
++    const q = gl.x.e.partial;
++    try c.expect(!started and (q == null or (q.?.slot == held_slot and q.?.j == j0 + 1)), "the next stream's step advanced the held chunk one slice (layer {d} to {d}{s}) without starting its own", .{ j0, if (q) |v| v.j else 0, if (q == null) ", which ended it" else "" });
++    while (try le.fillStream(&held, false) == false) {} // the held chunk drains to its first token
++    while (try le.fillStream(&next, false) == false) if (le.activeCount() > 0) try le.step(); // and the waiting stream's own fill slices in
++    while (le.activeCount() > 0) try le.step();
++    try c.expect(std.mem.eql(u32, held.emitted(), solo_long.ids[0..@min(held.emitted().len, solo_long.ids.len)]), "the drained chunk's reply equals its solo run's ({d} ids)", .{held.emitted().len});
++    try c.expect(std.mem.eql(u32, next.emitted(), solo_short.ids), "the waiting stream's reply equals its solo run's ({d} ids)", .{next.emitted().len});
++    try c.expect(gl.x.e.partial == null, "no chunk stays suspended at the end", .{});
++    if (c.failed) return error.TestFailed;
++}
++
+ /// `glm-shared-check`: streams verified in one shared forward equal lone twins byte for byte.
+ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
+     const glm = @import("glm_cuda");
+diff --git a/zig/tests/cuda/glm_slice_tests.zig b/zig/tests/cuda/glm_slice_tests.zig
+new file mode 100644
+index 0000000..3831335
+--- /dev/null
++++ b/zig/tests/cuda/glm_slice_tests.zig
+@@ -0,0 +1,145 @@
++//! GLM-5.3-Flash's layer-sliced prompt chunks (TF_GLM_FILL_SLICE_MS) against their whole twins: every cut, one chunk
++//! cancelled between slices, and a sampled stream after the prompt.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const Gpu = check.Gpu;
++
++/// `glm-slice-check`: prompts a slice at a time (a layer a slice, every boundary) and whole; first token, the
++/// sampled stream after it, the next window's logits and every state byte equal. A chunk cancelled between two of
++/// its slices leaves a slot whose next pass is the whole one's bits.
++pub fn sliceCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
++    const glm = @import("glm_cuda");
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const dc = try std.json.parseFromSliceLeaky(struct { capacity: usize = 8192 }, a, try std.Io.Dir.cwd().readFileAlloc(gpu.io, dc_path, a, .limited(1 << 26)), .{ .ignore_unknown_fields = true });
++    var lib = try cuda.nccl.Library.open();
++    defer lib.close();
++    const comm = try @import("glm_lanes_tests.zig").openComm(gpu, &lib, rank, world, id_path);
++    defer _ = lib.api.ncclCommDestroy(comm);
++    var problem: []const u8 = "";
++    const set = glm.ranks.Settings.read(&glm.ranks.environment, &problem) catch |err| {
++        std.debug.print("REFUSE {s}\n", .{problem});
++        return err;
++    };
++    const C = glm.engine.prompt_rows;
++    const capacity = @max(dc.capacity, 4 * C);
++    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .drafts = true, .settings = set });
++    defer e.deinit();
++    var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, capacity);
++    defer link.deinit();
++    if (rank != 0) {
++        try glm.follow.follow(e, &link);
++        check.pass("rank {d} followed rank 0's sliced and whole prompt chunks to the end", .{rank});
++        return;
++    }
++    const x: glm.follow.Leader = .{ .e = e, .link = &link };
++    defer x.end() catch {};
++    const V = e.share.vocab.len();
++    const L = e.w.layers.len;
++    // every slice one layer: costs no layer can share a slice with, from the first chunk on (no calibration run)
++    const huge = try a.alloc(f64, L + 1);
++    @memset(huge[0..L], 1000);
++    huge[L] = 0;
++    try e.slice_costs.calibrate(C, huge);
++    const budget = 1.0; // ms: far under one of the huge layers, so each slice is one layer alone
++    // two chunks and a tail, and a whole number of chunks (the last slice carries the tail and the commit)
++    const lens = [_]usize{ 2 * C + 300, 2 * C };
++    const rounds = 8;
++    var failed = false;
++    var most_slices: usize = 0;
++    for (lens, 0..) |len, i| {
++        const ids = try a.alloc(u32, len);
++        for (ids, 0..) |*u, j| u.* = @intCast(100 + (j * 7919 + i * 31) % 5000);
++        var firsts: [2]u32 = undefined;
++        var stream: [2][rounds]u32 = undefined;
++        var logits: [2][]u16 = undefined;
++        var steps: [2]usize = .{ 0, 0 };
++        const sampling: glm.sampler.Sampling = .{ .seed = 7, .temperature = 0.7, .top_p = 0.95 };
++        for (0..2) |twin| { // twin 0 whole, twin 1 a layer a slice
++            try x.bind(@intCast(2 * i + twin));
++            try x.begin(sampling);
++            var at: usize = 0;
++            const first = while (true) {
++                const r = if (twin == 1) x.chunkSliced(ids, at, false, null, budget, null, null) catch |err| {
++                    std.debug.print("FAIL slice: prompt of {d}, twin {d}: the step at {d}: {s}\n", .{ len, twin, at, @errorName(err) });
++                    return err;
++                } else x.chunk(ids, at, false, null, null, null) catch |err| {
++                    std.debug.print("FAIL whole: prompt of {d}, twin {d}: the step at {d}: {s}\n", .{ len, twin, at, @errorName(err) });
++                    return err;
++                };
++                steps[twin] += 1;
++                if (r.first) |f| break f;
++                if (e.partial) |p| at = p.start else at += r.rows; // a suspended chunk resumes where it stands
++            };
++            firsts[twin] = first;
++            // a sampled stream: each round's window the token the last drew, kept at its first row
++            var t = first;
++            for (0..rounds) |r| {
++                const win = [_]u32{t};
++                try x.verify(&win, stream[twin][r..][0..1], 0);
++                try x.keep(1);
++                t = stream[twin][r];
++            }
++            logits[twin] = try a.alloc(u16, V);
++            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(logits[twin].ptr, e.bd.logits, V * 2), "cuMemcpyDtoH");
++        }
++        most_slices = @max(most_slices, steps[1]);
++        if (steps[0] != (len + C - 1) / C or steps[1] < steps[0] * L) {
++            std.debug.print("FAIL slice: prompt of {d}: {d} whole steps, {d} sliced (want {d} chunks, at least {d} slices)\n", .{ len, steps[0], steps[1], (len + C - 1) / C, steps[0] * L });
++            failed = true;
++        }
++        if (firsts[0] != firsts[1] or !std.mem.eql(u32, &stream[0], &stream[1]) or !std.mem.eql(u16, logits[0], logits[1])) {
++            std.debug.print("FAIL slice: prompt of {d}: first {d}/{d}, the sampled stream or the next window's logits differ\n", .{ len, firsts[0], firsts[1] });
++            failed = true;
++        }
++        try e.stream.synchronize();
++        const st = &e.seqs.items[2 * i].?.st;
++        const tw = &e.seqs.items[2 * i + 1].?.st;
++        const n = st.arena.buf.len;
++        const h0 = try a.alloc(u8, n);
++        const h1 = try a.alloc(u8, n);
++        try st.arena.buf.download(0, h0);
++        try tw.arena.buf.download(0, h1);
++        const diff = std.mem.indexOfDiff(u8, h0, h1);
++        if (st.pos != tw.pos or st.mtp_len != tw.mtp_len or !std.mem.eql(u1, st.cur, tw.cur) or diff != null) {
++            std.debug.print("FAIL slice: prompt of {d}: the sliced state differs (pos {d}/{d}, first byte {?d} of {d})\n", .{ len, st.pos, tw.pos, diff, n });
++            failed = true;
++        }
++    }
++    // a chunk cancelled between two of its slices: the slot's next pass is its whole twin's, bit for bit
++    {
++        const len = 2 * C + 5;
++        const ids = try a.alloc(u32, len);
++        for (ids, 0..) |*u, j| u.* = @intCast(200 + (j * 104729 + 7) % 5000);
++        var firsts: [2]u32 = undefined;
++        for (0..2) |twin| {
++            try x.bind(@intCast(10 + twin));
++            try x.begin(null);
++            if (twin == 1) {
++                _ = try x.chunkSliced(ids, 0, false, null, budget, null, null);
++                _ = try x.chunkSliced(ids, 0, false, null, budget, null, null); // two slices in, the chunk suspended
++                try x.cancelSlice(0, null);
++            }
++            var at: usize = 0;
++            const first = while (true) {
++                const r = if (twin == 1) try x.chunkSliced(ids, at, false, null, budget, null, null) else try x.chunk(ids, at, false, null, null, null);
++                if (r.first) |f| break f;
++                if (e.partial) |p| at = p.start else at += r.rows;
++            };
++            firsts[twin] = first;
++        }
++        if (firsts[0] != firsts[1]) {
++            std.debug.print("FAIL slice: a cancelled chunk's next pass draws {d}, the whole twin {d}\n", .{ firsts[1], firsts[0] });
++            failed = true;
++        }
++    }
++    if (e.partial != null) {
++        std.debug.print("FAIL slice: a chunk stays suspended at the end\n", .{});
++        failed = true;
++    }
++    if (failed) return error.TestFailed;
++    check.pass("layer-sliced prompt chunks at TP={d}: prompts of {any} rows cut a layer a slice ({d} slices at most) equal their whole twins in the first token, the sampled stream after it, the next window's logits and every state byte; a chunk cancelled between slices leaves its slot the whole one's bits", .{ world, lens, most_slices });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 59782ef..2d5c60d 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -67,6 +67,7 @@ const radio_tests = @import("radio_tests.zig");
+ const glm_lanes_tests = @import("glm_lanes_tests.zig");
+ const glm_pair_tests = @import("glm_pair_tests.zig");
+ const glm_split_tests = @import("glm_split_tests.zig");
++const glm_slice_tests = @import("glm_slice_tests.zig");
+ const glm_solo_tests = @import("glm_solo_tests.zig");
+ const glm_paged_tests = @import("glm_paged_tests.zig");
+ const glm_kv_shard_check = @import("glm_kv_shard_check.zig");
+@@ -255,6 +256,8 @@ const usage =
+     \\  glm-pair-check <ckpt> <dc.json> <rank> <world> <idfile>  paired prompt steps against twins a chunk a step, logits and states byte for byte
+     \\  glm-split-check <ckpt> <dc.json> <rank> <world> <idfile>  prompt chunks with their indexer rows split across ranks against whole twins, byte for byte
+     \\  glm-solo-check <ckpt> <dc.json> <rank> <world> <idfile>  busy prompt steps (TF_GLM_CHUNK_SOLO=4096, TF_GLM_CHUNK rows) against twins a whole chunk a step, logits and states byte for byte
++    \\  glm-slice-check <ckpt> <dc.json> <rank> <world> <idfile>  layer-sliced prompt chunks (TF_GLM_FILL_SLICE_MS) against whole twins: every cut, a cancel between slices, a sampled stream
++    \\  glm-lanes-sliced <ckpt> <dc.json> <rank> <world> <idfile>  sliced fills a slice a step between decode rounds, one slice of another stream's held chunk a step
+     \\  glm-paged-check <ckpt> <rank> <world> <idfile>  a paged stream (pages out of order, NaN first) against a whole-window twin
+     \\  glm-kv-shard-check <ckpt> <rank> <world> <idfile>  TF_GLM_KV_SHARD: a sharded stream (twins, owner-computed, both parts, resumes and carries) against a whole-window twin
+     \\  dory MODEL LOOPS N TEXT     Dory (NVFP4): N greedy tokens from TEXT, then verify windows of 2 to 16 rows bit-equal
+@@ -484,6 +487,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "glm-pair-check")) return glm_pair_tests.pairCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "glm-split-check")) return glm_split_tests.splitCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
++    if (std.mem.eql(u8, cmd, "glm-slice-check")) return glm_slice_tests.sliceCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
++    if (std.mem.eql(u8, cmd, "glm-lanes-sliced")) return glm_lanes_tests.slicedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "glm-solo-check")) return glm_solo_tests.soloCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "glm-synth")) {
+         const kind = if (rest.len > 1) std.meta.stringToEnum(glm_synth.Kind, rest[1]) orelse return error.UnknownCommand else .nvfp4;
