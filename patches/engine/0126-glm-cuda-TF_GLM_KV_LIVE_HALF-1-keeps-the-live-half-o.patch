@@ -1,0 +1,473 @@
+From 90944e30aefdf6d2ae9acca92d288979b7c140ac Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] glm cuda: TF_GLM_KV_LIVE_HALF=1 keeps the live half of the
+ KDA state in a kept prompt state
+
+Ported from upstream 7547c99c2 (PR #2181). Opt-in, off by default; the ranks' fingerprint layout carries it (18). Host-tested. Beside --learn-conversations it is refused at open (0131): neither disk identity carries the flag.
+---
+ zig/src/families/glm/cuda.zig                 |   1 +
+ zig/src/families/glm/cuda_disk_shard_test.zig |   4 +-
+ .../families/glm/cuda_kv_shard_pages_test.zig |   4 +-
+ zig/src/families/glm/cuda_ranks.zig           |  14 ++-
+ zig/src/families/glm/cuda_ranks_test.zig      |  26 +++-
+ zig/src/families/glm/cuda_snapshot_layout.zig |  59 ++++++---
+ .../glm/cuda_snapshot_layout_test.zig         | 113 ++++++++++++++++++
+ zig/src/families/glm/cuda_snapshots.zig       |  13 +-
+ 8 files changed, 205 insertions(+), 29 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_snapshot_layout_test.zig
+
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index f4e532f0..c077c600 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -53,6 +53,7 @@ test {
+     _ = @import("cuda_load_owner.zig");
+     _ = @import("cuda_images_interleave_test.zig");
+     _ = @import("cuda_pages_test.zig");
++    _ = @import("cuda_snapshot_layout_test.zig");
+     _ = kv_shard;
+     _ = share;
+     _ = @import("cuda_kv_shard_pages_test.zig");
+diff --git a/zig/src/families/glm/cuda_disk_shard_test.zig b/zig/src/families/glm/cuda_disk_shard_test.zig
+index 79afb171..af44baeb 100644
+--- a/zig/src/families/glm/cuda_disk_shard_test.zig
++++ b/zig/src/families/glm/cuda_disk_shard_test.zig
+@@ -241,7 +241,7 @@ fn pattern(rank: usize, k: usize, j: usize) u8 {
+ /// Each part of the bound sequence's full plan at `at` (on a rank that does not hold its latent rows, those land on
+ /// the trash page), filled with `pattern`; then its position and head rows set as a pass leaves them.
+ fn fill(e: *Engine) !void {
+-    const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true);
++    const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true, e.cur.st.cur);
+     for (plan.parts[0..plan.count], 0..) |part, k| {
+         var done: usize = 0;
+         while (done < part.len) {
+@@ -263,7 +263,7 @@ const Parts = struct {
+     count: usize = 0,
+ 
+     fn of(e: *Engine) !Parts {
+-        const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true);
++        const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true, e.cur.st.cur);
+         var out: Parts = .{ .count = plan.count };
+         for (plan.parts[0..plan.count], 0..) |part, k| {
+             out.lat[k] = k == 1 or k == 2; // the DSA layer's codes, then its E4M3 scales (`lat` marks them sharded)
+diff --git a/zig/src/families/glm/cuda_kv_shard_pages_test.zig b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+index 872c06f8..edaddb27 100644
+--- a/zig/src/families/glm/cuda_kv_shard_pages_test.zig
++++ b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+@@ -281,8 +281,8 @@ test "kv shard pages: a kept state's plan walks the latent rows by the latent ta
+     try p.mapWith(1, &.{ 12, 9, 14 }, 0, 0); // part 1's stream on rank 1: latent pages 4, 1, 6
+     const st = f.st(1);
+     const at = 1200;
+-    const full = try layout.Plan.initFor(st, &f.e.w.config, at, null, true);
+-    const bare = try layout.Plan.initFor(st, &f.e.w.config, at, null, false);
++    const full = try layout.Plan.initFor(st, &f.e.w.config, at, null, true, st.cur);
++    const bare = try layout.Plan.initFor(st, &f.e.w.config, at, null, false, st.cur);
+     try expectEqual(full.len - at * (512 + 4), bare.len); // one DSA layer's codes and scales
+     try expectEqual(full.len, try layout.Plan.size(st, &f.e.w.config, st.capacity, at, null));
+     var lat: usize = 0;
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index ef55827c..1da33eb6 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -27,6 +27,7 @@ pub const Settings = struct {
+     numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
+     kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
+     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
++    kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
+ 
+     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
+     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
+@@ -142,6 +143,12 @@ pub const Settings = struct {
+             problem.* = kv_shard.why(err).?;
+             return error.BadSetting;
+         };
++        if (get("TF_GLM_KV_LIVE_HALF")) |v| {
++            if (std.mem.eql(u8, v, "1")) s.kv_live_half = true else if (!std.mem.eql(u8, v, "0")) {
++                problem.* = "TF_GLM_KV_LIVE_HALF: 0 or 1";
++                return error.BadSetting;
++            }
++        }
+         if (s.prompt_fixed_k and !s.tiled) {
+             problem.* = "TF_GLM_PROMPT_K=shape requires TF_GLM_MM=1";
+             return error.BadSetting;
+@@ -172,7 +179,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
+ 
+ /// What every rank must agree on, as bytes the communicator carries.
+ pub const Fingerprint = extern struct {
+-    layout: u32 = 17, // this struct's version (16 had no l2pf words; 15 had the chunk words or the kv_shard words alone; 14 was without chunk; 13 num3's numerics or prefill3's pair alone)
++    layout: u32 = 18, // this struct's version (17 had no kv_live_half; 16 had no l2pf words; 15 had the chunk words or the kv_shard words alone; 14 was without chunk; 13 num3's numerics or prefill3's pair alone)
+     world: u32,
+     rank: u32,
+     kv8: u32 = 0,
+@@ -196,6 +203,7 @@ pub const Fingerprint = extern struct {
+     numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
+     kv_shard: u32 = 0, // TF_GLM_KV_SHARD and _CARRY, _TWINS (kv_shard.Switches.word; 0: off)
+     kv_shard_check: u32 = 0, // TF_GLM_KV_SHARD_CHECK when on (0 off)
++    kv_live_half: u32 = 0, // TF_GLM_KV_LIVE_HALF: every rank keeps the live KDA half alone (1) or the head whole (0)
+     capacity: u64, // tokens a sequence holds
+     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
+     heat_low: f64,
+@@ -228,6 +236,7 @@ pub const Fingerprint = extern struct {
+         numerics,
+         kv_shard,
+         kv_shard_check,
++        kv_live_half,
+         capacity,
+         heat_high,
+         heat_low,
+@@ -265,6 +274,7 @@ pub const Fingerprint = extern struct {
+             .numerics = s.numerics.bits(),
+             .kv_shard = s.kv_shard.word(),
+             .kv_shard_check = s.kv_shard.checkWord(),
++            .kv_live_half = @intFromBool(s.kv_live_half),
+             .capacity = capacity,
+             .heat_high = if (s.heat) |b| b.high_c else 0,
+             .heat_low = if (s.heat) |b| b.low_c else 0,
+@@ -306,6 +316,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+             "numerics",
+             "kv_shard",
+             "kv_shard_check",
++            "kv_live_half",
+             "capacity",
+             "heat_high",
+             "heat_low",
+@@ -420,6 +431,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
+         .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
+         .kv_shard => "TF_GLM_KV_SHARD, TF_GLM_KV_SHARD_CARRY or TF_GLM_KV_SHARD_TWINS",
+         .kv_shard_check => "TF_GLM_KV_SHARD_CHECK",
++        .kv_live_half => "TF_GLM_KV_LIVE_HALF",
+         .capacity => "the sequence capacity (the context)",
+         .heat_high => "TF_HEAT_HIGH",
+         .heat_low => "TF_HEAT_LOW",
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index a73bf005..629930d0 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -186,7 +186,7 @@ test "every media limit is part of the ranks' agreement" {
+ test "every scheduling and identity field that differs stops the ranks" {
+     const zero = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
+     const one = Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
+-    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "pieces", "pair", "chunk", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
++    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "kv_live_half", "pieces", "pair", "chunk", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
+         var all = [_]Fingerprint{ zero, one };
+         @field(all[1], name) += 1;
+         try std.testing.expectEqual(@field(Fingerprint.Field, name), mismatch(&all).?.field);
+@@ -418,7 +418,7 @@ test "TF_GLM_KV_SHARD: read with its knobs, refused by name on a typo, and in th
+     const f0 = Fingerprint.of(2, 0, .{}, 8192, true, h0, h0, hashBytes("/c"));
+     try std.testing.expectEqual(@as(u32, 0), f0.kv_shard);
+     try std.testing.expectEqual(@as(u32, 0), f0.kv_shard_check);
+-    try std.testing.expectEqual(@as(u32, 15), f0.layout);
++    try std.testing.expectEqual(@as(u32, 18), f0.layout);
+     var all = [_]Fingerprint{ f0, Fingerprint.of(2, 1, s, 8192, true, h0, h0, hashBytes("/c")) };
+     try std.testing.expectEqual(Mismatch{ .field = .kv_shard, .rank = 1 }, mismatch(&all).?); // on one rank only
+     all[0] = Fingerprint.of(2, 0, s, 8192, true, h0, h0, hashBytes("/c"));
+@@ -454,3 +454,25 @@ test "TF_GLM_L2PF: read with the settings, carried in the fingerprint, and ranks
+     all[1].l2pf[3] = 0; // rank 1 unpaced
+     try std.testing.expectEqual(Mismatch{ .field = .l2pf, .rank = 1 }, mismatch(&all).?);
+ }
++
++test "TF_GLM_KV_LIVE_HALF: off by default, 0 or 1, a typo refused, and every rank must agree (their keeps' plans differ)" {
++    const Reader = struct {
++        fn absent(_: [:0]const u8) ?[]const u8 {
++            return null;
++        }
++        fn on(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_KV_LIVE_HALF")) "1" else null;
++        }
++        fn bad(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_KV_LIVE_HALF")) "yes" else null;
++        }
++    };
++    var problem: []const u8 = "";
++    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).kv_live_half);
++    const on = try Settings.read(Reader.on, &problem);
++    try std.testing.expect(on.kv_live_half);
++    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
++    try std.testing.expectEqualStrings("TF_GLM_KV_LIVE_HALF: 0 or 1", problem);
++    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, on, 8192, true, @splat(0), @splat(0), @splat(0)) };
++    try std.testing.expectEqual(Mismatch{ .field = .kv_live_half, .rank = 1 }, mismatch(&all).?);
++}
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index be82bf92..bacc78a2 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -6,6 +6,20 @@ const Config = @import("config.zig").Config;
+ const cache = @import("cuda_dsa_block.zig");
+ const sparse = @import("cuda_sparse.zig");
+ 
++/// TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone; nothing reads the dead half after a restore.
++pub fn liveHalfEnabled() bool {
++    const v = std.c.getenv("TF_GLM_KV_LIVE_HALF") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// The half a plan keeps: `on` with every KDA layer on the same half gives that half; otherwise both (null).
++pub fn halfOf(cur: []const u1, layers: usize, on: bool) ?u1 {
++    if (!on or layers == 0 or cur.len != layers) return null;
++    const h = cur[0];
++    for (cur) |b| if (b != h) return null;
++    return h;
++}
++
+ /// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page `page` bytes apart, from byte `from`;
+ /// `lat`: a sharded sequence's latent rows (TF_GLM_KV_SHARD), whose pages are its latent table's (`Plan.lids`).
+ pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0, lat: bool = false, from: usize = 0 };
+@@ -19,54 +33,67 @@ pub const Plan = struct {
+     sizing: bool = false, // `size`: the rows counted, not read, so no page need be mapped
+     latent: bool = true, // the latent codes and scales are parts (sharded: only where this rank keeps them)
+     shared: usize = 0, // TF_KV_SHARE: a paged sequence's first pages the shared store holds: their rows stay on them
++    half: ?u1 = null, // TF_GLM_KV_LIVE_HALF: the KDA half the plan carries (null: both, the arena head whole)
+ 
+     /// The state at `at` (a kept copy's plan; `initForShared` past a shared store's pages).
+     pub fn init(st: *const State, c: *const Config, at: usize, head: ?usize) !Plan {
+-        return make(st, c, at, head, 0, false, true);
++        return make(st, c, at, head, 0, false, true, halfOf(st.cur, st.kda_layers, liveHalfEnabled()));
+     }
+ 
+     /// `init` past the shared store's `shared` pages (TF_KV_SHARE, a state's own copy).
+     pub fn initShared(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize) !Plan {
+-        return make(st, c, at, head, shared, false, true);
++        return make(st, c, at, head, shared, false, true, halfOf(st.cur, st.kda_layers, liveHalfEnabled()));
+     }
+ 
+-    /// `init` with or without the DSA caches' latent codes and scales (`latent`: a sharded state off its home rank
+-    /// holds every other part; cuda_snapshots).
+-    pub fn initFor(st: *const State, c: *const Config, at: usize, head: ?usize, latent: bool) !Plan {
+-        return initForShared(st, c, at, head, 0, latent);
++    /// `initFor` with the kept state's own `cur` bits: they say which half it carries (the slot's may differ by now,
++    /// so a restore passes them; an even keep passes the live state's).
++    pub fn initFor(st: *const State, c: *const Config, at: usize, head: ?usize, latent: bool, cur: []const u1) !Plan {
++        return initForShared(st, c, at, head, 0, latent, cur);
+     }
+ 
+     /// `initFor` past the shared store's `shared` pages (TF_KV_SHARE; a resume's state leaves their rows out).
+-    pub fn initForShared(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, latent: bool) !Plan {
+-        return make(st, c, at, head, shared, false, latent);
++    pub fn initForShared(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, latent: bool, cur: []const u1) !Plan {
++        return make(st, c, at, head, shared, false, latent, halfOf(cur, st.kda_layers, liveHalfEnabled()));
++    }
++
++    /// The plan with a given half (tests and tools): both halves for null; `latent` as `initFor`'s.
++    pub fn withHalf(st: *const State, c: *const Config, at: usize, head: ?usize, latent: bool, half: ?u1) !Plan {
++        return make(st, c, at, head, 0, false, latent, half);
+     }
+ 
+     /// A prefix's bytes at `at`, rows to `capacity` counted held or not (a paged sequence holds its request's alone).
+     pub fn size(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize) !usize {
+-        return sizeFor(st, c, capacity, at, head, true);
++        return sizeFor(st, c, capacity, at, head, true, st.cur);
+     }
+ 
+     /// `size` with or without the latent codes and scales (`initFor`'s `latent`).
+-    pub fn sizeFor(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, latent: bool) !usize {
+-        return sizeForShared(st, c, capacity, at, head, 0, latent);
++    pub fn sizeFor(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, latent: bool, cur: []const u1) !usize {
++        return sizeForShared(st, c, capacity, at, head, 0, latent, cur);
+     }
+ 
+     /// `sizeFor` past the shared store's `shared` pages (TF_KV_SHARE).
+-    pub fn sizeForShared(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, shared: usize, latent: bool) !usize {
++    pub fn sizeForShared(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, shared: usize, latent: bool, cur: []const u1) !usize {
+         var whole = st.*;
+         whole.capacity = capacity;
+-        return (try make(&whole, c, at, head, shared, true, latent)).len;
++        return (try make(&whole, c, at, head, shared, true, latent, halfOf(cur, st.kda_layers, liveHalfEnabled()))).len;
+     }
+ 
+-    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, sizing: bool, latent: bool) !Plan {
++    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, sizing: bool, latent: bool, half: ?u1) !Plan {
+         if (at > st.capacity or st.caches.len > @import("config.zig").max_layers) return error.SnapshotShape;
+         if (st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;
+         if (shared > 0 and (st.table == 0 or shared * page_rows > at)) return error.SnapshotShape; // pages below `at` only
+-        var p: Plan = .{ .ids = st.pages, .lids = st.lpages, .sizing = sizing, .latent = latent, .shared = shared };
++        var p: Plan = .{ .ids = st.pages, .lids = st.lpages, .sizing = sizing, .latent = latent, .shared = shared, .half = half };
+         // a paged sequence's caches are its pages: its fields up to them end at its first ring
+         const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
+         if (first < st.arena.buf.ptr) return error.SnapshotShape;
+-        try p.add(st, st.arena.buf.ptr, @intCast(first - st.arena.buf.ptr));
++        if (half) |h| {
++            // the arena head in two parts around the dead half: [start, dead) and [dead + len, first)
++            const len = try std.math.mul(usize, st.kda_layers, st.rec_layer);
++            const dead = st.rec + @as(u64, 1 - h) * len;
++            if (dead < st.arena.buf.ptr or dead > first or first - dead < len) return error.SnapshotShape;
++            try p.add(st, st.arena.buf.ptr, @intCast(dead - st.arena.buf.ptr));
++            try p.add(st, dead + len, @intCast(first - (dead + len)));
++        } else try p.add(st, st.arena.buf.ptr, @intCast(first - st.arena.buf.ptr));
+         for (st.caches, 0..) |x, j| try p.rows(st, c, x, j, at);
+         if (head) |n| {
+             if (n > st.capacity) return error.SnapshotShape;
+diff --git a/zig/src/families/glm/cuda_snapshot_layout_test.zig b/zig/src/families/glm/cuda_snapshot_layout_test.zig
+new file mode 100644
+index 00000000..42bf7c1f
+--- /dev/null
++++ b/zig/src/families/glm/cuda_snapshot_layout_test.zig
+@@ -0,0 +1,113 @@
++//! The live-half keep's plan on a real state of virtual addresses: the dead KDA half left out, the given parity's half.
++const std = @import("std");
++const cuda = @import("cuda");
++const weights = @import("cuda_weights.zig");
++const shard = @import("cuda_shard.zig");
++const state = @import("cuda_state.zig");
++const layout = @import("cuda_snapshot_layout.zig");
++const t = std.testing;
++
++const Fake = struct {
++    var next: u64 = 0x200000000;
++    fn driver() cuda.Driver {
++        var d: cuda.Driver = undefined;
++        d.api.cuMemAlloc_v2 = alloc;
++        d.api.cuMemFree_v2 = free;
++        d.api.cuMemsetD8_v2 = fill;
++        return d;
++    }
++    fn alloc(out: *u64, n: usize) callconv(.c) c_int {
++        out.* = next;
++        next += std.mem.alignForward(u64, n, 256);
++        return 0;
++    }
++    fn free(_: u64) callconv(.c) c_int {
++        return 0;
++    }
++    fn fill(_: u64, _: u8, _: usize) callconv(.c) c_int {
++        return 0;
++    }
++};
++
++/// TP=2's shapes on a KDA and a DSA layer, 4,096 rows: the arena head holds both halves of one KDA layer's state.
++fn fixture(d: *cuda.Driver, w: *weights.Weights, layers: []weights.Layer) !state.State {
++    layers[0].mixer = .{ .kda = undefined };
++    layers[1].mixer = .{ .mla = undefined };
++    w.config = .{};
++    w.share = try shard.Share.of(&w.config, 0, 2);
++    w.layers = layers;
++    return state.State.init(t.allocator, d, w, 4096);
++}
++
++test "live half: the plan leaves the dead half out as one hole of the state's rec bytes, and nothing else changes" {
++    var d = Fake.driver();
++    var layers: [2]weights.Layer = undefined;
++    var w: weights.Weights = undefined;
++    var st = try fixture(&d, &w, &layers);
++    defer st.deinit();
++    const whole = try layout.Plan.withHalf(&st, &w.config, 2048, null, true, null);
++    const len = st.kda_layers * st.rec_layer;
++    try t.expect(len > 0);
++    try t.expectEqual(@as(?u1, null), whole.half);
++    for ([_]u1{ 0, 1 }) |h| {
++        const half = try layout.Plan.withHalf(&st, &w.config, 2048, null, true, h);
++        try t.expectEqual(@as(?u1, h), half.half);
++        try t.expectEqual(whole.len - len, half.len);
++        try t.expectEqual(whole.count + 1, half.count);
++        const dead = st.rec + @as(u64, 1 - h) * len;
++        // the head in two parts around the dead half: [start, dead) and [dead + len, the first cache's rows)
++        try t.expectEqual(st.arena.buf.ptr, half.parts[0].live);
++        try t.expectEqual(@as(usize, @intCast(dead - st.arena.buf.ptr)), half.parts[0].len);
++        try t.expectEqual(dead + len, half.parts[1].live);
++        try t.expectEqual(whole.parts[0].len - half.parts[0].len - len, half.parts[1].len);
++        // every later part as in the whole plan
++        for (whole.parts[1..whole.count], half.parts[2..half.count]) |a, b| try t.expectEqual(a, b);
++    }
++}
++
++test "live half: the plan follows the parity it is given, not the slot's (a restore passes the kept state's)" {
++    var d = Fake.driver();
++    var layers: [2]weights.Layer = undefined;
++    var w: weights.Weights = undefined;
++    var st = try fixture(&d, &w, &layers);
++    defer st.deinit();
++    @memset(st.cur, 0); // the slot moved on since the keep: its live half is 0
++    const len = st.kda_layers * st.rec_layer;
++    const rec_at: usize = @intCast(st.rec - st.arena.buf.ptr);
++    // the kept state lived on half 1: its plan leaves half 0 out, which starts where rec starts
++    const kept = try layout.Plan.withHalf(&st, &w.config, 2048, null, true, 1);
++    try t.expectEqual(rec_at, kept.parts[0].len);
++    // the slot's own parity would leave half 1 out instead: a different hole, a plan that restores the wrong bytes
++    const slot = try layout.Plan.withHalf(&st, &w.config, 2048, null, true, 0);
++    try t.expectEqual(rec_at + len, slot.parts[0].len);
++    try t.expect(kept.parts[0].len != slot.parts[0].len);
++    try t.expectEqual(kept.len, slot.len);
++}
++
++test "live half: the switch off leaves the plan's len and count as they were (both halves, one head part)" {
++    var d = Fake.driver();
++    var layers: [2]weights.Layer = undefined;
++    var w: weights.Weights = undefined;
++    var st = try fixture(&d, &w, &layers);
++    defer st.deinit();
++    try t.expect(!layout.liveHalfEnabled()); // unset in the tests' environment: off, every path as before
++    const plan = try layout.Plan.init(&st, &w.config, 2048, null);
++    const sized = try layout.Plan.size(&st, &w.config, st.capacity, 2048, null);
++    try t.expectEqual(@as(?u1, null), plan.half);
++    const whole = try layout.Plan.withHalf(&st, &w.config, 2048, null, true, null);
++    try t.expectEqual(whole.len, plan.len);
++    try t.expectEqual(whole.count, plan.count);
++    try t.expectEqual(whole.len, sized);
++}
++
++test "live half: halfOf keeps both halves when the flag is off, when a layer is on the other half, or without KDA layers" {
++    const same = [_]u1{ 1, 1, 1 };
++    const mixed = [_]u1{ 1, 0, 1 };
++    const zero = [_]u1{0};
++    try t.expectEqual(@as(?u1, 1), layout.halfOf(&same, 3, true));
++    try t.expectEqual(@as(?u1, null), layout.halfOf(&same, 3, false));
++    try t.expectEqual(@as(?u1, null), layout.halfOf(&mixed, 3, true));
++    try t.expectEqual(@as(?u1, null), layout.halfOf(&same, 0, true));
++    try t.expectEqual(@as(?u1, null), layout.halfOf(&same, 2, true));
++    try t.expectEqual(@as(?u1, 0), layout.halfOf(&zero, 1, true));
++}
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 4e203af7..291ed2d0 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -86,7 +86,7 @@ fn mtpHead(e: anytype, at: usize) error{Overflow}!?usize {
+ pub fn bytes(e: anytype, at: usize) u64 {
+     const head = mtpHead(e, at) catch return std.math.maxInt(u64);
+     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
+-    const n = layout.Plan.sizeForShared(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at), true) catch return std.math.maxInt(u64);
++    const n = layout.Plan.sizeForShared(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at), true, e.cur.st.cur) catch return std.math.maxInt(u64);
+     const ring: usize = if (e.drafter != null) dflash.ring_bytes else 0; // at most: DFlash2's ring when it holds rows
+     return pages.rounded(n + ring) catch std.math.maxInt(u64);
+ }
+@@ -141,8 +141,8 @@ pub fn keepAs(e: anytype, id: u64) !void {
+     // TF_KV_SHARE: the shared store's pages below the mark stay out (the state's copy resumes from them by reference).
+     const own = kv_keep.keepsLatent(hold, e.share.rank);
+     const held = heldPages(e, e.cur.st.pos);
+-    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, own);
+-    const latent_bytes = if (own) 0 else (try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, true)).len - plan.len;
++    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, own, e.cur.st.cur);
++    const latent_bytes = if (own) 0 else (try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, true, e.cur.st.cur)).len - plan.len;
+     const ring = try drafterPart(e, &plan, e.cur.st.pos);
+     var lease = try pool.take(plan.len + latent_bytes);
+     errdefer {
+@@ -188,7 +188,7 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
+     if (!ringHolds(bases[0], s.pos, rows) or !ringHolds(bases[1], mtp_len, rows)) return error.DiskWords;
+     // TF_GLM_KV_SHARD: off its home rank the copy packs every part but the latent rows, as keepAs leaves it
+     const own = if (s.home) |h| h == e.share.rank else true;
+-    const n = try layout.Plan.sizeFor(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, own);
++    const n = try layout.Plan.sizeFor(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, own, s.cur);
+     if (n == 0 or n > s.lease.count() * pages.page) return error.SnapshotSize;
+     for (s.cur, 0..) |*b, i| b.* = @intCast(cur >> @intCast(i) & 1);
+     s.len = n;
+@@ -203,7 +203,8 @@ pub fn restore(e: anytype, id: u64) !void {
+     const hold = holdOf(e);
+     const home: ?u8 = if (e.settings.kv_shard.on) s.home else null;
+     const own = if (home) |h| h == e.share.rank else true; // this rank's copy holds the latent rows
+-    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, own);
++    // the kept state's own parity picks the half a live-half keep carries; the slot's dead half stays as it is
++    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, own, s.cur);
+     if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), dflash.ring_bytes);
+     if (plan.len != s.len) return error.SnapshotSize;
+     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
+@@ -268,7 +269,7 @@ fn carrySend(e: anytype, s: *const types.Snap, plan: *const layout.Plan) !void {
+ /// piece at a time from the peer into the staging buffer and on into the rows.
+ fn carryRecv(e: anytype, s: *const types.Snap) !void {
+     const stage = (e.kv_stage orelse return error.KvShardRoom).ptr;
+-    const live = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, true);
++    const live = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, true, e.cur.st.cur);
+     var buf: [layout.Plan.max_parts]usize = undefined;
+     const lens = latentLens(&live, &buf);
+     var parts: [layout.Plan.max_parts]layout.Part = undefined;
+-- 
+2.56.0
+

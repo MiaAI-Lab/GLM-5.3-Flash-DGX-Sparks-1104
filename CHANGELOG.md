@@ -1,5 +1,52 @@
 # Changelog
 
+- **2026-11-11** -- engine patch 0140: `tools/share_gate.py`, the served exactness gate for kept-state changes. The
+  tool the 0122-0139 measurements were taken with: against a serving lane it checks resumed = fresh at calibrated
+  prompt sizes, concurrent = alone at each level, drafted = plain, with a per-run nonce so a cold run is cold. A
+  concurrent request that errored fails the gate with its error in the report; the API key is read from an
+  environment variable (`--api-key-env NAME`), never from the command line.
+
+- **2026-11-11** -- engine patches 0137-0139: a failed disk recall under `TF_KV_SHARE` costs a cold prefill, not the
+  lane; a fault drill; a follower's failure after its seal reaches rank 0. Before, a disk op failing on rank 1 inside
+  a recall ended both ranks (`rank 1 stopped (SnapshotSize); this rank stops too`); now the recall is given up and the
+  request prefills cold. `TF_GLM_DISK_FAULT=n` (off by default) fails the nth disk write a rank other than 0 takes.
+  0139: a `settle` step ends each recall, so a write that fails on a follower after its seal answered (the state's
+  own file follows the seal) also gives the recall up instead of leaving that rank's copy dropped. The
+  follower side of 0137 and the settle also serve `LEARN_GIB` without `TF_KV_SHARE`. Drill on two DGX
+  Sparks with 0122-0140 (2026-11-11, `TF_GLM_DISK_FAULT=40`): rank 1 logged `a disk step for state 2 failed
+  (DiskFaultDrill)` and stayed up, rank 0 logged `recalling 606208 tokens from disk failed (DiskRankFailed); the pass
+  prefills from the start`, and the next recall returned a 126k conversation with its reference sha256; the same
+  with `TF_KV_SHARE` unset.
+
+- **2026-11-11** -- engine patches 0132-0136: `LEARN_GIB` beside `TF_KV_SHARE`, unsharded and with `KV_SHARD`, and
+  two fixes for defects seen on a second two-Spark pair running this stack (2026-11-11). The disk tier (`LEARN_GIB`, 0113) works under the shared pages: states are written
+  from the pool's pages in pieces under the staging permit and recalled into pool pages, per rank when sharded; the
+  share store's identity carries the window width (0119's `window_rows`). 0135: a cold pass seats in the part that
+  holds its prefix, and a keep that would span the parts evicts the other part's idle branches. Before, a
+  conversation seated away from its kept prefix had every keep refused and ran cold every turn (about 207 s a turn
+  at 335K tokens, on that pair); measured on ours with 0122-0140 (2026-11-11): a 333,161-token conversation 207.3 s cold, then 1.35 s with
+  `cached 331776` and the same sha256, its next turn 1.44 s, no keep refused. 0136: a disk recall's home is the part
+  that holds its prefix in the tree, and a kept state whose home is not its pages' part is not resumed. Before, a
+  recall filed in the part with fewer live streams while its resume adopted pages in the other part; the two ranks
+  deadlocked in the resume's carry and that pair hung (7 h); measured on ours with 0122-0140: a 206,708-token
+  conversation recalled after a restart beside a resumed branch, `cached 204800` in 6.35 s, no carry. From disk
+  (same run): a 610,124-token conversation `cached 606208` in 10.5 s after a restart and in 8.23 s after eviction. Recommended settings for two Sparks:
+  `scripts/local.sh.kv-share.example` and the README section.
+
+- **2026-11-11** -- engine patches 0122-0131: `TF_KV_SHARE`, kept prompt states as the pool's own pages (no second
+  copy), beside `KV_SHARD`. Under `TF_KV_SHARE=n` kept prompt states are the pool's pages by reference (ports of
+  upstream's share work onto f350cd3e + 0001-0121, plus what the sharded pool needed). `TF_KV_SHARE` is read with the
+  rank settings and carried in the rank fingerprint (layout 19), and `TF_GLM_KV_LIVE_HALF=1` is refused beside
+  `--learn-conversations` (0131). Measured on two DGX Sparks with 0122-0140 (2026-11-11, `PARALLEL=8 CONTEXT=1048576
+  KV=fp8 KV_SHARD=1 CACHE_FIRST=1 PROMPT_CACHE_GIB=7 TF_KV_SHARE=32 MEMORY_RESERVE_GIB=5`, 32-row windows): 8,704 pool
+  pages (4.46M tokens), 24 kept states in 6.8 GiB of slots (about 290 MiB each; the engine's startup line puts all 32 at
+  `PROMPT_CACHE_GIB=10`);
+  cold/warm time to first token 4.36/1.40 s at 4,110 tokens, 75.0/4.52 s at 126,407, 401.0/6.21 s at 610,128;
+  resumed = fresh and concurrent = alone at 1 and 8, drafted and plain. Off by default. With `TF_KV_SHARE`
+  unset: 0124's staging permit (1 GiB, `TF_GLM_LEARN_STAGING_GIB`) also bounds `LEARN_GIB`'s write-behind, 0131
+  refuses `TF_GLM_KV_LIVE_HALF=1` beside `LEARN_GIB` and moves the rank fingerprint to layout 19, and 0127 (host
+  tests) turns one `TF_GLM_MM_STAGES` message from an error into a warning; nothing else changes.
+
 - **2026-11-11** -- `MEMORY_RESERVE_GIB=6.5` and `CACHE_FIRST=1` are the defaults everywhere, the pair included (the
   reserve was 12, and the pair ran 9.5 in its `local.sh`; cache-first was off), with `PROMPT_CACHE_GIB` 5 on the pair
   (8 and 4 at four Sparks, as below). Cache-first is part of it: at 6.5 and windows first the pair's page pool would

@@ -1,0 +1,156 @@
+From cffe4b2a2f22fcdeefe486abcfab13ab074dfd37 Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 18:23:46 +0100
+Subject: [PATCH] glm cuda: TF_KV_SHARE is in the rank fingerprint;
+ TF_GLM_KV_LIVE_HALF beside --learn-conversations is refused
+
+- Settings reads TF_KV_SHARE (a count; a typo is refused by name) and the Fingerprint carries it (kv_share, layout 19):
+  ranks that keep prompts differently, or a different number of them, stop at startup naming TF_KV_SHARE. Before, each
+  rank read the variable with getenv and nothing compared them.
+- A live-half keep omits the dead KDA half and neither disk identity carries the flag, so a store written with one
+  setting could be read with the other. GLM with --learn-conversations and TF_GLM_KV_LIVE_HALF=1 now refuses at open,
+  as upstream does (f34b97085).
+
+Host-tested (cuda_ranks_test: the field is read, carried and compared).
+---
+ zig/src/families/glm/cuda_ranks.zig      | 12 ++++++++++-
+ zig/src/families/glm/cuda_ranks_test.zig | 26 ++++++++++++++++++++++--
+ zig/src/native/cuda_refusal.zig          |  2 ++
+ 3 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index a305c727..f12fac1c 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -28,6 +28,7 @@ pub const Settings = struct {
+     numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
+     kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
+     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
++    kv_share: u32 = 0, // TF_KV_SHARE=n: kept prompt states as the pool's pages, at most n past them (core kv_prompts.sharing reads the same value)
+     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
+     share_untwinned_pct: u32 = share_mod.untwinned_pct_default, // TF_GLM_KV_SHARE_UNTWINNED_PCT: a sharded share resume adopts only when its untwinned tail pays
+ 
+@@ -149,6 +150,10 @@ pub const Settings = struct {
+             problem.* = "TF_GLM_KV_SHARE_UNTWINNED_PCT: 1 to 100 (an untwinned prefill's rate as a percentage of the twinned; 75 the default, 100 always adopts a kept prefix)";
+             return error.BadSetting;
+         };
++        if (get("TF_KV_SHARE")) |v| s.kv_share = std.fmt.parseInt(u32, v, 10) catch {
++            problem.* = "TF_KV_SHARE: a count (kept prompt states as the pool's pages, at most that many; 0 or unset: copies)";
++            return error.BadSetting;
++        };
+         if (get("TF_GLM_KV_LIVE_HALF")) |v| {
+             if (std.mem.eql(u8, v, "1")) s.kv_live_half = true else if (!std.mem.eql(u8, v, "0")) {
+                 problem.* = "TF_GLM_KV_LIVE_HALF: 0 or 1";
+@@ -185,7 +190,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
+ 
+ /// What every rank must agree on, as bytes the communicator carries.
+ pub const Fingerprint = extern struct {
+-    layout: u32 = 18, // this struct's version (17 had no kv_live_half; 16 had no l2pf words; 15 had the chunk words or the kv_shard words alone; 14 was without chunk; 13 num3's numerics or prefill3's pair alone)
++    layout: u32 = 19, // this struct's version (18 had no kv_share; 17 had no kv_live_half; 16 had no l2pf words; 15 had the chunk words or the kv_shard words alone; 14 was without chunk; 13 num3's numerics or prefill3's pair alone)
+     world: u32,
+     rank: u32,
+     kv8: u32 = 0,
+@@ -209,6 +214,7 @@ pub const Fingerprint = extern struct {
+     numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
+     kv_shard: u32 = 0, // TF_GLM_KV_SHARD and _CARRY, _TWINS (kv_shard.Switches.word; 0: off)
+     kv_shard_check: u32 = 0, // TF_GLM_KV_SHARD_CHECK when on (0 off)
++    kv_share: u32 = 0, // TF_KV_SHARE's count: every rank keeps prompts as pool pages, and as many, or none does
+     kv_live_half: u32 = 0, // TF_GLM_KV_LIVE_HALF: every rank keeps the live KDA half alone (1) or the head whole (0)
+     capacity: u64, // tokens a sequence holds
+     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
+@@ -242,6 +248,7 @@ pub const Fingerprint = extern struct {
+         numerics,
+         kv_shard,
+         kv_shard_check,
++        kv_share,
+         kv_live_half,
+         capacity,
+         heat_high,
+@@ -280,6 +287,7 @@ pub const Fingerprint = extern struct {
+             .numerics = s.numerics.bits(),
+             .kv_shard = s.kv_shard.word(),
+             .kv_shard_check = s.kv_shard.checkWord(),
++            .kv_share = s.kv_share,
+             .kv_live_half = @intFromBool(s.kv_live_half),
+             .capacity = capacity,
+             .heat_high = if (s.heat) |b| b.high_c else 0,
+@@ -322,6 +330,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+             "numerics",
+             "kv_shard",
+             "kv_shard_check",
++            "kv_share",
+             "kv_live_half",
+             "capacity",
+             "heat_high",
+@@ -437,6 +446,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
+         .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
+         .kv_shard => "TF_GLM_KV_SHARD, TF_GLM_KV_SHARD_CARRY or TF_GLM_KV_SHARD_TWINS",
+         .kv_shard_check => "TF_GLM_KV_SHARD_CHECK",
++        .kv_share => "TF_KV_SHARE",
+         .kv_live_half => "TF_GLM_KV_LIVE_HALF",
+         .capacity => "the sequence capacity (the context)",
+         .heat_high => "TF_HEAT_HIGH",
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index 782561a1..13420bf8 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -186,7 +186,7 @@ test "every media limit is part of the ranks' agreement" {
+ test "every scheduling and identity field that differs stops the ranks" {
+     const zero = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
+     const one = Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
+-    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "kv_live_half", "pieces", "pair", "chunk", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
++    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "kv_share", "kv_live_half", "pieces", "pair", "chunk", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
+         var all = [_]Fingerprint{ zero, one };
+         @field(all[1], name) += 1;
+         try std.testing.expectEqual(@field(Fingerprint.Field, name), mismatch(&all).?.field);
+@@ -418,7 +418,7 @@ test "TF_GLM_KV_SHARD: read with its knobs, refused by name on a typo, and in th
+     const f0 = Fingerprint.of(2, 0, .{}, 8192, true, h0, h0, hashBytes("/c"));
+     try std.testing.expectEqual(@as(u32, 0), f0.kv_shard);
+     try std.testing.expectEqual(@as(u32, 0), f0.kv_shard_check);
+-    try std.testing.expectEqual(@as(u32, 18), f0.layout);
++    try std.testing.expectEqual(@as(u32, 19), f0.layout);
+     var all = [_]Fingerprint{ f0, Fingerprint.of(2, 1, s, 8192, true, h0, h0, hashBytes("/c")) };
+     try std.testing.expectEqual(Mismatch{ .field = .kv_shard, .rank = 1 }, mismatch(&all).?); // on one rank only
+     all[0] = Fingerprint.of(2, 0, s, 8192, true, h0, h0, hashBytes("/c"));
+@@ -499,3 +499,25 @@ test "TF_GLM_KV_SHARE_UNTWINNED_PCT: 75 by default, 1 to 100 read, a value outsi
+     try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
+     try std.testing.expect(std.mem.indexOf(u8, problem, "TF_GLM_KV_SHARE_UNTWINNED_PCT") != null);
+ }
++
++test "TF_KV_SHARE: read with the settings, a typo refused, and ranks that keep a different count disagree" {
++    const Reader = struct {
++        fn on(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_KV_SHARE")) "32" else null;
++        }
++        fn bad(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_KV_SHARE")) "on" else null;
++        }
++    };
++    var problem: []const u8 = "";
++    const s = try Settings.read(Reader.on, &problem);
++    try std.testing.expectEqual(@as(u32, 32), s.kv_share);
++    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
++    try std.testing.expect(std.mem.indexOf(u8, problem, "TF_KV_SHARE") != null);
++    const h: [32]u8 = @splat(0);
++    var all = [_]Fingerprint{ Fingerprint.of(2, 0, s, 8192, true, h, h, h), Fingerprint.of(2, 1, s, 8192, true, h, h, h) };
++    try std.testing.expectEqual(@as(u32, 32), all[0].kv_share);
++    try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
++    all[1].kv_share = 0; // rank 1 without the variable
++    try std.testing.expectEqual(Mismatch{ .field = .kv_share, .rank = 1 }, mismatch(&all).?);
++}
+diff --git a/zig/src/native/cuda_refusal.zig b/zig/src/native/cuda_refusal.zig
+index a698ff6d..0c67a033 100644
+--- a/zig/src/native/cuda_refusal.zig
++++ b/zig/src/native/cuda_refusal.zig
+@@ -54,6 +54,8 @@ pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
+         return "--drafter loads a separate drafter, and this CUDA family drafts with its own MTP head: serve without --drafter";
+     }
+     if (o.learn_conversations and F != nemotron.native and F != @import("glm_cuda").native and @import("cuda_disk.zig").keptDisk(F) == null) return "--learn-conversations keeps conversation states on disk for Nemotron, GLM-5.3-Flash, the Qwen hybrids and Flash Next only on CUDA: serve this model without it";
++    // a live-half keep omits the dead KDA half, and the disk identity does not carry the flag: such a state must never reach a store
++    if (F == @import("glm_cuda").native and o.learn_conversations and @import("glm_cuda").snapshots.layout.liveHalfEnabled()) return "TF_GLM_KV_LIVE_HALF=1 keeps half of each KDA state, and --learn-conversations' store on disk holds whole ones: serve with one of them, not both";
+     if (o.learn_conversations and o.tp > 1) if (@import("cuda_disk.zig").keptDisk(F)) |K| if (@hasDecl(K, "one_rank") and K.one_rank) return "--learn-conversations keeps one rank's states on disk for this CUDA family: serve without --tp or without --learn-conversations";
+     if (o.kv8 and !(@hasDecl(F, "Options") and @hasField(F.Options, "kv8"))) return "--kv-cache fp8: this CUDA family keeps bf16 caches; serve without it";
+     if (o.prompt_int8 and !(@hasDecl(F, "Options") and @hasField(F.Options, "prompt_int8"))) return "--prompt-precision int8: this CUDA family's prompt matmuls take bf16 inputs; serve without it";
+-- 
+2.56.0
+
