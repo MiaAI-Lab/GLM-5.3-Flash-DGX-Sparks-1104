@@ -19,7 +19,7 @@
 
 **Engine: TensorFold 1.1.9** (`tensorfold-native --version`), upstream commit
 [`f350cd3e`](https://github.com/ashhart/TensorFold/commit/f350cd3ea253a042e205746928271f9d8f71a82d) plus this recipe's
-121 engine patches (`patches/engine/`).
+131 engine patches (`patches/engine/`).
 
 This recipe serves GLM-5.3-Flash from an EXL3 checkpoint on **two NVIDIA DGX Sparks** (GB10, 128 GB unified memory
 each) at tensor parallel 2, one rank on each Spark, over their ConnectX-7 link. It uses TensorFold's native Zig/CUDA
@@ -49,7 +49,7 @@ The engine is TensorFold 1.1.9 at commit `f350cd3e` ([ashhart/TensorFold](https:
 
 ## What is checked
 
-121 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
+131 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
 reaches the worker by content; link discovery finds both PCIe twins of the cabled port and the RoCE v2 GID that
 holds each port's own IPv4; NCCL and the engine's RDMA all-gather run over the cable; the full 1,048,576-token window
 serves 8 streams beside a 3.6 GiB prompt cache; greedy replies are byte-stable across every change
@@ -314,9 +314,9 @@ and MMLU 88.4%, thinking-on categories unchanged.
 
 ## Engine patches
 
-`patches/engine/` holds 121 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
+`patches/engine/` holds 131 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0106 and 0111-0121 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. None is GB10-specific: the arch-gated kernels test
+0094-0106 and 0111-0131 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -345,6 +345,16 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0119 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (0039 had 16), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Fixes what the wider window exposes on this stack: shared-window scratch is said outright (a 32-row segment no longer shrinks the KDA projection buffer to 4 bytes or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. Not taken: load-timed pricing, 15-deep MTP chains, and #1779's shared reservation (upstream turned it off for DFlash2, cc2fa8d23). On the pair (2026-11-11, greedy, token hashes identical): a 1,195-token file rewrite at one stream 151 to 201-205 tok/s decode (14.9 to 26.6 tokens a round); prose at 1/4/8 streams and four-stream rewrites unchanged; 34 MiB more fixed memory a stream |
 | 0120 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids and leave the reply as they do. A name the tokenizer does not hold refuses the start; unset, the EOS list is the checkpoint's |
 | 0121 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default (`THINK_OFF_SPLIT=0`; 1024 is the hold the author measured)): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, whole and streamed alike (a stream holds its content until the token, the hold or the end). A close after the hold stays text; raw completions, the JSON channel and logprobs requests are never split. Tests: `zig build test-think-off-split-host` |
+| 0122 | **Ported (upstream a2d27dac7, a3a53dbe3).** `prompt_radix` plans its marks on the prompt grid and looks ahead for a longer kept prefix; groundwork for 0123-0131. |
+| 0123 | **Ported (upstream 40c03bf13).** `TF_KV_SHARE=n` (off by default): kept prompt states are the pool's own pages, held by reference in one radix store; `n` is the number of kept states. |
+| 0124 | **Ported (upstream 0e5085dca, 12dfa588a).** The disk tier's host staging is bounded by a permit (`TF_GLM_LEARN_STAGING_GIB`, 1 GiB by default): a long state is saved in pieces. |
+| 0125 | **Ported (upstream a6f5615d4, 768170532, d5b0b92f4).** GLM under `TF_KV_SHARE`: a kept state leaves the shared pages out of its copy, lanes adopt the store's pages at the head of a lease; unsupported combinations are refused by name. |
+| 0126 | **Ported (upstream 7547c99c2, PR #2181).** `TF_GLM_KV_LIVE_HALF=1` (off by default): a kept state carries the live KDA half alone; in the rank fingerprint (layout 18). Refused beside `LEARN_GIB` (0131). |
+| 0127 | Host tests follow 0094's 4,096-row chunk grid, 0014's `e.drafts` and 0095's drafter width. |
+| 0128 | **Ported (upstream 389769733).** The startup plan counts `TF_KV_SHARE`'s kept states, a slot each (about 290 MiB sharded at 0119's 32-row windows) beside the pool's pages, under `CACHE_FIRST=1`. |
+| 0129 | `TF_KV_SHARE` beside `KV_SHARD=1`: the store takes the pool's parts as its pages, reclaim runs per part, a resume opens in its adopted pages' part, a kept state's slot leaves the latent rows on the pages. |
+| 0130 | A sharded share resume takes no twin (about 75 % of the twinned prefill rate), so a kept prefix is adopted only when it pays: `TF_GLM_KV_SHARE_UNTWINNED_PCT` (75), counter `kv_shard_resumes_skipped_total`. |
+| 0131 | `TF_KV_SHARE` is read with the rank settings and carried in the rank fingerprint (layout 19): ranks that keep prompts differently stop at startup naming it. `TF_GLM_KV_LIVE_HALF=1` beside `--learn-conversations` (`LEARN_GIB`) is refused at open, as upstream does (f34b97085): neither disk identity carries the flag. |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 

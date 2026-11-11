@@ -1,5 +1,19 @@
 # Changelog
 
+- **2026-11-11** -- engine patches 0122-0131: `TF_KV_SHARE`, kept prompt states as the pool's own pages (no second
+  copy), beside `KV_SHARD`. Under `TF_KV_SHARE=n` kept prompt states are the pool's pages by reference (ports of
+  upstream's share work onto f350cd3e + 0001-0121, plus what the sharded pool needed). `TF_KV_SHARE` is read with the
+  rank settings and carried in the rank fingerprint (layout 19), and `TF_GLM_KV_LIVE_HALF=1` is refused beside
+  `--learn-conversations` (0131). Measured on two DGX Sparks with 0122-0140 (2026-11-11, `PARALLEL=8 CONTEXT=1048576
+  KV=fp8 KV_SHARD=1 CACHE_FIRST=1 PROMPT_CACHE_GIB=7 TF_KV_SHARE=32 MEMORY_RESERVE_GIB=5`, 32-row windows): 8,704 pool
+  pages (4.46M tokens), 24 kept states in 6.8 GiB of slots (about 290 MiB each; the engine's startup line puts all 32 at
+  `PROMPT_CACHE_GIB=10`);
+  cold/warm time to first token 4.36/1.40 s at 4,110 tokens, 75.0/4.52 s at 126,407, 401.0/6.21 s at 610,128;
+  resumed = fresh and concurrent = alone at 1 and 8, drafted and plain. Off by default. With `TF_KV_SHARE`
+  unset: 0124's staging permit (1 GiB, `TF_GLM_LEARN_STAGING_GIB`) also bounds `LEARN_GIB`'s write-behind, 0131
+  refuses `TF_GLM_KV_LIVE_HALF=1` beside `LEARN_GIB` and moves the rank fingerprint to layout 19, and 0127 (host
+  tests) turns one `TF_GLM_MM_STAGES` message from an error into a warning; nothing else changes.
+
 - **2026-11-11** -- `MEMORY_RESERVE_GIB=6.5` and `CACHE_FIRST=1` are the defaults everywhere, the pair included (the
   reserve was 12, and the pair ran 9.5 in its `local.sh`; cache-first was off), with `PROMPT_CACHE_GIB` 5 on the pair
   (8 and 4 at four Sparks, as below). Cache-first is part of it: at 6.5 and windows first the pair's page pool would

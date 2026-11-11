@@ -1,0 +1,453 @@
+From ba03df71292040723a5a571e3df8c55932bd3d40 Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] core prompt_radix: a lookahead in the tree and a planned grid
+
+Ported from upstream a2d27dac7 and a3a53dbe3 onto this recipe's tree: the radix store plans its marks on the prompt grid and looks ahead for a longer kept prefix. Groundwork for TF_KV_SHARE; nothing reads it until the adapter lands. Host tests with the change.
+---
+ zig/src/core/prompt_radix.zig      |  44 +++---
+ zig/src/core/prompt_radix_test.zig | 206 +++++++++++++++++++++++++++++
+ zig/src/core/prompt_radix_tree.zig |  32 +++--
+ 3 files changed, 251 insertions(+), 31 deletions(-)
+
+diff --git a/zig/src/core/prompt_radix.zig b/zig/src/core/prompt_radix.zig
+index 56fd1a6d..e1fd5586 100644
+--- a/zig/src/core/prompt_radix.zig
++++ b/zig/src/core/prompt_radix.zig
+@@ -12,7 +12,7 @@ pub const Counts = tree_mod.Counts;
+ pub const Node = tree_mod.Node;
+ pub const Tree = tree_mod.Tree;
+ 
+-/// The rules of prompt_cache.zig, paged: `page` set, `lookahead` and `planned` not (a row's bits ignore its chunk).
++/// The rules of prompt_cache.zig, paged: `page` set; a planned store cuts and resumes only on `grid`, a multiple of it.
+ pub const Rules = pc.Rules;
+ 
+ /// What the tree may hold: pages, and snapshots.
+@@ -54,8 +54,18 @@ pub const Store = struct {
+     const SHARED_KEYS = 64;
+ 
+     pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, rules: Rules) !Store {
+-        std.debug.assert(rules.page > 0 and rules.lookahead == 0 and !rules.planned);
+-        return .{ .tree = try Tree.init(gpa, family, pages, rules.page), .rules = rules };
++        if (rules.page == 0 or (rules.planned and (rules.grid == 0 or rules.grid % rules.page != 0))) return error.BadPromptRadixRules;
++        return .{ .tree = try Tree.init(gpa, family, pages, rules.page, rules.lookahead), .rules = rules };
++    }
++
++    /// Where a pass may cut and resume: a page edge, or a planned store's grid.
++    fn step(s: *const Store) u32 {
++        return if (s.rules.planned) s.rules.grid else s.rules.page;
++    }
++
++    /// Tokens a resume leaves past its state: the lookahead it read, and at least one to prefill.
++    fn past(s: *const Store) u32 {
++        return @max(1, s.rules.lookahead);
+     }
+ 
+     pub fn deinit(s: *Store) void {
+@@ -75,10 +85,10 @@ pub const Store = struct {
+         return s.limits.pages > 0 and s.limits.snaps > 0;
+     }
+ 
+-    /// The deepest node with a state `prompt` resumes exactly: its tokens a prefix, at least one token left.
++    /// The deepest node whose state `prompt` resumes exactly: its tokens and lookahead a prefix, a token left.
+     pub fn find(s: *const Store, prompt: []const u32) ?*Node {
+-        if (!s.on() or prompt.len < 2) return null;
+-        return s.tree.deepest(prompt, (prompt.len - 1) / s.rules.page * s.rules.page);
++        if (!s.on() or prompt.len < s.past() + 1) return null;
++        return s.tree.deepest(prompt, (prompt.len - s.past()) / s.rules.page * s.rules.page, s.step());
+     }
+ 
+     /// Restores the longest state `prompt` resumes into `owner`, its pages into `adopt` (held once more); plans marks.
+@@ -91,8 +101,8 @@ pub const Store = struct {
+         const marks_ = try s.fitting(a, planned);
+         errdefer a.free(marks_);
+         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
+-            const cut = w - w % s.rules.page;
+-            if (std.mem.indexOfScalar(u32, marks_, cut) != null) s.noteShared(prompt[0..cut]);
++            const cut = w - w % s.step();
++            if (std.mem.indexOfScalar(u32, marks_, cut) != null) s.noteShared(prompt[0 .. cut + s.rules.lookahead]);
+         }
+         s.reserve(prompt, found, marks_);
+         var from: u32 = 0;
+@@ -133,7 +143,7 @@ pub const Store = struct {
+         if (marks_.len == 0) return;
+         const last = marks_[marks_.len - 1];
+         while (true) {
+-            const new = last / s.rules.page - s.tree.have(prompt[0..last]);
++            const new = last / s.rules.page - s.tree.have(prompt[0 .. last + s.rules.lookahead]);
+             if (s.tree.held_pages + new <= s.limits.pages and s.tree.snaps + marks_.len <= s.limits.snaps) return;
+             s.tree.evict(s.victim(prompt, from) orelse return);
+         }
+@@ -141,7 +151,7 @@ pub const Store = struct {
+ 
+     /// A kept state a peer could not resume goes, so later prompts do not ask for it again.
+     pub fn forget(s: *Store, prompt: []const u32, at: u32) void {
+-        const n = s.find(prompt[0..@min(prompt.len, at + 1)]) orelse return;
++        const n = s.find(prompt[0..@min(prompt.len, at + s.past())]) orelse return;
+         if (n.end != at) return;
+         s.tree.counts.failed += 1;
+         s.tree.evict(n);
+@@ -185,10 +195,10 @@ pub const Store = struct {
+             if (stable > 0 and stable < history_len and stable >= history_len / 2) try want.append(a, stable);
+         }
+         try want.appendSlice(a, shared);
+-        if (s.rules.tail) try want.append(a, @intCast(prompt.len - 1));
++        if (s.rules.tail and prompt.len > s.past()) try want.append(a, @intCast(prompt.len - s.past()));
+         for (want.items, 0..) |w, k| {
+-            const m = w - w % s.rules.page;
+-            if (m <= from or m >= prompt.len) continue;
++            const m = w - w % s.step();
++            if (m <= from or m >= prompt.len or m + s.rules.lookahead > prompt.len) continue;
+             if (k > 0) { // the history's mark always; the others only away from it, each other and the resume point
+                 if (m - from < s.rules.min_gap) continue;
+                 const near = for (out.items) |o| {
+@@ -205,9 +215,9 @@ pub const Store = struct {
+     /// At `at` the tree takes the pages of `mine` it lacks and the snapshot, evicting to fit; `path` gets its pages.
+     pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, mine: []const u32, path: []u32) Kept {
+         const t = &s.tree;
+-        if (!s.on() or at == 0 or at % s.rules.page != 0 or at > prompt.len or mine.len != at / s.rules.page or path.len != mine.len) return .{ .held = false, .shared = 0 };
++        if (!s.on() or at == 0 or at % s.step() != 0 or at + s.rules.lookahead > prompt.len or mine.len != at / s.rules.page or path.len != mine.len) return .{ .held = false, .shared = 0 };
+         t.clock += 1;
+-        const tokens = prompt[0..at];
++        const tokens = prompt[0 .. at + s.rules.lookahead]; // a page past which the lookahead differs is another page
+         const flagged = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(tokens)) != null;
+         while (true) {
+             var last: ?*Node = null;
+@@ -254,10 +264,10 @@ pub const Store = struct {
+         return x.used < y.used;
+     }
+ 
+-    /// Whether `prompt` repeats every token up to the end of `n`.
++    /// Whether `prompt` repeats every token `n` holds: up to its end, and its lookahead.
+     fn extends(n: *const Node, prompt: []const u32) bool {
+         const parent = n.parent orelse return true;
+-        return prompt.len >= n.end and std.mem.eql(u32, n.tokens, prompt[parent.end..n.end]) and extends(parent, prompt);
++        return prompt.len >= parent.end + n.tokens.len and std.mem.eql(u32, n.tokens, prompt[parent.end..][0..n.tokens.len]) and extends(parent, prompt);
+     }
+ 
+     /// Whether a later prompt kept a state below `n`.
+diff --git a/zig/src/core/prompt_radix_test.zig b/zig/src/core/prompt_radix_test.zig
+index 89ba29ec..55bb93bf 100644
+--- a/zig/src/core/prompt_radix_test.zig
++++ b/zig/src/core/prompt_radix_test.zig
+@@ -308,3 +308,209 @@ test "a history every turn resumes again after one kept a longer state is a bran
+     f.leave(mine.items);
+     try std.testing.expectEqual(s.tree.snaps, f.live);
+ }
++
++/// A golden pass: where it resumed and kept, then what the tree held and had counted.
++const Row = struct { from: u32, marks: []const u32, snaps: usize, pages: usize, bytes: u64, hits: u64, misses: u64, kept: u64, evicted: u64, refused: u64 };
++
++/// Two conversations over a shared system block, a growing and an edited turn, a third prompt that evicts, a refusal.
++fn goldenRun(a: Allocator, f: *Fake, s: *Store, out: *std.ArrayList(Row)) !void {
++    var mine: std.ArrayList(u32) = .empty;
++    var edited = seq(42, 0);
++    edited[25] = 999;
++    var other: [32]u32 = undefined;
++    @memcpy(other[0..13], &seq(13, 0));
++    @memcpy(other[13..], &seq(19, 200));
++    const Pass = struct { prompt: []const u32, history: u32, shared: []const u32 };
++    const passes = [_]Pass{
++        .{ .prompt = &seq(30, 0), .history = 0, .shared = &.{12} },
++        .{ .prompt = &seq(42, 0), .history = 30, .shared = &.{12} },
++        .{ .prompt = &other, .history = 0, .shared = &.{12} },
++        .{ .prompt = &edited, .history = 30, .shared = &.{12} },
++        .{ .prompt = &seq(56, 0), .history = 42, .shared = &.{12} },
++        .{ .prompt = &seq(30, 300), .history = 20, .shared = &.{} },
++        .{ .prompt = &seq(92, 400), .history = 88, .shared = &.{} },
++    };
++    for (passes) |p| {
++        const plan = try pass(f, s, a, p.prompt, p.history, p.shared, &mine);
++        const c = s.tree.counts;
++        try out.append(a, .{ .from = plan.from, .marks = plan.marks, .snaps = s.tree.snaps, .pages = s.tree.held_pages, .bytes = s.tree.held(), .hits = c.hits, .misses = c.misses, .kept = c.kept, .evicted = c.evicted, .refused = c.refused });
++        f.leave(mine.items);
++    }
++}
++
++test "golden: lookahead 0 and no grid, as HIP's families and Qwen's CUDA path keep, resume and evict the same" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, .{ .page = 4, .min_gap = 16, .min_prompt = 0, .tail = true });
++    defer s.deinit();
++    s.limit(.{ .pages = 20, .snaps = 4 });
++    var rows: std.ArrayList(Row) = .empty;
++    try goldenRun(a, &f, &s, &rows);
++    // the store before it learned a lookahead and a grid kept exactly these
++    const want = [_]Row{
++        .{ .from = 0, .marks = &.{28}, .snaps = 1, .pages = 7, .bytes = 170, .hits = 0, .misses = 1, .kept = 1, .evicted = 0, .refused = 0 },
++        .{ .from = 28, .marks = &.{}, .snaps = 1, .pages = 7, .bytes = 170, .hits = 1, .misses = 1, .kept = 1, .evicted = 0, .refused = 0 },
++        .{ .from = 0, .marks = &.{28}, .snaps = 2, .pages = 11, .bytes = 310, .hits = 1, .misses = 2, .kept = 2, .evicted = 0, .refused = 0 },
++        .{ .from = 0, .marks = &.{28}, .snaps = 3, .pages = 12, .bytes = 420, .hits = 1, .misses = 3, .kept = 3, .evicted = 0, .refused = 0 },
++        .{ .from = 28, .marks = &.{40}, .snaps = 4, .pages = 15, .bytes = 550, .hits = 2, .misses = 3, .kept = 4, .evicted = 0, .refused = 0 },
++        .{ .from = 0, .marks = &.{20}, .snaps = 4, .pages = 20, .bytes = 600, .hits = 2, .misses = 4, .kept = 5, .evicted = 1, .refused = 0 },
++        .{ .from = 0, .marks = &.{}, .snaps = 4, .pages = 20, .bytes = 600, .hits = 2, .misses = 5, .kept = 5, .evicted = 1, .refused = 1 },
++    };
++    try std.testing.expectEqual(want.len, rows.items.len);
++    for (want, rows.items) |w, r| {
++        try std.testing.expectEqualSlices(u32, w.marks, r.marks);
++        var got = r;
++        got.marks = w.marks;
++        try std.testing.expectEqual(w, got);
++    }
++    try std.testing.expectEqual(s.tree.snaps, f.live);
++}
++
++test "lookahead 1: a state resumes when the token past it repeats, and not when it differs" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, .{ .page = 4, .min_gap = 8, .min_prompt = 0, .lookahead = 1 });
++    defer s.deinit();
++    s.limit(.{ .pages = 40, .snaps = 8 });
++    var mine: std.ArrayList(u32) = .empty;
++    const t1 = seq(24, 0);
++    var plan = try pass(&f, &s, a, &t1, 20, &.{}, &mine);
++    try std.testing.expectEqualSlices(u32, &.{20}, plan.marks);
++    f.leave(mine.items);
++    const t2 = seq(32, 0); // the next turn repeats token 20
++    plan = try pass(&f, &s, a, &t2, 28, &.{}, &mine);
++    try std.testing.expectEqual(@as(u32, 20), plan.from);
++    f.leave(mine.items);
++    var t3 = seq(32, 0); // a conversation parting exactly at token 20 cannot use the state there
++    t3[20] = 999;
++    plan = try pass(&f, &s, a, &t3, 28, &.{}, &mine);
++    try std.testing.expectEqual(@as(u32, 0), plan.from);
++    f.leave(mine.items);
++    try std.testing.expectEqual(@as(u32, 20), s.find(&seq(21, 0)).?.end); // its lookahead, the one token to prefill
++    try std.testing.expect(s.find(&seq(20, 0)) == null); // no token past the state: nothing to resume
++    try std.testing.expectEqual(s.tree.snaps, f.live);
++}
++
++/// Pages a second conversation takes from a first's state at 20 when it keeps at 20 too, parting from it at `branch`.
++fn sharedAfter(branch: usize, lookahead: u32) !usize {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, .{ .page = 4, .min_gap = 8, .min_prompt = 0, .lookahead = lookahead });
++    defer s.deinit();
++    s.limit(.{ .pages = 40, .snaps = 8 });
++    var mine: std.ArrayList(u32) = .empty;
++    _ = try pass(&f, &s, a, &seq(24, 0), 20, &.{}, &mine);
++    f.leave(mine.items);
++    var second = seq(24, 0);
++    second[branch] = 999;
++    var own: [5]u32 = undefined;
++    f.lane(&own);
++    var path: [5]u32 = undefined;
++    const kept = s.keep(&second, 20, null, &own, &path);
++    f.leave(&own);
++    try std.testing.expect(kept.held);
++    try std.testing.expectEqual(s.tree.snaps, f.live);
++    var taken: usize = 0;
++    for (own, path) |o, p| taken += @intFromBool(o != p);
++    return taken;
++}
++
++test "lookahead 1: a conversation shares only the pages whose next token it still repeats" {
++    // parting at the state's end: the last page's rows read the token past it, so it is not shared
++    try std.testing.expectEqual(@as(usize, 5), try sharedAfter(20, 0));
++    try std.testing.expectEqual(@as(usize, 4), try sharedAfter(20, 1));
++    // parting at an inner page edge, and one token after it
++    try std.testing.expectEqual(@as(usize, 4), try sharedAfter(16, 0));
++    try std.testing.expectEqual(@as(usize, 3), try sharedAfter(16, 1));
++    try std.testing.expectEqual(@as(usize, 4), try sharedAfter(17, 1));
++}
++
++test "planned: marks and resumes sit on the grid, never on a page between" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, .{ .page = 4, .min_gap = 8, .min_prompt = 0, .tail = true, .planned = true, .grid = 8 });
++    defer s.deinit();
++    s.limit(.{ .pages = 40, .snaps = 8 });
++    // a page store would cut at 12 and 40; the grid of 8 moves the block's cut to 8, the tail joins the history's 40
++    try std.testing.expectEqualSlices(u32, &.{ 8, 40 }, try s.marks(a, &seq(48, 0), 0, 41, &.{12}, &.{}));
++    var mine: std.ArrayList(u32) = .empty;
++    var plan = try pass(&f, &s, a, &seq(24, 0), 20, &.{}, &mine);
++    try std.testing.expectEqualSlices(u32, &.{16}, plan.marks); // history 20, its grid point 16
++    f.leave(mine.items);
++    plan = try pass(&f, &s, a, &seq(40, 0), 36, &.{}, &mine);
++    try std.testing.expectEqual(@as(u32, 16), plan.from);
++    f.leave(mine.items);
++    try std.testing.expectEqual(s.tree.snaps, f.live);
++}
++
++test "planned: a keep off the grid is refused, one on it kept" {
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, .{ .page = 4, .min_gap = 8, .min_prompt = 0, .planned = true, .grid = 8 });
++    defer s.deinit();
++    s.limit(.{ .pages = 40, .snaps = 8 });
++    var own: [4]u32 = undefined;
++    f.lane(&own);
++    defer f.leave(&own);
++    var path: [4]u32 = undefined;
++    const prompt = seq(24, 0);
++    try std.testing.expect(!s.keep(&prompt, 12, null, own[0..3], path[0..3]).held);
++    try std.testing.expectEqual(@as(usize, 0), s.tree.snaps);
++    try std.testing.expect(s.keep(&prompt, 16, null, &own, &path).held);
++    try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
++}
++
++test "the tree's deepest state is the deepest at a multiple of the step it is asked for" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, rules);
++    defer s.deinit();
++    s.limit(.{ .pages = 40, .snaps = 8 });
++    var mine: std.ArrayList(u32) = .empty;
++    const prompt = seq(24, 0);
++    _ = try pass(&f, &s, a, &prompt, 12, &.{}, &mine); // a state at 12, off a grid of 8
++    f.leave(mine.items);
++    try std.testing.expectEqual(@as(u32, 12), s.tree.deepest(&prompt, 20, 4).?.end);
++    try std.testing.expect(s.tree.deepest(&prompt, 20, 8) == null);
++}
++
++test "GLM's shape, a grid of four pages and lookahead 1: a chat resumes at its history's grid point, sharing its pages" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, .{ .page = 4, .min_gap = 16, .min_prompt = 0, .lookahead = 1, .planned = true, .grid = 16 });
++    defer s.deinit();
++    s.limit(.{ .pages = 40, .snaps = 8 });
++    var mine: std.ArrayList(u32) = .empty;
++    var plan = try pass(&f, &s, a, &seq(40, 0), 36, &.{}, &mine);
++    try std.testing.expectEqualSlices(u32, &.{32}, plan.marks);
++    const first = try a.dupe(u32, mine.items[0..8]);
++    f.leave(mine.items);
++    plan = try pass(&f, &s, a, &seq(56, 0), 52, &.{}, &mine);
++    try std.testing.expectEqual(@as(u32, 32), plan.from);
++    try std.testing.expectEqualSlices(u32, first, mine.items[0..8]); // the resume adopted the first turn's pages
++    try std.testing.expectEqualSlices(u32, &.{48}, plan.marks);
++    f.leave(mine.items);
++    try std.testing.expectEqual(@as(usize, 2), s.tree.snaps);
++    try std.testing.expectEqual(@as(usize, 12), s.tree.held_pages);
++    try std.testing.expectEqual(s.tree.snaps, f.live);
++}
++
++test "a store refuses rules it cannot keep: no page, or a planned grid that is no multiple of the page" {
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    try std.testing.expectError(error.BadPromptRadixRules, newStore(&f, .{ .page = 0 }));
++    try std.testing.expectError(error.BadPromptRadixRules, newStore(&f, .{ .page = 4, .planned = true }));
++    try std.testing.expectError(error.BadPromptRadixRules, newStore(&f, .{ .page = 4, .planned = true, .grid = 6 }));
++    var s = try newStore(&f, .{ .page = 4, .planned = true, .grid = 8 });
++    s.deinit();
++}
+diff --git a/zig/src/core/prompt_radix_tree.zig b/zig/src/core/prompt_radix_tree.zig
+index 7ff2ff34..2c6770ee 100644
+--- a/zig/src/core/prompt_radix_tree.zig
++++ b/zig/src/core/prompt_radix_tree.zig
+@@ -32,7 +32,7 @@ pub const Node = struct {
+     parent: ?*Node,
+     /// Tokens up to the end of this node.
+     end: u32,
+-    /// The tokens of this node's pages, a page's worth each.
++    /// The tokens of this node's pages, a page's worth each, and the tree's `ahead` more past its last page.
+     tokens: []u32,
+     pages: []u32,
+     kids: std.ArrayList(*Node) = .empty,
+@@ -46,6 +46,8 @@ pub const Tree = struct {
+     pages: Pages,
+     /// Tokens a page holds.
+     page: usize,
++    /// Tokens past a page that its rows read (the family's lookahead): a page matches only when they match too.
++    ahead: usize,
+     root: *Node,
+     clock: u64 = 0,
+     /// Pages and snapshots the tree holds.
+@@ -53,10 +55,10 @@ pub const Tree = struct {
+     snaps: usize = 0,
+     counts: Counts = .{},
+ 
+-    pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, page: usize) !Tree {
++    pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, page: usize, ahead: usize) !Tree {
+         const root = try gpa.create(Node);
+         root.* = .{ .parent = null, .end = 0, .tokens = &.{}, .pages = &.{} };
+-        return .{ .gpa = gpa, .family = family, .pages = pages, .page = page, .root = root };
++        return .{ .gpa = gpa, .family = family, .pages = pages, .page = page, .ahead = ahead, .root = root };
+     }
+ 
+     pub fn deinit(t: *Tree) void {
+@@ -82,19 +84,21 @@ pub const Tree = struct {
+     }
+ 
+     fn child(t: *const Tree, n: *const Node, tokens: []const u32) ?*Node {
+-        for (n.kids.items) |k| if (std.mem.eql(u32, k.tokens[0..t.page], tokens[0..t.page])) return k;
++        const w = t.page + t.ahead;
++        for (n.kids.items) |k| if (std.mem.eql(u32, k.tokens[0..w], tokens[0..w])) return k;
+         return null;
+     }
+ 
+-    /// Whole pages of `n` that `tokens` repeats, at most `most`.
++    /// Whole pages of `n` that `tokens` repeats with the `ahead` tokens past each, at most `most`.
+     fn common(t: *const Tree, n: *const Node, tokens: []const u32, most: usize) usize {
++        const w = t.page + t.ahead;
+         var p: usize = 0;
+-        while (p < n.pages.len and p < most and std.mem.eql(u32, n.tokens[p * t.page ..][0..t.page], tokens[p * t.page ..][0..t.page])) p += 1;
++        while (p < n.pages.len and p < most and std.mem.eql(u32, n.tokens[p * t.page ..][0..w], tokens[p * t.page ..][0..w])) p += 1;
+         return p;
+     }
+ 
+-    /// The deepest node with a state that `prompt` repeats whole up to `limit_at` (a page edge).
+-    pub fn deepest(t: *const Tree, prompt: []const u32, limit_at: usize) ?*Node {
++    /// The deepest node with a state at a multiple of `step` that `prompt` repeats up to `limit_at` (a page edge).
++    pub fn deepest(t: *const Tree, prompt: []const u32, limit_at: usize, step: usize) ?*Node {
+         var node = t.root;
+         var at: usize = 0;
+         var best: ?*Node = null;
+@@ -104,12 +108,12 @@ pub const Tree = struct {
+             if (p < c.pages.len) break;
+             at += p * t.page;
+             node = c;
+-            if (c.entry != null) best = c;
++            if (c.entry != null and c.end % step == 0) best = c;
+         }
+         return best;
+     }
+ 
+-    /// Pages of `tokens` (`np` whole pages) the tree holds from the start, into `path` if any; `last` the end node.
++    /// Pages of `tokens` (`np` whole pages and `ahead` more) the tree holds, into `path` if any; `last` the end node.
+     pub fn heldPrefix(t: *const Tree, tokens: []const u32, np: usize, path: ?[]u32, last: *?*Node) usize {
+         var node = t.root;
+         var pi: usize = 0;
+@@ -125,10 +129,10 @@ pub const Tree = struct {
+         return pi;
+     }
+ 
+-    /// Pages of `tokens` (whole pages) the tree holds from the start.
++    /// Pages of `tokens` (whole pages, then `ahead` tokens) the tree holds from the start.
+     pub fn have(t: *const Tree, tokens: []const u32) usize {
+         var last: ?*Node = null;
+-        return t.heldPrefix(tokens, tokens.len / t.page, null, &last);
++        return t.heldPrefix(tokens, (tokens.len -| t.ahead) / t.page, null, &last);
+     }
+ 
+     /// The pages of the path to `n`, each held once more for the caller; the nodes marked used.
+@@ -147,7 +151,7 @@ pub const Tree = struct {
+         }
+     }
+ 
+-    /// Puts `tokens` (whole pages, `mine` the caller's) in the tree, returns the end node; `path` gets the tree's page.
++    /// Puts `tokens` (whole pages, `mine` the caller's, and `ahead` more) in the tree; the end node, `path` its pages.
+     pub fn insert(t: *Tree, tokens: []const u32, mine: []const u32, path: []u32) !*Node {
+         const np = mine.len;
+         var node = t.root;
+@@ -180,7 +184,7 @@ pub const Tree = struct {
+     fn split(t: *Tree, c: *Node, p: usize) !*Node {
+         const up = try t.gpa.create(Node);
+         errdefer t.gpa.destroy(up);
+-        const head_tokens = try t.gpa.dupe(u32, c.tokens[0 .. p * t.page]);
++        const head_tokens = try t.gpa.dupe(u32, c.tokens[0 .. p * t.page + t.ahead]); // its pages, the tail's first `ahead`
+         errdefer t.gpa.free(head_tokens);
+         const head_pages = try t.gpa.dupe(u32, c.pages[0..p]);
+         errdefer t.gpa.free(head_pages);
+-- 
+2.56.0
+
