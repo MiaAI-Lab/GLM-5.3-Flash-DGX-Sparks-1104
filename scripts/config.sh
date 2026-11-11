@@ -184,6 +184,11 @@ PARALLEL="${PARALLEL:-4}"                        # --parallel: streams at once (
 PREFILL_SHARE="${PREFILL_SHARE:-0.68}"
 # TENSORFOLD_PREFILL_BUDGET: prompt rows filled in one visit while a stream waits to decode (empty: no cap)
 PREFILL_BUDGET="${PREFILL_BUDGET:-}"
+# FILL_SLICE_MS (engine patch 0122, TF_GLM_FILL_SLICE_MS): a prompt chunk's ~2.5 s of layers run as slices of about
+# this many milliseconds, the host getting a decode round between them, so a long prefill no longer freezes the
+# decoding streams for whole chunks at a time. Replies are the same bits: the kernels, their order and the commit
+# are the whole chunk's, only where its layers stop moves. Empty or 0 (default): whole chunks, as before.
+FILL_SLICE_MS="${FILL_SLICE_MS:-}"
 # auto: the largest window that fits. The first start tries CONTEXT_MAX (the model's 1,048,576), and when a rank
 # refuses it with its memory figures, starts once more with the window they allow; the window that served is kept in
 # STATE_DIR/context-fit.tsv for the next start with the same memory settings.
