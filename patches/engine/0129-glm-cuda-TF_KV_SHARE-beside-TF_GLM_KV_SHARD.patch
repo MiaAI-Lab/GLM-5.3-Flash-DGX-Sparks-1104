@@ -1,0 +1,1111 @@
+From 58c7e9a05511d06965f1a3534aed4c1c01126f6a Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] glm cuda: TF_KV_SHARE beside TF_GLM_KV_SHARD
+
+The store takes a sharded pool's parts as its pages, reclaim runs per part with a leaf filter, a resume opens in its adopted pages' part, and a sharded kept state's slot leaves the pages' latent rows on the pages (the slot was 5.8 GiB without that, one kept state in 7 GiB; with it about 252 MiB, 27 states).
+---
+ zig/src/core/kv_pool_store_test.zig           |   4 +-
+ zig/src/core/kv_prompts.zig                   |  35 +++
+ zig/src/core/prompt_radix.zig                 |  17 +-
+ zig/src/core/prompt_radix_test.zig            |  49 +++-
+ zig/src/core/prompt_radix_tree.zig            |  24 +-
+ zig/src/families/glm/cuda_kv_shard.zig        | 148 +++++++++++-
+ .../families/glm/cuda_kv_shard_keep_test.zig  |   2 +-
+ .../families/glm/cuda_kv_shard_pages_test.zig | 110 +++++++++
+ zig/src/families/glm/cuda_lanes.zig           |   4 +-
+ zig/src/families/glm/cuda_native.zig          |  62 ++++-
+ zig/src/families/glm/cuda_pages.zig           |  20 +-
+ zig/src/families/glm/cuda_pages_test.zig      |   6 +-
+ zig/src/families/glm/cuda_share.zig           |   4 +-
+ zig/src/families/glm/cuda_snapshot_layout.zig |   7 +-
+ zig/src/families/nemotron/hip/lanes.zig       |   2 +-
+ .../qwen3_5/backend/hip/engine/hip_lanes.zig  |   2 +-
+ zig/src/native/cuda_prompt_pages.zig          | 213 +++++++++++++++++-
+ 17 files changed, 653 insertions(+), 56 deletions(-)
+
+diff --git a/zig/src/core/kv_pool_store_test.zig b/zig/src/core/kv_pool_store_test.zig
+index 5958d25c..9b4d433e 100644
+--- a/zig/src/core/kv_pool_store_test.zig
++++ b/zig/src/core/kv_pool_store_test.zig
+@@ -72,7 +72,7 @@ const World = struct {
+ 
+     fn reclaim(ctx: *anyopaque, want: usize) bool {
+         const s: *radix.Store = @ptrCast(@alignCast(ctx));
+-        return s.reclaim(want);
++        return s.reclaim(want, null);
+     }
+ 
+     /// A request as the backend admits it: resume, promise the rest of its need, cover it, keep at its marks.
+@@ -181,7 +181,7 @@ fn run(w: *World, seed: u64, pages: usize) !void {
+             },
+             5...7 => if (w.streams.items.len > 0) w.end(rnd.uintLessThan(usize, w.streams.items.len)), // finish or cancel
+             8 => w.store.limit(.{ .pages = rnd.uintLessThan(usize, pages), .snaps = rnd.uintLessThan(usize, 6) }),
+-            else => _ = w.store.reclaim(rnd.uintLessThan(usize, pages)),
++            else => _ = w.store.reclaim(rnd.uintLessThan(usize, pages), null),
+         }
+         try w.check();
+     }
+diff --git a/zig/src/core/kv_prompts.zig b/zig/src/core/kv_prompts.zig
+index 8ee361ee..c89e3445 100644
+--- a/zig/src/core/kv_prompts.zig
++++ b/zig/src/core/kv_prompts.zig
+@@ -1,5 +1,6 @@
+ //! TF_KV_SHARE: what a family on the core pool calls of one prompt store over its pages (native/cuda_prompt_pages.zig).
+ const std = @import("std");
++const kv = @import("kv_pool.zig");
+ 
+ /// Where a pass resumes and the marks it keeps states at (`marks` the store's allocation, freed by `free`).
+ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+@@ -63,6 +64,40 @@ pub const Blob = struct {
+     }
+ };
+ 
++/// The pages a family's store keeps prompts in (`share_pool`'s): one pool, or a sharded pool's parts
++/// (TF_GLM_KV_SHARD's parts, each a kv_pool.Pool).
++pub const Pool = union(enum) {
++    one: *kv.Pool,
++    parts: Parts,
++};
++
++/// A sharded pool's parts as the store's pages (TF_GLM_KV_SHARD's, each part a kv_pool.Pool): global page ids in,
++/// each routed to its part's pool with the part-local id; the store's page limit is every part's, and each part's
++/// pool takes its own reclaim hook (a promise there evicts that part's idle leaves first).
++pub const Parts = struct {
++    /// The tree's page ids over the parts, the pages' four calls on `ctx` (prompt_cache.Pages').
++    retain: *const fn (ctx: *anyopaque, id: u32) void,
++    release: *const fn (ctx: *anyopaque, id: u32) void,
++    holders: *const fn (ctx: *anyopaque, id: u32) u32,
++    /// Pages free and not promised, both parts together (the store's logging only).
++    available: *const fn (ctx: *anyopaque) usize,
++    /// Bytes of one page, over every layer (the tree's held count).
++    page_bytes: u64,
++    /// The store's page limit: every part's pages.
++    total: usize,
++    /// The parts (two at TP=2, lanes.kv_parts.max_parts).
++    count: usize,
++    /// Free pages in `part` now (its part's reclaim evicts its leaves until `want` of these).
++    free: *const fn (ctx: *anyopaque, part: usize) usize,
++    /// Whether a tree leaf whose first page is `first` lies in `part` (a leaf's pages always lie in one).
++    inPart: *const fn (ctx: *anyopaque, part: usize, first: u32) bool,
++    /// Whether `ids` all lie in one part (a stream's pages do; the tree takes a leaf's pages as one).
++    onePart: *const fn (ctx: *anyopaque, ids: []const u32) bool,
++    /// `part`'s pool takes the store's reclaim hook, or drops it.
++    setReclaim: *const fn (ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void,
++    ctx: *anyopaque,
++};
++
+ /// TF_KV_SHARE=n: keep prompts as pool pages and at most n states past them (0 or unset: copies, as before).
+ pub fn sharing() error{BadKvShare}!usize {
+     const v = std.c.getenv("TF_KV_SHARE") orelse return 0;
+diff --git a/zig/src/core/prompt_radix.zig b/zig/src/core/prompt_radix.zig
+index e1fd5586..b45dabb7 100644
+--- a/zig/src/core/prompt_radix.zig
++++ b/zig/src/core/prompt_radix.zig
+@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
+ pub const Saved = tree_mod.Saved;
+ pub const Snapshots = tree_mod.Snapshots;
+ pub const Pages = tree_mod.Pages;
++pub const LeafFilter = tree_mod.LeafFilter;
+ pub const Counts = tree_mod.Counts;
+ pub const Node = tree_mod.Node;
+ pub const Tree = tree_mod.Tree;
+@@ -77,7 +78,7 @@ pub const Store = struct {
+     pub fn limit(s: *Store, limits: Limits) void {
+         s.limits = limits;
+         while (s.tree.snaps > limits.snaps) s.tree.evict(s.victim(&.{}, null) orelse break);
+-        while (s.tree.held_pages > limits.pages) if (!s.tree.evictLeaf()) break;
++        while (s.tree.held_pages > limits.pages) if (!s.tree.evictLeaf(null)) break;
+     }
+ 
+     /// Whether anything can be kept.
+@@ -296,13 +297,19 @@ pub const Store = struct {
+         return moved orelse oldest;
+     }
+ 
+-    /// Evicts until `want` pool pages are free and not promised; false when the tree cannot give that many.
+-    pub fn reclaim(s: *Store, want: usize) bool {
+-        const pages = s.tree.pages;
+-        while (pages.vtable.available(pages.ptr) < want) if (!s.tree.evictLeaf()) return false;
++    /// Evicts until `want` pages are free where `in`'s leaves lie (null: the pages' available) and not promised;
++    /// false when the tree cannot give that many.
++    pub fn reclaim(s: *Store, want: usize, in: ?tree_mod.LeafFilter) bool {
++        while (freeIn(s.tree.pages, want, in)) if (!s.tree.evictLeaf(in)) return false;
+         return true;
+     }
+ 
++    /// Whether fewer than `want` pages are free where `in`'s leaves lie (null: the pages' available).
++    fn freeIn(pages: tree_mod.Pages, want: usize, in: ?tree_mod.LeafFilter) bool {
++        const n = if (in) |x| (if (x.free) |f| f(x.ctx) else pages.vtable.available(pages.ptr)) else pages.vtable.available(pages.ptr);
++        return n < want;
++    }
++
+     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the tree holds.
+     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
+         if (@import("builtin").is_test) return;
+diff --git a/zig/src/core/prompt_radix_test.zig b/zig/src/core/prompt_radix_test.zig
+index 55bb93bf..89479cd9 100644
+--- a/zig/src/core/prompt_radix_test.zig
++++ b/zig/src/core/prompt_radix_test.zig
+@@ -268,11 +268,11 @@ test "reclaim frees the pages of the least valuable leaf nobody holds, and spare
+     var rest: [54]u32 = undefined;
+     f.lane(&rest); // the pool is full
+     try std.testing.expectEqual(@as(usize, 0), Fake.available(&f));
+-    try std.testing.expect(s.reclaim(3));
++    try std.testing.expect(s.reclaim(3, null));
+     try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
+     try std.testing.expect(s.find(&seq(26, 0)) == null);
+     for (y_pages) |id| f.refs[id] += 1; // a stream holds the other's pages
+-    try std.testing.expect(!s.reclaim(100));
++    try std.testing.expect(!s.reclaim(100, null));
+     try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
+     for (y_pages) |id| f.refs[id] -= 1;
+     s.limit(.{ .pages = 40, .snaps = 0 });
+@@ -280,6 +280,51 @@ test "reclaim frees the pages of the least valuable leaf nobody holds, and spare
+     try std.testing.expectEqual(@as(usize, 0), f.live);
+ }
+ 
++/// A leaf filter's part over the Fake's pages (a sharded pool's): part 0 the low ids, part 1 the high.
++const Part0 = struct {
++    fn leaf(_: *anyopaque, first: u32) bool {
++        return first < 32;
++    }
++    fn free(ptr: *anyopaque) usize {
++        const f: *Fake = @ptrCast(@alignCast(ptr));
++        var n: usize = 0;
++        for (f.refs[0..32]) |r| n += @intFromBool(r == 0);
++        return n;
++    }
++};
++
++test "reclaim with a leaf filter evicts only the leaves that pass, the sharded pool's part that is short" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, rules);
++    defer s.deinit();
++    s.limit(.{ .pages = 64, .snaps = 4 });
++    var mine: std.ArrayList(u32) = .empty;
++    const x = seq(24, 0); // the first pass keeps its state on the pool's low pages: part 0
++    _ = try pass(&f, &s, a, &x, 20, &.{}, &mine);
++    f.leave(mine.items);
++    var held0: [27]u32 = undefined;
++    f.lane(&held0); // part 0's free pages stay taken: the part is short, its leaves its only room
++    const y = seq(24, 100); // the second pass's pages are the pool's high ones: part 1
++    _ = try pass(&f, &s, a, &y, 20, &.{}, &mine);
++    f.leave(mine.items);
++    for (mine.items) |id| try std.testing.expect(id >= 32); // the second state's leaves are part 1's
++    try std.testing.expectEqual(@as(usize, 2), s.tree.snaps);
++    const filter: radix.LeafFilter = .{ .ctx = &f, .f = Part0.leaf, .free = Part0.free };
++    try std.testing.expect(s.reclaim(1, filter)); // the part-0 promise evicts part-0 leaves alone
++    try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
++    try std.testing.expect(s.find(&seq(26, 0)) == null); // the part-0 state went
++    try std.testing.expect(s.find(&y) != null); // the part-1 state stays
++    var again: [5]u32 = undefined;
++    f.lane(&again); // part 0 short again, and no part-0 leaf left to evict
++    try std.testing.expect(!s.reclaim(1, filter));
++    try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
++    try std.testing.expect(!s.reclaim(100, null)); // no filter: the part-1 leaf goes too, then none is left
++    try std.testing.expectEqual(@as(usize, 0), s.tree.snaps);
++}
++
+ test "a history every turn resumes again after one kept a longer state is a branch point: its turns never supersede it" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+diff --git a/zig/src/core/prompt_radix_tree.zig b/zig/src/core/prompt_radix_tree.zig
+index 2c6770ee..14ea5eff 100644
+--- a/zig/src/core/prompt_radix_tree.zig
++++ b/zig/src/core/prompt_radix_tree.zig
+@@ -10,6 +10,16 @@ pub const Snapshots = pc.Snapshots;
+ pub const Pages = pc.Pages;
+ pub const Counts = pc.Counts;
+ 
++/// Which leaves an evict may take, and how free where they lie: a sharded pool's part (cuda_prompt_pages,
++/// TF_GLM_KV_SHARD) evicts only its own leaves until `want` are free in it; null (or `free` null) takes any leaf
++/// until the pages' available says so. A leaf's pages always lie in one part.
++pub const LeafFilter = struct {
++    ctx: *anyopaque,
++    f: *const fn (ctx: *anyopaque, first: u32) bool,
++    /// Pages free where the filter's leaves lie (null: the pages' available).
++    free: ?*const fn (ctx: *anyopaque) usize = null,
++};
++
+ /// The state kept at a node's end.
+ pub const Entry = struct {
+     saved: Saved,
+@@ -244,15 +254,17 @@ pub const Tree = struct {
+         return a.used < b.used;
+     }
+ 
+-    fn weakestLeaf(t: *const Tree, n: *Node, best: *?*Node) void {
+-        if (n.parent != null and n.kids.items.len == 0 and t.idle(n) and (best.* == null or lessValuable(n, best.*.?))) best.* = n;
+-        for (n.kids.items) |k| t.weakestLeaf(k, best);
++    fn weakestLeaf(t: *const Tree, n: *Node, best: *?*Node, in: ?LeafFilter) void {
++        if (n.parent != null and n.kids.items.len == 0 and n.pages.len > 0 and t.idle(n) and
++            (in == null or in.?.f(in.?.ctx, n.pages[0])) and (best.* == null or lessValuable(n, best.*.?))) best.* = n;
++        for (n.kids.items) |k| t.weakestLeaf(k, best, in);
+     }
+ 
+-    /// Evicts the least valuable leaf nobody holds; false when there is none.
+-    pub fn evictLeaf(t: *Tree) bool {
++    /// Evicts the least valuable leaf nobody holds; false when there is none. `in`: only leaves whose first page
++    /// passes (a sharded pool's per-part reclaim evicts the part that is short's leaves alone, cuda_prompt_pages).
++    pub fn evictLeaf(t: *Tree, in: ?LeafFilter) bool {
+         var best: ?*Node = null;
+-        t.weakestLeaf(t.root, &best);
++        t.weakestLeaf(t.root, &best, in);
+         const n = best orelse return false;
+         if (n.entry != null) t.evict(n) else t.prune(n);
+         return true;
+diff --git a/zig/src/families/glm/cuda_kv_shard.zig b/zig/src/families/glm/cuda_kv_shard.zig
+index 9b3707fa..1473c08e 100644
+--- a/zig/src/families/glm/cuda_kv_shard.zig
++++ b/zig/src/families/glm/cuda_kv_shard.zig
+@@ -296,17 +296,26 @@ pub const Parts = struct {
+     }
+ 
+     /// Rank 0: slot `slot` takes `n` pages of part `part` (`ids` the global ids, row order), and with `twin` pages a
+-    /// twin of that many in the other part when it has them (counted when it has not).
+-    pub fn open(p: *Parts, slot: usize, part: u8, n: usize, twin: usize) !void {
++    /// twin of that many in the other part when it has them (counted when it has not). `adopted` (a TF_KV_SHARE
++    /// resume's, the shared store's pages it held, all of `part`): the head of the lease, held once more by it —
++    /// they are already the tree's, as kv.Pool.adopt holds them for one pool; the rest promised and covered here.
++    pub fn open(p: *Parts, slot: usize, part: u8, n: usize, twin: usize, adopted: []const u32) !void {
+         const s = &p.slots[slot];
+         if (s.used or part > 1) return error.SlotTaken;
++        if (adopted.len > n) return error.PromptTooLong;
++        for (adopted) |id| if (partOf(id, p.h) != part) return error.KvShardPlacement; // a stream's pages lie in one part
+         const pool = &p.pools[part];
+-        try pool.promise(&s.lease, n);
++        // a resume's home is its adopted pages' part and there it stays: no fall-back to the other part (LaneMemory)
++        try pool.promise(&s.lease, n - adopted.len);
+         errdefer pool.finish(&s.lease);
+-        try pool.cover(&s.lease, n, null);
+         s.ids.clearRetainingCapacity();
+         try s.ids.ensureTotalCapacity(p.gpa, n);
+-        for (s.lease.ids.items) |id| s.ids.appendAssumeCapacity(@intCast(id + part * p.h));
++        if (adopted.len > 0) for (adopted) |id| {
++            try pool.adopt(&s.lease, &.{@intCast(id - part * p.h)});
++            try s.ids.append(p.gpa, id);
++        };
++        try pool.cover(&s.lease, n, null);
++        for (s.lease.ids.items[adopted.len..]) |id| s.ids.appendAssumeCapacity(@intCast(id + part * p.h));
+         s.part = part;
+         s.used = true;
+         s.twin.clearRetainingCapacity();
+@@ -407,6 +416,54 @@ pub const Parts = struct {
+         }
+         p.counts.into(out);
+     }
++
++    // -- the shared store's pages over the parts (TF_KV_SHARE with sharding, core.kv_prompts.Pool.parts) ---------------
++
++    /// The store's one more holder of page `id`: its part's pool, the part-local id.
++    pub fn retain(p: *Parts, id: u32) void {
++        const part = partOf(id, p.h);
++        p.pools[part].retain(id - @as(u32, @intCast(part * p.h)));
++    }
++
++    /// The store's hold of page `id` gone; the last holder's release frees the page in its part's pool.
++    pub fn release(p: *Parts, id: u32) void {
++        const part = partOf(id, p.h);
++        p.pools[part].release(id - @as(u32, @intCast(part * p.h)));
++    }
++
++    /// How many hold page `id`: each lease that maps it, and the store.
++    pub fn holders(p: *const Parts, id: u32) u32 {
++        const part = partOf(id, p.h);
++        return p.pools[part].holders(id - @as(u32, @intCast(part * p.h)));
++    }
++
++    /// Pages free and not promised, both parts together (the store's logging only).
++    pub fn available(p: *const Parts) usize {
++        return p.pools[0].available() + p.pools[1].available();
++    }
++
++    /// Free pages in part `part` now: its part's reclaim evicts its leaves until `want` of these.
++    pub fn free(p: *const Parts, part: usize) usize {
++        return p.pools[part].available();
++    }
++
++    /// Whether a tree leaf whose first page is `first` lies in part `part` (a leaf's pages always do).
++    pub fn inPart(p: *const Parts, part: usize, first: u32) bool {
++        return partOf(first, p.h) == part;
++    }
++
++    /// Whether `ids` all lie in one part (a stream's pages do; the tree takes a leaf's pages as one).
++    pub fn onePart(p: *const Parts, ids: []const u32) bool {
++        const part = partOf(ids[0], p.h);
++        for (ids) |id| if (partOf(id, p.h) != part) return false;
++        return true;
++    }
++
++    /// Part `part`'s pool takes the store's reclaim hook (or drops it): a promise there evicts the part's idle
++    /// leaves before it fails.
++    pub fn setReclaim(p: *Parts, part: usize, hook: ?kv.Reclaim) void {
++        p.pools[part].reclaim = hook;
++    }
+ };
+ 
+ /// The ownership counters rank 0 reports (each rank counts its own exchanges; rank 0's are reported).
+@@ -545,14 +602,14 @@ test "kv shard: parts place home first, then fewer live streams, then more free
+     defer p.deinit();
+     try std.testing.expectEqual(@as(?u8, 0), p.choose(2, null)); // a tie: the lower index
+     try std.testing.expectEqual(@as(?u8, 1), p.choose(2, 1)); // home first
+-    try p.open(0, 0, 3, 0);
++    try p.open(0, 0, 3, 0, &.{});
+     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, p.slots[0].ids.items);
+     try std.testing.expectEqual(@as(?u8, 1), p.choose(2, null)); // fewer live streams
+     try std.testing.expectEqual(@as(?u8, 0), p.choose(2, 0)); // home, though it has more streams
+-    try p.open(1, 1, 7, 0);
++    try p.open(1, 1, 7, 0, &.{});
+     try std.testing.expectEqual(@as(usize, 8), p.slots[1].ids.items[0] / 8 * 8); // part 1's ids from 8
+     try std.testing.expectEqual(@as(?u8, 0), p.choose(2, 1)); // home lacks the room: the other
+-    try p.open(2, 0, 2, 0); // part 0: 5 of 8 pages, 2 streams; part 1: 7 of 8, 1 stream
++    try p.open(2, 0, 2, 0, &.{}); // part 0: 5 of 8 pages, 2 streams; part 1: 7 of 8, 1 stream
+     try std.testing.expectEqual(@as(?u8, 1), p.choose(1, null)); // fewer live streams, though fewer free pages
+     try std.testing.expectEqual(@as(?u8, null), p.choose(4, null));
+     // a twin of 2 pages for slot 1 (part 1) in part 0, all or none: 3 free there
+@@ -579,8 +636,8 @@ test "kv shard: a follower maps rank 0's places and digests them alike; a missed
+     defer lead.deinit();
+     var other = try Parts.init(gpa, 16, 4096, 3, false);
+     defer other.deinit();
+-    try lead.open(0, 1, 5, 3);
+-    try lead.open(2, 0, 4, 0);
++    try lead.open(0, 1, 5, 3, &.{});
++    try lead.open(2, 0, 4, 0, &.{});
+     try other.map(0, lead.slots[0].ids.items, lead.slots[0].twin.items);
+     try other.map(2, lead.slots[2].ids.items, lead.slots[2].twin.items);
+     try std.testing.expectEqual(lead.digest(), other.digest());
+@@ -618,7 +675,7 @@ test "kv shard: each guard's mutant is caught by its test" {
+     mutant = .home_ignored;
+     try std.testing.expect(p.choose(2, 1).? != 1);
+     mutant = .none;
+-    try p.open(0, 0, 2, 2); // part 0: 6 free, 1 stream; part 1: 6 free (its twin), none
++    try p.open(0, 0, 2, 2, &.{}); // part 0: 6 free, 1 stream; part 1: 6 free (its twin), none
+     try std.testing.expectEqual(@as(?u8, 1), p.choose(1, null));
+     mutant = .live_ignored;
+     try std.testing.expectEqual(@as(?u8, 0), p.choose(1, null)); // more free pages alone
+@@ -629,3 +686,72 @@ test "kv shard: each guard's mutant is caught by its test" {
+     mutant = .digest_no_twin;
+     try std.testing.expectEqual(p.digest(), q.digest()); // the twin's absence on q goes unseen
+ }
++
++test "kv shard: the parts are the shared store's pages: a global id routes to its part's pool, the sum is free" {
++    const gpa = std.testing.allocator;
++    var p = try Parts.init(gpa, 8, 4096, 2, true);
++    defer p.deinit();
++    var lease: kv.Lease = .{};
++    try p.pools[1].promise(&lease, 3);
++    try p.pools[1].cover(&lease, 3, null); // a part-1 stream: part-local ids 0, 1, 2, global 8, 9, 10
++    defer p.pools[1].finish(&lease);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, lease.ids.items);
++    try std.testing.expectEqual(@as(u32, 1), p.holders(8)); // the lease's alone, by its global id
++    p.retain(8); // the store's hold: part 1's pool, its page 0
++    try std.testing.expectEqual(@as(u32, 2), p.holders(8));
++    try std.testing.expectEqual(@as(usize, 13), p.available()); // the sum of the parts
++    try std.testing.expectEqual(@as(usize, 13), p.free(0) + p.free(1));
++    p.release(8);
++    try std.testing.expectEqual(@as(u32, 1), p.holders(8));
++    try std.testing.expect(p.onePart(&.{ 8, 10 }) and !p.onePart(&.{ 8, 3 }));
++    try std.testing.expect(p.inPart(1, 9) and !p.inPart(0, 9));
++    var probe: u8 = 0;
++    p.setReclaim(1, .{ .ctx = &probe, .call = partReclaimProbe });
++    try std.testing.expect(p.pools[1].reclaim != null and p.pools[0].reclaim == null);
++    p.setReclaim(1, null);
++    try std.testing.expect(p.pools[1].reclaim == null);
++}
++
++fn partReclaimProbe(_: *anyopaque, _: usize) bool {
++    return false;
++}
++
++test "kv shard: a resume opens in its adopted pages' part, their hold passing to the lease; a short home waits" {
++    const gpa = std.testing.allocator;
++    var p = try Parts.init(gpa, 8, 4096, 4, true);
++    defer p.deinit();
++    // a keep in part 1: a stream there, the store taking two of its pages (global ids 9, 10)
++    try p.open(0, 1, 3, 0, &.{});
++    const kept = [_]u32{ 9, 10 };
++    for (kept) |id| {
++        p.retain(id); // the tree's own hold on the page
++        p.retain(id); // the begin's hold for the resume it offered the pages to
++    }
++    p.close(0); // the stream's pages back, the store's stay
++    try std.testing.expectEqual(@as(usize, 2), p.holders(9));
++    var lease: kv.Lease = .{};
++    try p.pools[1].promise(&lease, 1);
++    try p.pools[1].cover(&lease, 1, null); // another stream: part 1 has room
++    defer p.pools[1].finish(&lease);
++    // a resume adopts them into part 1, one fresh page beside: the begin's hold becomes the lease's
++    try p.open(1, 1, 3, 0, &kept);
++    try std.testing.expectEqualSlices(u32, &kept, p.slots[1].ids.items[0..2]);
++    try std.testing.expectEqual(@as(usize, 2), p.holders(9)); // the tree's and the lease's
++    try std.testing.expectEqual(@as(usize, 4), p.free(1)); // 8 - the other stream's - the resume's two adopted and one fresh
++    p.close(1);
++    try std.testing.expectEqual(@as(usize, 1), p.holders(9)); // the lease's hold went with it, the tree's stays
++    // the store's pages released, part 1 whole again
++    for (kept) |id| p.release(id);
++    try std.testing.expectEqual(@as(usize, 7), p.free(1));
++    // a resume whose home part lacks room waits (LaneMemory), it never moves to the other part
++    var full: kv.Lease = .{};
++    try p.pools[1].promise(&full, 7);
++    try p.pools[1].cover(&full, 7, null);
++    defer p.pools[1].finish(&full);
++    try std.testing.expectError(error.LaneMemory, p.open(2, 1, 3, 0, &kept));
++    try std.testing.expect(!p.slots[2].used);
++    try std.testing.expectEqual(@as(usize, 8), p.free(0)); // part 0 untouched by the waiting resume
++    // adopted pages of another part than the resume's home are refused
++    try std.testing.expectError(error.KvShardPlacement, p.open(2, 0, 3, 0, &kept));
++    try std.testing.expectError(error.KvShardPlacement, p.open(2, 1, 3, 0, &.{ 0, 9 }));
++}
+diff --git a/zig/src/families/glm/cuda_kv_shard_keep_test.zig b/zig/src/families/glm/cuda_kv_shard_keep_test.zig
+index 623d83e2..530f445b 100644
+--- a/zig/src/families/glm/cuda_kv_shard_keep_test.zig
++++ b/zig/src/families/glm/cuda_kv_shard_keep_test.zig
+@@ -91,7 +91,7 @@ test "kv shard parts: random admissions, twins and ends on two ranks: every page
+                 const home: ?u8 = if (rnd.boolean()) rnd.uintLessThan(u8, 2) else null;
+                 const part = lead.choose(n, home) orelse continue;
+                 if (home) |hp| if (lead.pools[hp].fits(n)) try expectEqual(hp, part);
+-                try lead.open(slot, part, n, if (rnd.boolean()) rnd.intRangeAtMost(usize, 1, n) else 0);
++                try lead.open(slot, part, n, if (rnd.boolean()) rnd.intRangeAtMost(usize, 1, n) else 0, &.{});
+                 try other.map(slot, s.ids.items, s.twin.items);
+             },
+             2 => if (s.used) {
+diff --git a/zig/src/families/glm/cuda_kv_shard_pages_test.zig b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+index edaddb27..b4b1bef6 100644
+--- a/zig/src/families/glm/cuda_kv_shard_pages_test.zig
++++ b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+@@ -306,6 +306,37 @@ test "kv shard pages: a kept state's plan walks the latent rows by the latent ta
+     };
+ }
+ 
++test "kv shard pages: a kept state's plan past the shared store's pages leaves their latent rows on the pages" {
++    const gpa = std.testing.allocator;
++    const layout = @import("cuda_snapshot_layout.zig");
++    var f: Fake = undefined;
++    Fake.reset();
++    try f.init(gpa, 1, true);
++    const p = try f.pool(3, 20, false);
++    defer f.deinit(p);
++    try p.mapWith(1, &.{ 12, 9, 14 }, 0, 0);
++    const st = f.st(1);
++    const at = 1200;
++    const whole = try layout.Plan.initForShared(st, &f.e.w.config, at, null, 0, true, st.cur);
++    const past = try layout.Plan.initForShared(st, &f.e.w.config, at, null, 2, true, st.cur); // the store holds 2 pages
++    // the two pages' 1,024 rows of codes and scales stay on the pages, with their pooled keys
++    try expect(whole.len - past.len >= 1024 * (512 + 4));
++    var lat: usize = 0;
++    for (past.parts[0..past.count]) |part| {
++        if (!part.lat) continue;
++        lat += 1;
++        try expectEqual(2 * part.span, part.from);
++        try expectEqual((at - 1024) * (part.span / 512), part.len);
++        // the first byte it copies is row 1,024: the stream's third page (latent page 6 of this rank's arena)
++        try expectEqual(part.live + 6 * part.page, past.piece(part, 0).live);
++    }
++    try expectEqual(@as(usize, 2), lat);
++    // a state wholly on the store's pages copies no latent row, sized or planned
++    const grid = try layout.Plan.sizeForShared(st, &f.e.w.config, st.capacity, 1024, null, 2, true, st.cur);
++    const bare = try layout.Plan.sizeForShared(st, &f.e.w.config, st.capacity, 1024, null, 2, false, st.cur);
++    try expectEqual(bare, grid);
++}
++
+ test "kv shard pages: a stream resuming a kept state is seated in the state's home part, the lanes' view of it" {
+     const gpa = std.testing.allocator;
+     const Lanes = @import("cuda_lanes.zig").Lanes;
+@@ -330,3 +361,82 @@ test "kv shard pages: a stream resuming a kept state is seated in the state's ho
+     _ = try ln.seat(&streams[1], 600, 100, &.{}); // no kept state: the part with fewer live streams
+     try expectEqual(@as(u8, 0), f.st(ln.lanes.get(&streams[1]).?.slot).hold.?.owner);
+ }
++
++test "kv shard pages: a share resume seats in its adopted pages' part, no twin, and waits there when it lacks room" {
++    const gpa = std.testing.allocator;
++    const Lanes = @import("cuda_lanes.zig").Lanes;
++    const lanes = @import("lanes");
++    const kv = @import("core").kv_pool;
++    var f: Fake = undefined;
++    Fake.reset();
++    try f.init(gpa, 0, true);
++    const p = try f.pool(4, 20, true); // two parts of 8
++    defer f.deinit(p);
++    const x = p.shard.?;
++    // the store's two pages in part 1 (global 8, 9): a keep left them, a begin holds them once more
++    var lease: kv.Lease = .{};
++    try x.parts.pools[1].promise(&lease, 2);
++    try x.parts.pools[1].cover(&lease, 2, null);
++    const adopted = [_]u32{ lease.ids.items[0] + 8, lease.ids.items[1] + 8 };
++    for (adopted) |id| {
++        x.parts.retain(id); // the tree's own hold on the page
++        x.parts.retain(id); // the begin's hold for the resume it offered the pages to
++    }
++    x.parts.pools[1].finish(&lease); // the stream's lease goes, the store's two holds stay
++    var ln: Lanes = .{ .x = .{ .e = &f.e, .link = undefined } };
++    defer ln.lanes.deinit(gpa);
++    var s: lanes.Stream = undefined;
++    s.reuse = .{};
++    _ = try ln.seat(&s, 600, 100, &adopted); // part 0 has more free: the adopted pages' part wins
++    const slot = ln.lanes.get(&s).?.slot;
++    try expectEqual(@as(u8, 1), f.st(slot).hold.?.owner);
++    try expectEqualSlices(u32, &adopted, f.st(slot).pages[0..2]);
++    for (adopted) |id| try expectEqual(@as(u32, 2), x.parts.holders(id)); // the tree's and the lease's
++    try expectEqual(@as(usize, 0), p.twinCount(slot)); // no twin: the pass runs owner-computed
++    p.close(slot);
++    for (adopted) |id| try expectEqual(@as(u32, 1), x.parts.holders(id)); // the lease's hold went, the tree's stays
++    // part 1 full of other streams' pages: the resume waits there (LaneMemory), it never moves to part 0
++    var full: kv.Lease = .{};
++    try x.parts.pools[1].promise(&full, 6);
++    try x.parts.pools[1].cover(&full, 6, null);
++    for (adopted) |id| x.parts.retain(id); // a fresh begin's hold for this resume
++    var w: lanes.Stream = undefined;
++    w.reuse = .{};
++    try std.testing.expectError(error.LaneMemory, ln.seat(&w, 1500, 100, &adopted)); // 4 pages: 2 fresh past the adopted
++    for (adopted) |id| try expectEqual(@as(u32, 1), x.parts.holders(id)); // the failed seat gave the begin's hold back
++    x.parts.pools[1].finish(&full);
++}
++
++test "kv shard pages: the follower maps a begin whose leading ids are the store's, and the digests agree" {
++    const gpa = std.testing.allocator;
++    const kv = @import("core").kv_pool;
++    var lead: Fake = undefined;
++    Fake.reset();
++    try lead.init(gpa, 0, true);
++    const p0 = try lead.pool(3, 20, true); // two parts of 8
++    defer lead.deinit(p0);
++    const x0 = p0.shard.?;
++    // the store's two pages in part 1, a begin's holds beside the tree's own (a keep left them)
++    var lease: kv.Lease = .{};
++    try x0.parts.pools[1].promise(&lease, 2);
++    try x0.parts.pools[1].cover(&lease, 2, null);
++    const adopted = [_]u32{ lease.ids.items[0] + 8, lease.ids.items[1] + 8 };
++    for (adopted) |id| {
++        x0.parts.retain(id);
++        x0.parts.retain(id);
++    }
++    x0.parts.pools[1].finish(&lease);
++    const wire = try gpa.dupe(u32, try p0.openWith(1, 1500, 100, null, &adopted)); // 4 pages in part 1, no twin
++    defer gpa.free(wire);
++    try expectEqualSlices(u32, &adopted, wire[0..2]);
++    try expectEqual(@as(usize, 0), p0.twinCount(1));
++    var other: Fake = undefined;
++    try other.init(gpa, 1, true);
++    const p1 = try other.pool(3, 20, false);
++    defer other.deinit(p1);
++    try p1.mapWith(1, wire, 0, adopted.len); // the begin's ids, the store's first: mapped, not poisoned
++    const s = other.st(1);
++    try expectEqualSlices(u32, wire, F.table(s.table, wire.len));
++    try expectEqual(kvs.Hold{ .owner = 1 }, s.hold.?); // owner-computed pass: rank 0 alone holds the rows
++    try expectEqual(p0.digest(), p1.digest()); // the adopted pages are in the slot's ids, so in the digest
++}
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 86659ad5..bffd1495 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -374,7 +374,9 @@ pub const Lanes = struct {
+             _ = self.lanes.remove(s);
+         }
+         const sharded = self.x.e.settings.kv_shard.on and if (self.x.e.pages) |p| p.shard != null else false; // only then is a kept state's part read
+-        const pages = try self.pagesFor(l.slot, prompt, max_new, if (sharded) self.homeOf(s) else null, adopted);
++        // sharded: the stream's home is the kept state's part, or a share resume's its adopted pages' (TF_KV_SHARE)
++        const home: ?u8 = if (!sharded) null else if (adopted.len > 0) self.x.e.pages.?.partOf(adopted[0]) else self.homeOf(s);
++        const pages = try self.pagesFor(l.slot, prompt, max_new, home, adopted);
+         try self.x.bind(l.slot);
+         return pages;
+     }
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 06810756..e0017aad 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -15,6 +15,7 @@ const dflash = @import("dflash.zig");
+ const dflash_load = @import("dflash_load.zig");
+ const pages_mod = @import("cuda_pages.zig");
+ const share_mod = @import("cuda_share.zig");
++const kvs = @import("cuda_kv_shard.zig");
+ const kp = @import("core").kv_prompts;
+ const kv = @import("core").kv_pool;
+ 
+@@ -234,7 +235,8 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
+     const roce_bytes = a.roce_bytes;
+     // TF_KV_SHARE keeps prompts as the pool's pages: refused before the weights load, every rank told (startup)
+     if (a.share > 0 and !set.pages) return error.GlmShareNeedsPages;
+-    if (a.share > 0 and set.kv_shard.on) return error.KvShareWithShard; // T05 lifts this: one store over the parts
++    // TF_KV_SHARE with TF_GLM_KV_SHARD: one store over the parts (T05); sharding's own refusals still run, among
++    // them --parallel 2 at least (KvShardNeedsParallel at the attach), which share under sharding needs too
+     cuda.memory_receipt.emit(@intCast(p.rank), .load_begin, true); // the four phases tools/memory_receipts.py reads
+     const own = try gpa.create(Owned);
+     errdefer gpa.destroy(own);
+@@ -457,11 +459,62 @@ pub fn snap_restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anye
+     o.pending = @ptrCast(@alignCast(saved));
+ }
+ 
+-/// TF_KV_SHARE: the pool the shared store keeps prompts in, rank 0's pages (null: a window a stream).
+-pub fn share_pool(ptr: *anyopaque) ?*kv.Pool {
++/// TF_KV_SHARE: the pool the shared store keeps prompts in — rank 0's pages, or sharded the pool's parts
++/// (core.kv_prompts.Pool; null: a window a stream).
++pub fn share_pool(ptr: *anyopaque) ?kp.Pool {
+     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+     const p = e.pages orelse return null;
+-    return &p.pool;
++    if (p.shard) |x| return .{ .parts = .{
++        .retain = partsRetain,
++        .release = partsRelease,
++        .holders = partsHolders,
++        .available = partsAvailable,
++        .page_bytes = x.g.wholePage(),
++        .total = 2 * x.parts.h,
++        .count = 2,
++        .free = partsFree,
++        .inPart = partsInPart,
++        .onePart = partsOnePart,
++        .setReclaim = partsSetReclaim,
++        .ctx = &x.parts,
++    } };
++    return .{ .one = &p.pool };
++}
++
++fn partsOf(ctx: *anyopaque) *kvs.Parts {
++    return @ptrCast(@alignCast(ctx));
++}
++
++fn partsRetain(ctx: *anyopaque, id: u32) void {
++    partsOf(ctx).retain(id);
++}
++
++fn partsRelease(ctx: *anyopaque, id: u32) void {
++    partsOf(ctx).release(id);
++}
++
++fn partsHolders(ctx: *anyopaque, id: u32) u32 {
++    return partsOf(ctx).holders(id);
++}
++
++fn partsAvailable(ctx: *anyopaque) usize {
++    return partsOf(ctx).available();
++}
++
++fn partsFree(ctx: *anyopaque, part: usize) usize {
++    return partsOf(ctx).free(part);
++}
++
++fn partsInPart(ctx: *anyopaque, part: usize, first: u32) bool {
++    return partsOf(ctx).inPart(part, first);
++}
++
++fn partsOnePart(ctx: *anyopaque, ids: []const u32) bool {
++    return partsOf(ctx).onePart(ids);
++}
++
++fn partsSetReclaim(ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void {
++    partsOf(ctx).setReclaim(part, hook);
+ }
+ 
+ /// TF_KV_SHARE: the store the prompt passes keep and resume through, on rank 0's pages (null: none).
+@@ -515,7 +568,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
+         error.GlmShareNeedsPages => "TF_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",
+         error.GlmShareTooMany => std.fmt.comptimePrint("TF_KV_SHARE keeps at most {d} states, a slot each in the startup plan: set {d} or fewer", .{ kv.most_snaps, kv.most_snaps }),
+-        error.KvShareWithShard => "TF_KV_SHARE with TF_GLM_KV_SHARD=1 is not supported yet: set one",
+         error.BadKvPages => "TF_KV_PAGES: give auto, on (or 1, all) or off (or 0)",
+         error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
+         error.NoPagedCaches => "TF_KV_PAGES: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): unset TF_KV_PAGES or set it off",
+diff --git a/zig/src/families/glm/cuda_pages.zig b/zig/src/families/glm/cuda_pages.zig
+index 2e7eb21e..02f75413 100644
+--- a/zig/src/families/glm/cuda_pages.zig
++++ b/zig/src/families/glm/cuda_pages.zig
+@@ -216,6 +216,12 @@ pub const Pages = struct {
+         return slot < p.used.len;
+     }
+ 
++    /// The part page `id` lies in under sharding (null: unsharded): a share resume's home is its adopted pages'.
++    pub fn partOf(p: *const Pages, id: u32) ?u8 {
++        const x = p.shard orelse return null;
++        return @intCast(kvs.partOf(id, x.parts.h));
++    }
++
+     /// Whether a request's pages fit now and a paged sequence is free for it. One that needs more pages than the whole
+     /// pool holds is admitted at once, so its opening refuses it (error.PoolTooSmall) instead of it waiting forever.
+     pub fn fits(p: *Pages, prompt: usize, max_tokens: usize) bool {
+@@ -257,16 +263,22 @@ pub const Pages = struct {
+ 
+     /// `open`, sharded in `home` (a kept state's part) when it has the room (cuda_kv_shard.Parts.choose), with a twin
+     /// of the prompt's pages in the other part under TF_GLM_KV_SHARD_TWINS when it has them. The ids that cross with
+-    /// the begin step: the stream's, then its twin's (`twinCount`). Unsharded with `adopted` (the shared store's pages
+-    /// a resume held, first in the lease): their rows stay as the store kept them, the rest promised and covered.
++    /// the begin step: the stream's, then its twin's (`twinCount`). With `adopted` (the shared store's pages a resume
++    /// held, first in the lease): the stream opens in their part and there it stays — no fall-back to the other part
++    /// (LaneMemory: the request waits, as a kept state's home does when carries are off), and no twin (its adopted
++    /// prefix's latent rows exist on the owner alone; the pass runs owner-computed, cuda_kv_shard_attn).
+     pub fn openWith(p: *Pages, slot: u32, prompt: usize, max_tokens: usize, home: ?u8, adopted: []const u32) ![]const u32 {
+         if (!p.paged(slot) or p.used[slot]) return error.SlotTaken;
+         if (p.shard) |x| {
+             const n = need(p.layout, prompt, max_tokens);
+             if (n > tableLen(p.e.capacity)) return error.PromptTooLong;
+             if (n > x.parts.h) return error.PoolTooSmall; // a stream's pages lie in one part
+-            const part = x.parts.choose(n, home) orelse return error.LaneMemory;
+-            try x.parts.open(slot, part, n, if (x.switches.twins) p.layout.pages(prompt) else 0);
++            if (adopted.len > n) return error.PromptTooLong;
++            const part: u8 = if (adopted.len > 0) @intCast(kvs.partOf(adopted[0], x.parts.h)) else (x.parts.choose(n, home) orelse return error.LaneMemory);
++            var held = adopted.len > 0; // the begin's holds, given back if no lease takes them (as unsharded)
++            errdefer if (held) for (adopted) |id| x.parts.release(id);
++            try x.parts.open(slot, part, n, if (adopted.len == 0 and x.switches.twins) p.layout.pages(prompt) else 0, adopted);
++            held = false;
+             errdefer x.parts.close(slot);
+             try p.mappedShard(slot, true);
+             const sl = &x.parts.slots[slot];
+diff --git a/zig/src/families/glm/cuda_pages_test.zig b/zig/src/families/glm/cuda_pages_test.zig
+index 8fd5dfa2..3f40bd84 100644
+--- a/zig/src/families/glm/cuda_pages_test.zig
++++ b/zig/src/families/glm/cuda_pages_test.zig
+@@ -410,7 +410,7 @@ const Store = struct {
+         return @ptrCast(@alignCast(ctx));
+     }
+     fn open(x: *Store, gpa: std.mem.Allocator, e: *Engine, states: radix.Snapshots, snaps: usize) !void {
+-        const pool = native.share_pool(e).?;
++        const pool = native.share_pool(e).?.one;
+         const rules: radix.Rules = .{ .page = page_rows, .planned = true, .grid = native.snap_grid, .lookahead = 1, .min_prompt = 0, .tail = true };
+         x.* = .{ .gpa = gpa, .store = try radix.Store.init(gpa, states, radix.pagesOf(kv.Pool, pool, pool.page_bytes), rules) };
+         x.store.limit(.{ .pages = pool.total(), .snaps = snaps });
+@@ -419,11 +419,11 @@ const Store = struct {
+     }
+     fn close(x: *Store, e: *Engine) void {
+         native.share_attach(e, null);
+-        native.share_pool(e).?.reclaim = null;
++        native.share_pool(e).?.one.reclaim = null;
+         x.store.deinit();
+     }
+     fn reclaim(ctx: *anyopaque, want: usize) bool {
+-        return of(ctx).store.reclaim(want);
++        return of(ctx).store.reclaim(want, null);
+     }
+     fn begin(ctx: *anyopaque, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!kp.Plan {
+         const x = of(ctx);
+diff --git a/zig/src/families/glm/cuda_share.zig b/zig/src/families/glm/cuda_share.zig
+index 03032856..c4fdc591 100644
+--- a/zig/src/families/glm/cuda_share.zig
++++ b/zig/src/families/glm/cuda_share.zig
+@@ -79,8 +79,10 @@ pub const Keeps = struct {
+         const p = k.e.pages.?;
+         if (!p.paged(k.slot)) return;
+         const n = mark / page_rows;
+-        const ids = p.leases[k.slot].ids.items;
++        // sharded (TF_GLM_KV_SHARD): the stream's pages are its part slot's global ids; unsharded its lease's
++        const ids: []const u32 = if (p.shard) |x| x.parts.slots[k.slot].ids.items else p.leases[k.slot].ids.items;
+         if (n > ids.len) return;
++        if (p.shard) |x| std.debug.assert(x.parts.onePart(ids[0..n])); // a leaf's pages always lie in one part
+         const path = k.e.gpa.alloc(u32, n) catch return;
+         defer k.e.gpa.free(path);
+         var owner: Owner = .{};
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index bacc78a2..2755d9d0 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -136,10 +136,11 @@ pub const Plan = struct {
+     /// A cache's latent codes or scales: `addCache`, and sharded (a latent table of its own) on its latent pages.
+     fn addLatent(p: *Plan, st: *const State, x: cache.Caches, live: u64, len: usize, span: usize) !void {
+         if (x.lpt == 0) return p.addCache(st, x, live, len, span);
+-        if (len == 0) return;
++        const from = @min(len, p.shared * span); // the store's pages keep their latent rows too (a part's pages)
++        if (len == from) return;
+         if ((!p.sizing and (len - 1) / span >= p.lids.len) or p.count == p.parts.len) return error.SnapshotShape;
+-        p.len = try std.math.add(usize, p.len, len);
+-        p.parts[p.count] = .{ .live = live, .len = len, .span = span, .page = x.lps, .lat = true };
++        p.len = try std.math.add(usize, p.len, len - from);
++        p.parts[p.count] = .{ .live = live, .len = len - from, .span = span, .page = x.lps, .lat = true, .from = from };
+         p.count += 1;
+     }
+ 
+diff --git a/zig/src/families/nemotron/hip/lanes.zig b/zig/src/families/nemotron/hip/lanes.zig
+index d639b304..b9ef819b 100644
+--- a/zig/src/families/nemotron/hip/lanes.zig
++++ b/zig/src/families/nemotron/hip/lanes.zig
+@@ -275,7 +275,7 @@ pub const Hip = struct {
+         // pages for the whole request are promised now, so no round runs out of them
+         const total = prompt.len + s.max_new + max_window + 1;
+         const need = pages.pagesFor(total);
+-        if (!h.prefix.store.reclaim(need)) return error.OutOfPages;
++        if (!h.prefix.store.reclaim(need, null)) return error.OutOfPages;
+         l.s.promised = need;
+         e.pool.ids.reserved += need;
+         // a request resumes from the deepest state the prompt cache holds and keeps its own marks
+diff --git a/zig/src/families/qwen3_5/backend/hip/engine/hip_lanes.zig b/zig/src/families/qwen3_5/backend/hip/engine/hip_lanes.zig
+index 4f1623f0..9c386922 100644
+--- a/zig/src/families/qwen3_5/backend/hip/engine/hip_lanes.zig
++++ b/zig/src/families/qwen3_5/backend/hip/engine/hip_lanes.zig
+@@ -238,7 +238,7 @@ pub const Hip = struct {
+         h.matched.clearRetainingCapacity();
+         // pages for the whole request are promised now, so no round runs out of them
+         const need = pages.pagesFor(lane.caches.total) - adopted;
+-        if (!h.prefix.store.reclaim(need)) return error.OutOfPages;
++        if (!h.prefix.store.reclaim(need, null)) return error.OutOfPages;
+         lane.caches.promised = need;
+         h.e.pool.ids.reserved += need;
+         _ = try lane.caches.grow(h.gpa, prompt.len);
+diff --git a/zig/src/native/cuda_prompt_pages.zig b/zig/src/native/cuda_prompt_pages.zig
+index b0454947..cfdcf7bb 100644
+--- a/zig/src/native/cuda_prompt_pages.zig
++++ b/zig/src/native/cuda_prompt_pages.zig
+@@ -27,14 +27,16 @@ pub fn hint(comptime F: type, loaded: anytype) []const u8 {
+ /// The store over the family's pool: its pages in the tree, the rest of a state from the family's `snap_*` decls.
+ pub const Adapter = struct {
+     gpa: Allocator,
+-    pool: *kv.Pool,
++    src: hooks.Pool, // the family's pages: one pool, or a sharded pool's parts (each part its own reclaim below)
+     store: radix.Store,
++    part: [2]Part = undefined, // each part's reclaim hook (the parts variant)
+     detach: *const fn (*anyopaque) void,
+     target: *anyopaque,
+ 
+-    /// The family's store, its pool's reclaim evicting the tree's idle pages; null: the family has no pool.
++    /// The family's store, its pool's reclaim evicting the tree's idle pages — one pool's all of them, a sharded
++    /// pool's each part its own leaves (below); null: the family has no pool.
+     pub fn open(comptime F: type, gpa: Allocator, target: anytype, page_tokens: u32, snap_limit: usize) !?*Adapter {
+-        const pool = F.share_pool(target) orelse return null;
++        const src = F.share_pool(target) orelse return null;
+         const x = try gpa.create(Adapter);
+         errdefer gpa.destroy(x);
+         var rules = snaps.cacheRules(F);
+@@ -46,13 +48,61 @@ pub const Adapter = struct {
+         rules.min_gap = 256;
+         rules.tail = true;
+         const copies: radix.Snapshots = .{ .ptr = target, .vtable = &snaps.Snaps(F, null).vtable };
+-        x.* = .{ .gpa = gpa, .pool = pool, .store = try radix.Store.init(gpa, copies, radix.pagesOf(kv.Pool, pool, pool.page_bytes), rules), .detach = Detach(F).call, .target = target };
+-        x.store.limit(.{ .pages = pool.total(), .snaps = snap_limit });
+-        pool.reclaim = .{ .ctx = x, .call = reclaim }; // a promise or a hold evicts the tree's idle pages before it fails
++        x.* = .{ .gpa = gpa, .src = src, .store = undefined, .detach = Detach(F).call, .target = target };
++        x.store = try radix.Store.init(gpa, copies, x.pages(), rules);
++        switch (src) {
++            .one => |pool| pool.reclaim = .{ .ctx = x, .call = reclaim }, // a promise or a hold evicts the tree's idle pages before it fails
++            .parts => |s| for (0..s.count) |i| { // a part's promise evicts its own leaves first (its hook below)
++                x.part[i] = .{ .x = x, .at = i };
++                s.setReclaim(s.ctx, i, .{ .ctx = &x.part[i], .call = reclaimPart });
++            },
++        }
++        x.store.limit(.{ .pages = switch (src) {
++            .one => |pool| pool.total(),
++            .parts => |s| s.total,
++        }, .snaps = snap_limit });
+         F.share_attach(target, .{ .ctx = x, .vtable = &vtable });
+         return x;
+     }
+ 
++    /// The tree's page ids over this source: one pool's, or a sharded pool's parts' (its calls on its place here).
++    fn pages(x: *Adapter) radix.Pages {
++        return switch (x.src) {
++            .one => |pool| radix.pagesOf(kv.Pool, pool, pool.page_bytes),
++            .parts => |*s| .{ .ptr = s, .bytes = s.page_bytes, .vtable = &partsPages },
++        };
++    }
++
++    /// The parts' pages as the tree takes them: each call through the family's own (hooks.Parts', ctx its parts).
++    const partsPages: radix.Pages.VTable = .{
++        .retain = PartsPages.retain,
++        .release = PartsPages.release,
++        .holders = PartsPages.holders,
++        .available = PartsPages.available,
++    };
++
++    const PartsPages = struct {
++        fn parts(ptr: *anyopaque) *const hooks.Parts {
++            return @ptrCast(@alignCast(ptr));
++        }
++        fn retain(ptr: *anyopaque, id: u32) void {
++            const s = parts(ptr);
++            s.retain(s.ctx, id);
++        }
++        fn release(ptr: *anyopaque, id: u32) void {
++            const s = parts(ptr);
++            s.release(s.ctx, id);
++        }
++        fn holders(ptr: *anyopaque, id: u32) u32 {
++            const s = parts(ptr);
++            return s.holders(s.ctx, id);
++        }
++        fn available(ptr: *anyopaque) usize {
++            const s = parts(ptr);
++            return s.available(s.ctx);
++        }
++    };
++
+     fn Detach(comptime F: type) type {
+         return struct {
+             fn call(target: *anyopaque) void {
+@@ -64,7 +114,10 @@ pub const Adapter = struct {
+     /// The family stops calling, the pool's reclaim goes, the tree drops its states and releases its pages.
+     pub fn close(x: *Adapter) void {
+         x.detach(x.target);
+-        x.pool.reclaim = null;
++        switch (x.src) {
++            .one => |pool| pool.reclaim = null,
++            .parts => |s| for (0..s.count) |i| s.setReclaim(s.ctx, i, null),
++        }
+         x.store.deinit();
+         x.gpa.destroy(x);
+     }
+@@ -74,7 +127,28 @@ pub const Adapter = struct {
+     }
+ 
+     fn reclaim(ctx: *anyopaque, want: usize) bool {
+-        return of(ctx).store.reclaim(want);
++        return of(ctx).store.reclaim(want, null);
++    }
++
++    /// A sharded pool's part as its pool's reclaim hook: evict the tree's idle leaves of this part until `want`
++    /// pages are free in it — never the other part's, whose rank's streams do not wait on this one.
++    const Part = struct { x: *Adapter, at: usize };
++
++    fn reclaimPart(ctx: *anyopaque, want: usize) bool {
++        const h: *Part = @ptrCast(@alignCast(ctx));
++        return h.x.store.reclaim(want, .{ .ctx = h, .f = leafInPart, .free = partFree });
++    }
++
++    fn leafInPart(ctx: *anyopaque, first: u32) bool {
++        const h: *Part = @ptrCast(@alignCast(ctx));
++        const s = h.x.src.parts;
++        return s.inPart(s.ctx, h.at, first);
++    }
++
++    fn partFree(ctx: *anyopaque) usize {
++        const h: *Part = @ptrCast(@alignCast(ctx));
++        const s = h.x.src.parts;
++        return s.free(s.ctx, h.at);
+     }
+ 
+     fn begin(ctx: *anyopaque, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!hooks.Plan {
+@@ -110,8 +184,8 @@ const Fake = struct {
+     fn of(p: *anyopaque) *Fake {
+         return @ptrCast(@alignCast(p));
+     }
+-    pub fn share_pool(p: *anyopaque) ?*kv.Pool {
+-        return &of(p).pool;
++    pub fn share_pool(p: *anyopaque) ?hooks.Pool {
++        return .{ .one = &of(p).pool };
+     }
+     pub fn share_attach(p: *anyopaque, prompts: ?hooks.Prompts) void {
+         of(p).prompts = prompts;
+@@ -163,3 +237,122 @@ test "TF_KV_SHARE: a state past the unpaged cache's whole budget names it where
+     try testing.expectEqualStrings("", hint(Fake, windows)); // a window a stream: the store cannot share
+     try testing.expectEqualStrings("", hint(struct {}, paged)); // a family without the store's hooks
+ }
++
++/// A sharded pool's stand-in (TF_GLM_KV_SHARD): two pools of `h` pages a part, `share_pool` handing them over as
++/// hooks.Pool.parts, its pages view routing a global id to its part's pool with the part-local id.
++const Sharded = struct {
++    h: usize = 4,
++    pools: [2]kv.Pool,
++    prompts: ?hooks.Prompts = null,
++    saved: u8 = 0,
++    restored: ?*anyopaque = null,
++
++    fn of(p: *anyopaque) *Sharded {
++        return @ptrCast(@alignCast(p));
++    }
++    pub fn share_pool(p: *anyopaque) ?hooks.Pool {
++        return .{ .parts = .{
++            .retain = shRetain,
++            .release = shRelease,
++            .holders = shHolders,
++            .available = shAvailable,
++            .page_bytes = 1,
++            .total = 2 * of(p).h,
++            .count = 2,
++            .free = partFree,
++            .inPart = partIn,
++            .onePart = partOne,
++            .setReclaim = partSet,
++            .ctx = p,
++        } };
++    }
++    pub fn share_attach(p: *anyopaque, prompts: ?hooks.Prompts) void {
++        of(p).prompts = prompts;
++    }
++    pub fn snap_bytes(_: *anyopaque, _: u32) u64 {
++        return 1;
++    }
++    pub fn snap_save(p: *anyopaque, _: ?*anyopaque, _: u32) anyerror!*anyopaque {
++        return @ptrCast(&of(p).saved);
++    }
++    pub fn snap_restore(p: *anyopaque, _: ?*anyopaque, saved: *anyopaque) anyerror!void {
++        of(p).restored = saved;
++    }
++    pub fn snap_drop(_: *anyopaque, _: *anyopaque) void {}
++    pub const snap_lookahead: u32 = 0;
++
++    fn pool(p: *Sharded, id: u32) *kv.Pool {
++        return &p.pools[id / p.h];
++    }
++    fn local(p: *const Sharded, id: u32) u32 {
++        return id - @as(u32, @intCast(id / p.h * p.h));
++    }
++    pub fn retain(p: *Sharded, id: u32) void {
++        p.pool(id).retain(p.local(id));
++    }
++    pub fn release(p: *Sharded, id: u32) void {
++        p.pool(id).release(p.local(id));
++    }
++    pub fn holders(p: *const Sharded, id: u32) u32 {
++        return p.pools[id / p.h].holders(p.local(id));
++    }
++    pub fn available(p: *const Sharded) usize {
++        return p.pools[0].available() + p.pools[1].available();
++    }
++
++    fn shRetain(ctx: *anyopaque, id: u32) void {
++        of(ctx).retain(id);
++    }
++    fn shRelease(ctx: *anyopaque, id: u32) void {
++        of(ctx).release(id);
++    }
++    fn shHolders(ctx: *anyopaque, id: u32) u32 {
++        return of(ctx).holders(id);
++    }
++    fn shAvailable(ctx: *anyopaque) usize {
++        return of(ctx).available();
++    }
++
++    fn partFree(ctx: *anyopaque, part: usize) usize {
++        return of(ctx).pools[part].available();
++    }
++    fn partIn(ctx: *anyopaque, part: usize, first: u32) bool {
++        return first / of(ctx).h == part;
++    }
++    fn partOne(ctx: *anyopaque, ids: []const u32) bool {
++        const h = of(ctx).h;
++        const one = ids[0] / h;
++        for (ids) |id| if (id / h != one) return false;
++        return true;
++    }
++    fn partSet(ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void {
++        of(ctx).pools[part].reclaim = hook;
++    }
++};
++
++test "TF_KV_SHARE's adapter over a sharded pool: the parts are the store's pages, a keep and its resume cross them" {
++    var f: Sharded = .{ .pools = .{ try kv.Pool.init(testing.allocator, 4, 1), try kv.Pool.init(testing.allocator, 4, 1) } };
++    defer for (&f.pools) |*p| p.deinit();
++    const x = (try Adapter.open(Sharded, testing.allocator, &f, 4, 4)).?;
++    const p = f.prompts.?;
++    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++    var lease: kv.Lease = .{};
++    try f.pools[1].promise(&lease, 3);
++    try f.pools[1].cover(&lease, 3, null); // a stream in part 1: part-local 0, 1, 2, global 4, 5, 6
++    const mine = [_]u32{ lease.ids.items[0] + 4, lease.ids.items[1] + 4 }; // the stream's pages, as the store sees them
++    var path: [2]u32 = undefined;
++    var owner: u8 = 0;
++    try testing.expectEqual(@as(usize, 2), p.keep(&prompt, 8, &owner, &mine, &path));
++    try testing.expectEqualSlices(u32, &mine, &path);
++    f.pools[1].finish(&lease); // the stream's pages past the mark free, those below it the tree's
++    for (path) |id| try testing.expectEqual(@as(u32, 1), f.holders(id)); // the tree's alone, in part 1
++    var adopt: std.ArrayList(u32) = .empty;
++    defer adopt.deinit(testing.allocator);
++    const plan = try p.begin(&prompt, 10, &.{}, &owner, &adopt);
++    defer p.free(plan.marks);
++    try testing.expectEqual(@as(u32, 8), plan.from);
++    try testing.expectEqualSlices(u32, &path, adopt.items); // the resume adopts them where they lie
++    for (adopt.items) |id| f.release(id);
++    x.close(); // the tree's holds go, each part's pool idle again
++    try testing.expect(f.prompts == null and f.pools[0].idle() and f.pools[1].idle());
++}
+-- 
+2.56.0
+

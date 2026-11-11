@@ -1,0 +1,66 @@
+From 946355ea72d2d7ff686babe8183e2d923d612c5d Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] glm cuda: TF_GLM_DISK_FAULT=n, a fault drill failing one disk
+ write on a rank other than 0
+
+Off by default. Used to prove the fallback on two DGX Sparks: rank 1 logs the failed step and stays up, rank 0 prefills cold, the next recall works.
+---
+ zig/src/families/glm/cuda_disk_ranks.zig | 4 ++++
+ zig/src/families/glm/cuda_engine.zig     | 1 +
+ zig/src/families/glm/cuda_ranks.zig      | 5 +++++
+ 3 files changed, 10 insertions(+)
+
+diff --git a/zig/src/families/glm/cuda_disk_ranks.zig b/zig/src/families/glm/cuda_disk_ranks.zig
+index eea91069..b9269a4e 100644
+--- a/zig/src/families/glm/cuda_disk_ranks.zig
++++ b/zig/src/families/glm/cuda_disk_ranks.zig
+@@ -471,6 +471,10 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
+     };
+     if (op == .blank) e.disk_cur = h.a;
+     if (write_op and e.disk_failed.contains(state)) return; // a poisoned id's writes are skipped: its seal says so
++    if (write_op and op != .blank and e.settings.disk_fault != 0) { // the fault drill (TF_GLM_DISK_FAULT)
++        e.disk_writes += 1;
++        if (e.disk_writes == e.settings.disk_fault) return poison(e, state, error.DiskFaultDrill);
++    }
+     switch (op) {
+         .blank => {
+             if (h.depth > image.Words.kv_parts or (h.depth != 0 and !e.settings.kv_shard.on)) return error.BadStep;
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index d7521567..808c9045 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -127,6 +127,7 @@ pub const Engine = struct {
+     next_snap: u64 = 1, // rank 0: the next id
+     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
+     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
++    disk_writes: u32 = 0, // a rank other than 0: its disk writes counted for the fault drill (TF_GLM_DISK_FAULT)
+     disk_cur: u64 = 0, // a rank other than 0: the state rank 0 last blanked here, which its page writes belong to (cuda_disk_ranks)
+     disk_failed: std.AutoHashMapUnmanaged(u64, void) = .empty, // ids whose disk op failed on this rank (cuda_disk_ranks): their later writes are skipped and their seal answers with the failure
+     prompt_logprobs: ?prompt_lp.Want = null, // a prompt pass's rows asked for (every rank runs the head on them)
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index f12fac1c..10e302e3 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -30,6 +30,7 @@ pub const Settings = struct {
+     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
+     kv_share: u32 = 0, // TF_KV_SHARE=n: kept prompt states as the pool's pages, at most n past them (core kv_prompts.sharing reads the same value)
+     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
++    disk_fault: u32 = 0, // TF_GLM_DISK_FAULT=n: a fault drill, the nth disk write a rank other than 0 takes fails once (0: none)
+     share_untwinned_pct: u32 = share_mod.untwinned_pct_default, // TF_GLM_KV_SHARE_UNTWINNED_PCT: a sharded share resume adopts only when its untwinned tail pays
+ 
+     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
+@@ -154,6 +155,10 @@ pub const Settings = struct {
+             problem.* = "TF_KV_SHARE: a count (kept prompt states as the pool's pages, at most that many; 0 or unset: copies)";
+             return error.BadSetting;
+         };
++        if (get("TF_GLM_DISK_FAULT")) |v| s.disk_fault = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch {
++            problem.* = "TF_GLM_DISK_FAULT: a count (a fault drill: the nth disk write a rank other than 0 takes fails once; 0 none)";
++            return error.BadSetting;
++        };
+         if (get("TF_GLM_KV_LIVE_HALF")) |v| {
+             if (std.mem.eql(u8, v, "1")) s.kv_live_half = true else if (!std.mem.eql(u8, v, "0")) {
+                 problem.* = "TF_GLM_KV_LIVE_HALF: 0 or 1";
+-- 
+2.56.0
+

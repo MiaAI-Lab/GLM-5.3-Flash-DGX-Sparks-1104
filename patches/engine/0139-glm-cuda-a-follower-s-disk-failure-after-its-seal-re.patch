@@ -1,0 +1,167 @@
+From 7b18b670c7fbb468235e7d4096e6478accf9f79a Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 18:32:27 +0100
+Subject: [PATCH] glm cuda: a follower's disk failure after its seal reaches
+ rank 0 (a settle step ends each recall)
+
+The seal was the only point where rank 0 collected the other ranks' disk status. The state's own file follows the
+seal (its fixed parts, each other rank's prefix); a rank whose write of one of those failed dropped its copy and
+logged it, and rank 0 kept the state as recalled.
+
+- Op.settle: after a recall's last piece rank 0 asks once more, each rank answers its status word for the id (the
+  seal's answer path, shared), and a failure is error.DiskRankFailed: the recall gives the state up and the request
+  runs a cold pass, as for a failure before the seal. One status word from each other rank a recall; it also runs for
+  --learn-conversations without TF_KV_SHARE (the copy store's recall takes the same scatter).
+- Host test: a write failing after a seal that stood poisons the id, drops the copy and the settle answers 1.
+---
+ zig/src/families/glm/cuda_disk_ranks.zig      | 43 ++++++++++++++-----
+ zig/src/families/glm/cuda_disk_shard_test.zig | 19 ++++++++
+ zig/src/native/cuda_glm_disk.zig              | 14 ++++--
+ 3 files changed, 61 insertions(+), 15 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_disk_ranks.zig b/zig/src/families/glm/cuda_disk_ranks.zig
+index b9269a4e..bf085b2f 100644
+--- a/zig/src/families/glm/cuda_disk_ranks.zig
++++ b/zig/src/families/glm/cuda_disk_ranks.zig
+@@ -14,12 +14,13 @@ const Engine = @import("cuda_engine.zig").Engine;
+ /// blank's home part + 1 in `depth` and the pages a recall holds in `top_k`. A page op's page is `a` (a key page's
+ /// global id, a latent page's part-local one), the byte in the page `seed`: rank 0's pool pages are read and written
+ /// through them (the other ranks' beside TF_GLM_KV_SHARD and on a read-back), a slot's lease through `slot`.
+-pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, key_put, lat_put, lat_take, slot_put, slot_take, page_put, page_take };
++pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, key_put, lat_put, lat_take, slot_put, slot_take, page_put, page_take, settle };
+ const kind = @backingInt(follow.Kind.disk); // each op crosses the follow link as a disk step, its bytes as the ids
+ 
+ /// A take's answer crosses the link as its bytes and one status word past them (0 ok, else the op failed on the
+ /// rank that answered): rank 0 fails the op here instead of gathering what a broken rank's copy sent. A seal's
+-/// answer is the status word alone, rank order: a rank whose ops failed for the id fails rank 0's seal with it.
++/// answer is the status word alone, rank order: a rank whose ops failed for the id fails rank 0's seal with it. A
++/// settle's answer is the same word once more, after the pieces that follow the seal.
+ const status_bytes: usize = @sizeOf(u32);
+ 
+ /// This rank's image shape (every sequence of the engine has the same).
+@@ -155,6 +156,20 @@ pub fn seal(e: *Engine, id: u64, w: image.Words) !void {
+     }
+ }
+ 
++/// Rank 0, after a recall's last piece: each rank's status for `id` once more. The seal collected the failures before
++/// it; the state's own file follows the seal (its fixed parts, each other rank's prefix), and a rank whose write of
++/// one of those failed has dropped its copy: it says so here, and rank 0's recall gives the state up for the pair.
++pub fn settle(e: *Engine, id: u64) !void {
++    if (leader(e)) |x| {
++        try x.disk(.{ .kind = kind, .flags = @backingInt(Op.settle), .a = id }, &.{});
++        var r: u32 = 1;
++        while (r < e.share.world) : (r += 1) {
++            try x.link.from(r, status_bytes);
++            if (try status(x.link, 0) != 0) return error.DiskRankFailed;
++        }
++    }
++}
++
+ /// This rank's shard (null: unsharded): its parts' pools, its key pages (every page's, global ids) and its own part's
+ /// latent pages (part-local ids, the trash page last).
+ fn shard(e: *Engine) !*pages_mod.Shard {
+@@ -453,10 +468,21 @@ fn sealBody(e: *Engine, id: u64, ids: []const u32) !void {
+     try e.sealState(id, w.mtp_len, .{ w.base, w.mtp_base }, w.cur);
+ }
+ 
++/// A seal's or a settle's answer crosses the link, rank order: each rank's status word (0 its copy stands, 1 it failed).
++fn answerStatus(e: *Engine, l: *follow.Link, rank: u32, ok: u32) !void {
++    const bytes = std.mem.sliceAsBytes(l.ids);
++    std.mem.writeInt(u32, bytes[0..status_bytes], ok, .little);
++    var r: u32 = 1;
++    while (r < e.share.world) : (r += 1) {
++        if (r == rank) l.buf.uploadAsync(64, bytes[0..status_bytes], l.stream.handle) catch {};
++        try l.from(r, status_bytes);
++    }
++}
++
+ /// A rank other than 0: rank 0's disk step on this rank's copy of its state. An op that fails here poisons its id
+ /// (poison) and the step loop runs on; only a step that breaks the protocol itself ends this rank.
+ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !void {
+-    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.page_take)) return error.BadStep;
++    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.settle)) return error.BadStep;
+     const op: Op = @fromBackingInt(h.flags);
+     const rank: u32 = @intCast(e.share.rank);
+     const write_op = switch (op) {
+@@ -487,15 +513,10 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
+                 poison(e, h.a, err);
+                 ok = 1;
+             };
+-            // the seal's answer crosses the link, rank order: each rank's status word (0 its seal stood, 1 it failed)
+-            const bytes = std.mem.sliceAsBytes(l.ids);
+-            std.mem.writeInt(u32, bytes[0..status_bytes], ok, .little);
+-            var r: u32 = 1;
+-            while (r < e.share.world) : (r += 1) {
+-                if (r == rank) l.buf.uploadAsync(64, bytes[0..status_bytes], l.stream.handle) catch {};
+-                try l.from(r, status_bytes);
+-            }
++            try answerStatus(e, l, rank, ok);
+         },
++        // a recall's last word: this rank's status for the id after the pieces that followed its seal
++        .settle => try answerStatus(e, l, rank, @intFromBool(e.disk_failed.contains(h.a))),
+         .put => if (h.top_k == rank) {
+             if (h.depth > ids.len * 4) return error.BadStep;
+             if (putBody(e, h, @constCast(std.mem.sliceAsBytes(ids))[0..h.depth])) |_| {} else |err| poison(e, h.a, err);
+diff --git a/zig/src/families/glm/cuda_disk_shard_test.zig b/zig/src/families/glm/cuda_disk_shard_test.zig
+index 15bf48af..cba6876e 100644
+--- a/zig/src/families/glm/cuda_disk_shard_test.zig
++++ b/zig/src/families/glm/cuda_disk_shard_test.zig
+@@ -405,6 +405,25 @@ test "GLM disk steps: a follower's failed op poisons the id, answers the seal wi
+     try expectEqual(@as(u32, 0), ok);
+     try expect(e.snaps.get(8).?.len != 0);
+     try expect(!e.disk_failed.contains(8));
++    // its settle answers 0 while the pieces after the seal stood
++    const settle: follow.Header = .{ .kind = disk, .flags = @backingInt(ranks.Op.settle), .a = 8 };
++    try ranks.step(e, &link[1], settle, &.{});
++    try link[0].from(1, @sizeOf(u32));
++    try link[0].buf.download(64, std.mem.asBytes(&ok));
++    try expectEqual(@as(u32, 0), ok);
++    // a write after the seal fails on this rank (the state's own file follows the seal): no error out of the step,
++    // the copy dropped, and the settle carries the failure to rank 0
++    var late = put;
++    late.a = 8;
++    e.settings.disk_fault = @intCast(e.disk_writes + 1); // the drill's switch: this rank's next disk write fails
++    defer e.settings.disk_fault = 0;
++    try ranks.step(e, &link[1], late, &bytes);
++    try expect(e.disk_failed.contains(8));
++    try expect(!e.snaps.contains(8));
++    try ranks.step(e, &link[1], settle, &.{});
++    try link[0].from(1, @sizeOf(u32));
++    try link[0].buf.download(64, std.mem.asBytes(&ok));
++    try expectEqual(@as(u32, 1), ok);
+ }
+ 
+ /// The store image of kept state `id` (rank 0's image, then rank 1's prefix), gathered in ranges across the seams.
+diff --git a/zig/src/native/cuda_glm_disk.zig b/zig/src/native/cuda_glm_disk.zig
+index f9213a86..d472e16b 100644
+--- a/zig/src/native/cuda_glm_disk.zig
++++ b/zig/src/native/cuda_glm_disk.zig
+@@ -267,15 +267,21 @@ fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, r
+     const k: *Kept = @ptrCast(@alignCast(saved));
+     const rest = Rest.of(e);
+     defer rest.done();
+-    if (ranges.len > 0 and ranges[0].off == 0) {
++    const last = ranges.len > 0 and ranges[0].off == 0; // the state's own file: the recall's last scatter
++    if (last) {
+         if (ranges[0].len < img.Words.bytes) return error.DiskWords;
+         var x: [img.Words.count]u64 = undefined;
+         @memcpy(std.mem.sliceAsBytes(&x), in[0..img.Words.bytes]);
+         try ranks.seal(e, k.id, try img.Words.decode(x, k.at));
+     }
+-    if (pages_mode) return if (pages_sharded) scatterPagesSharded(e, k, pages, ranges, in) else scatterPages(e, k, pages, ranges, in);
+-    // the blank's home (cuda_disk_ranks.readHome), not the words': a sharded state's latent rows to that rank alone
+-    try ranks.scatterWith(RankIo{ .e = e, .id = k.id }, try ranks.shape(e), prefixes, k.at, try homeOf(e, k.id), ranges, in, e.gpa);
++    if (pages_mode) {
++        if (pages_sharded) try scatterPagesSharded(e, k, pages, ranges, in) else try scatterPages(e, k, pages, ranges, in);
++    } else {
++        // the blank's home (cuda_disk_ranks.readHome), not the words': a sharded state's latent rows to that rank alone
++        try ranks.scatterWith(RankIo{ .e = e, .id = k.id }, try ranks.shape(e), prefixes, k.at, try homeOf(e, k.id), ranges, in, e.gpa);
++    }
++    // these pieces followed the seal: a rank whose write of one failed says so now, and the recall gives the state up
++    if (last) try ranks.settle(e, k.id);
+ }
+ 
+ /// A pages-layout state's image bytes from `in` into its pool pages and its slot's lease (the words went with the
+-- 
+2.56.0
+

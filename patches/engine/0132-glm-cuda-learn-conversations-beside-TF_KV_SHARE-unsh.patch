@@ -1,0 +1,2515 @@
+From 125b3327fda4acc38428d54d9a7bfdb6837459cd Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] glm cuda: --learn-conversations beside TF_KV_SHARE, unsharded
+
+A kept state's rows may be the store's pages: a Kept view over them, a pages layout in the disk image beside the copy one, write-behind in pieces under the staging permit, recall into pool pages. The disk identity probe runs with the shared store standing aside. Sharded stays refused by name until the next patches.
+---
+ zig/src/core/kv_prompts.zig                   |   3 +
+ zig/src/core/lane_host_fetch_test.zig         |   4 +-
+ zig/src/core/lane_host_rows_test.zig          |   4 +-
+ zig/src/core/prompt_cache.zig                 |   5 +-
+ zig/src/core/prompt_radix.zig                 | 139 +++++-
+ zig/src/core/prompt_radix_disk_test.zig       | 403 ++++++++++++++++++
+ zig/src/core/prompt_radix_tree.zig            |   8 +
+ zig/src/core/rows_fake.zig                    |   7 +-
+ zig/src/core/rows_io.zig                      |   8 +-
+ zig/src/core/rows_pool_select_test.zig        |   4 +-
+ zig/src/core/rows_read.zig                    |  27 +-
+ zig/src/core/rows_stage_test.zig              |  46 +-
+ zig/src/core/rows_store.zig                   |  55 ++-
+ zig/src/core/rows_verify.zig                  |  10 +-
+ zig/src/core/rows_write.zig                   | 238 +++++++++--
+ zig/src/core/rows_write_sync.zig              | 101 +++--
+ zig/src/families/flashnext/cuda_disk.zig      |   8 +-
+ zig/src/families/glm/cuda_disk_image.zig      |  73 +++-
+ zig/src/families/glm/cuda_disk_ranks.zig      |   2 +-
+ zig/src/families/glm/cuda_disk_shard_test.zig |   9 +-
+ zig/src/families/glm/cuda_native.zig          |  10 +
+ zig/src/families/glm/cuda_snapshots.zig       |   6 +-
+ zig/src/families/qwen3_5/cuda_disk.zig        |   6 +-
+ zig/src/families/qwen3_5/cuda_disk_test.zig   |  10 +-
+ zig/src/native/cuda.zig                       |  14 +-
+ zig/src/native/cuda_disk.zig                  |   8 +-
+ zig/src/native/cuda_glm_disk.zig              | 284 +++++++++++-
+ zig/src/native/cuda_prompt_pages.zig          |  13 +-
+ 28 files changed, 1341 insertions(+), 164 deletions(-)
+ create mode 100644 zig/src/core/prompt_radix_disk_test.zig
+
+diff --git a/zig/src/core/kv_prompts.zig b/zig/src/core/kv_prompts.zig
+index c89e3445..607bad1f 100644
+--- a/zig/src/core/kv_prompts.zig
++++ b/zig/src/core/kv_prompts.zig
+@@ -95,6 +95,9 @@ pub const Parts = struct {
+     onePart: *const fn (ctx: *anyopaque, ids: []const u32) bool,
+     /// `part`'s pool takes the store's reclaim hook, or drops it.
+     setReclaim: *const fn (ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void,
++    /// `out.len` pages held for a recalled state in one part with room (its pools reclaiming first), global ids
++    /// (false: none; a recall's home part, cuda_kv_shard.Parts.choose). Null: the parts cannot hold pages.
++    holdPages: ?*const fn (ctx: *anyopaque, out: []u32) bool = null,
+     ctx: *anyopaque,
+ };
+ 
+diff --git a/zig/src/core/lane_host_fetch_test.zig b/zig/src/core/lane_host_fetch_test.zig
+index 3ab5119a..a7946d85 100644
+--- a/zig/src/core/lane_host_fetch_test.zig
++++ b/zig/src/core/lane_host_fetch_test.zig
+@@ -36,7 +36,7 @@ const Snaps = struct {
+     fn parts(_: *anyopaque, at: u32, out: *std.ArrayList(pc.rows.image.Part), a: Allocator) anyerror!void {
+         try out.append(a, .{ .bytes = @as(u64, at) * 4, .row = 4 });
+     }
+-    fn gather(_: *anyopaque, saved: pc.Saved, ranges: []const pc.rows.image.Range, out: []u8) anyerror!void {
++    fn gather(_: *anyopaque, saved: pc.Saved, _: []const u32, ranges: []const pc.rows.image.Range, out: []u8) anyerror!void {
+         const src = std.mem.sliceAsBytes(kept(saved).items);
+         var o: usize = 0;
+         for (ranges) |r| {
+@@ -50,7 +50,7 @@ const Snaps = struct {
+         try k.appendNTimes(of(ptr).gpa, 0, at);
+         return k;
+     }
+-    fn scatter(_: *anyopaque, saved: pc.Saved, ranges: []const pc.rows.image.Range, in: []const u8) anyerror!void {
++    fn scatter(_: *anyopaque, saved: pc.Saved, _: []const u32, ranges: []const pc.rows.image.Range, in: []const u8) anyerror!void {
+         const dst = std.mem.sliceAsBytes(kept(saved).items);
+         var o: usize = 0;
+         for (ranges) |r| {
+diff --git a/zig/src/core/lane_host_rows_test.zig b/zig/src/core/lane_host_rows_test.zig
+index 06595814..f5044354 100644
+--- a/zig/src/core/lane_host_rows_test.zig
++++ b/zig/src/core/lane_host_rows_test.zig
+@@ -32,7 +32,7 @@ const Snaps = struct {
+     fn parts(_: *anyopaque, at: u32, out: *std.ArrayList(pc.rows.image.Part), a: Allocator) anyerror!void {
+         try out.append(a, .{ .bytes = @as(u64, at) * 4, .row = 4 });
+     }
+-    fn gather(_: *anyopaque, saved: pc.Saved, ranges: []const pc.rows.image.Range, out: []u8) anyerror!void {
++    fn gather(_: *anyopaque, saved: pc.Saved, _: []const u32, ranges: []const pc.rows.image.Range, out: []u8) anyerror!void {
+         const src = std.mem.sliceAsBytes(kept(saved).items);
+         var o: usize = 0;
+         for (ranges) |r| {
+@@ -46,7 +46,7 @@ const Snaps = struct {
+         try k.appendNTimes(of(ptr).gpa, 0, at);
+         return k;
+     }
+-    fn scatter(_: *anyopaque, saved: pc.Saved, ranges: []const pc.rows.image.Range, in: []const u8) anyerror!void {
++    fn scatter(_: *anyopaque, saved: pc.Saved, _: []const u32, ranges: []const pc.rows.image.Range, in: []const u8) anyerror!void {
+         const dst = std.mem.sliceAsBytes(kept(saved).items);
+         var o: usize = 0;
+         for (ranges) |r| {
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 252b90c8..7d679514 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -75,6 +75,9 @@ pub const Pages = struct {
+         holders: *const fn (ptr: *anyopaque, id: u32) u32,
+         /// Pages free and not promised to a stream.
+         available: *const fn (ptr: *anyopaque) usize,
++        /// `out.len` free pages the store holds itself (a paged store's recall into pages), the pool reclaiming first;
++        /// a sharded pool's in one part with room (false: none). Null: the family cannot hold pages.
++        hold: ?*const fn (ptr: *anyopaque, out: []u32) bool = null,
+     };
+ };
+ 
+@@ -511,7 +514,7 @@ pub const Store = struct {
+         s.held += charged;
+         s.counts.kept += 1;
+         if (shared) learned.learn(s, e, starts);
+-        if (s.disk) |r| rows.write.queued(r, e, starts);
++        if (s.disk) |r| rows.write.queued(r, rows.Kept.of(e), starts);
+         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
+         return true;
+     }
+diff --git a/zig/src/core/prompt_radix.zig b/zig/src/core/prompt_radix.zig
+index b45dabb7..5d110b1a 100644
+--- a/zig/src/core/prompt_radix.zig
++++ b/zig/src/core/prompt_radix.zig
+@@ -3,6 +3,8 @@
+ const std = @import("std");
+ const pc = @import("prompt_cache.zig");
+ const tree_mod = @import("prompt_radix_tree.zig");
++const rows = @import("rows_store.zig");
++const select = @import("rows_select.zig");
+ const Allocator = std.mem.Allocator;
+ 
+ pub const Saved = tree_mod.Saved;
+@@ -37,8 +39,11 @@ pub fn pagesOf(comptime T: type, owner: *T, bytes: u64) Pages {
+         fn available(p: *anyopaque) usize {
+             return of(p).available();
+         }
++        fn hold(p: *anyopaque, out: []u32) bool {
++            return of(p).hold(out);
++        }
+     };
+-    return .{ .ptr = owner, .bytes = bytes, .vtable = &.{ .retain = V.retain, .release = V.release, .holders = V.holders, .available = V.available } };
++    return .{ .ptr = owner, .bytes = bytes, .vtable = &.{ .retain = V.retain, .release = V.release, .holders = V.holders, .available = V.available, .hold = V.hold } };
+ }
+ 
+ pub const Plan = pc.Plan;
+@@ -51,9 +56,23 @@ pub const Store = struct {
+     limits: Limits = .{},
+     /// The tokens of recently planned shared cuts, hashed (at most SHARED_KEYS).
+     shared_keys: std.ArrayList(u64) = .empty,
++    /// --learn-conversations: every kept state written behind to disk, read back where it pays (prompt_cache.Store's).
++    disk: ?*rows.Rows = null,
++    /// Saves of nodes under way or queued: their pages held once more, their tokens copied (rows_write's Kept.freed).
++    saves: std.ArrayList(Save) = .empty,
++
++    /// A save of a node the writer reads: the pages held for it, and the tokens its blocks are named by.
++    const Save = struct { node: *Node, pages: []u32, tokens: []u32 };
+ 
+     const SHARED_KEYS = 64;
+ 
++    /// --learn-conversations on a paged store: every keep written behind (its pages held while the save reads them),
++    /// an eviction's still-queued save staged, and a begin that misses reading the longest state on disk that pays.
++    pub fn attachDisk(s: *Store, r: *rows.Rows) void {
++        s.disk = r;
++        s.tree.on_evict = .{ .ctx = s, .call = evicting };
++    }
++
+     pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, rules: Rules) !Store {
+         if (rules.page == 0 or (rules.planned and (rules.grid == 0 or rules.grid % rules.page != 0))) return error.BadPromptRadixRules;
+         return .{ .tree = try Tree.init(gpa, family, pages, rules.page, rules.lookahead), .rules = rules };
+@@ -70,6 +89,10 @@ pub const Store = struct {
+     }
+ 
+     pub fn deinit(s: *Store) void {
++        while (s.saves.items.len > 0) if (s.disk) |r| { // the writer's queue lets the saves go first (their pages back)
++            rows.write.dropped(r, s.saves.items[s.saves.items.len - 1].node);
++        } else break;
++        s.saves.deinit(s.tree.gpa);
+         s.shared_keys.deinit(s.tree.gpa);
+         s.tree.deinit();
+     }
+@@ -93,10 +116,12 @@ pub const Store = struct {
+     }
+ 
+     /// Restores the longest state `prompt` resumes into `owner`, its pages into `adopt` (held once more); plans marks.
++    /// With a disk store, a miss (or a tree state shorter than one on disk) recalls the longest state there that pays.
+     pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, owner: ?*anyopaque, adopt: *std.ArrayList(u32)) !Plan {
+         if (!s.on()) return .{ .marks = try a.alloc(u32, 0) };
+-        const found = s.find(prompt);
+-        if (found == null) s.tree.counts.misses += 1;
++        const found0 = s.find(prompt);
++        if (found0 == null) s.tree.counts.misses += 1;
++        const found = if (s.disk) |r| s.recall(r, prompt, found0) else found0;
+         const resume_at: u32 = if (found) |n| n.end else 0;
+         const planned = try s.marks(a, prompt, resume_at, history_len, shared, if (found) |n| n.entry.?.last else &.{});
+         const marks_ = try s.fitting(a, planned);
+@@ -248,9 +273,116 @@ pub const Store = struct {
+         node.entry = .{ .saved = saved, .bytes = family.vtable.bytes(family.ptr, at), .born = @intCast(prompt.len), .used = t.clock, .last = last, .shared = flagged };
+         t.snaps += 1;
+         t.counts.kept += 1;
++        if (s.disk) |r| s.writeBehind(r, node, saved);
+         return .{ .held = true, .shared = mine.len };
+     }
+ 
++    /// The state just kept written behind (prompt_cache.Store's `queued`): its pages held once more while the save
++    /// reads them, so the tree may drop the leaf but the pool cannot reuse the pages under the writer.
++    fn writeBehind(s: *Store, r: *rows.Rows, node: *Node, saved: pc.Saved) void {
++        const t = &s.tree;
++        const e = &node.entry.?;
++        const pages = t.gpa.dupe(u32, node.pages) catch return;
++        errdefer t.gpa.free(pages);
++        const tokens = t.gpa.dupe(u32, e.last[0..@min(e.last.len, node.end + t.ahead)]) catch return;
++        errdefer t.gpa.free(tokens);
++        for (pages) |id| t.pages.vtable.retain(t.pages.ptr, id);
++        s.saves.append(t.gpa, .{ .node = node, .pages = pages, .tokens = tokens }) catch {
++            for (pages) |id| t.pages.vtable.release(t.pages.ptr, id);
++            return;
++        };
++        rows.write.queued(r, .{
++            .owner = node,
++            .tokens = tokens,
++            .at = node.end,
++            .saved = saved,
++            .shared = e.shared,
++            .pages = pages,
++            .freed = .{ .ctx = s, .call = gaveBack },
++        }, &.{});
++    }
++
++    /// The writer no longer reads a save's state (staged, ended or dropped): its pages go back, its tokens freed.
++    fn gaveBack(ctx: *anyopaque, owner: *anyopaque) void {
++        const s: *Store = @ptrCast(@alignCast(ctx));
++        const t = &s.tree;
++        const n: *Node = @ptrCast(@alignCast(owner));
++        for (s.saves.items, 0..) |save, i| if (save.node == n) {
++            for (save.pages) |id| t.pages.vtable.release(t.pages.ptr, id);
++            t.gpa.free(save.pages);
++            t.gpa.free(save.tokens);
++            _ = s.saves.swapRemove(i);
++            return;
++        };
++    }
++
++    /// A leaf evicted while its save is still queued: the save is written now (its pages are held; rows_write).
++    fn evicting(ctx: *anyopaque, n: *Node) void {
++        const s: *Store = @ptrCast(@alignCast(ctx));
++        const r = s.disk orelse return;
++        for (s.saves.items) |save| if (save.node == n) return rows.write.evicting(r, n);
++    }
++
++    /// The longest state on disk below `prompt` that reaches past the tree's deepest match, when reading it pays:
++    /// read into pool pages the store holds and a slot, and keep it as the tree's (its pages adopted like any kept
++    /// state's; the store's holds go once the tree holds them). `found` (the tree's deepest match) otherwise.
++    fn recall(s: *Store, r: *rows.Rows, prompt: []const u32, found: ?*Node) ?*Node {
++        const t = &s.tree;
++        const from: u32 = if (found) |n| n.end else 0;
++        const i = r.best(prompt, &.{}, &.{}, from) orelse return found;
++        const st = &r.states.items[i];
++        if (st.at <= from) return found;
++        const pay = select.savedSeconds(r, i, from) orelse return found; // the read beats prefilling what the tree lacks
++        if (!(pay > 0)) return found;
++        const np = st.at / s.rules.page;
++        while (t.held_pages + np > s.limits.pages or t.snaps + 1 > s.limits.snaps) {
++            t.evict(s.victim(prompt, found) orelse return found);
++        }
++        var pages: std.ArrayList(u32) = .empty;
++        const got = rows.read.readPages(r, i, &pages) catch {
++            pages.deinit(t.gpa);
++            return found;
++        };
++        const give = struct {
++            fn go(t2: *Tree, ps: *std.ArrayList(u32)) void {
++                for (ps.items) |id| t2.pages.vtable.release(t2.pages.ptr, id);
++                ps.deinit(t2.gpa);
++            }
++        }.go;
++        const drop = struct {
++            fn go(f2: pc.Snapshots, saved2: pc.Saved) void {
++                f2.vtable.drop(f2.ptr, saved2);
++            }
++        }.go;
++        const path = t.gpa.alloc(u32, np) catch {
++            give(t, &pages);
++            drop(t.family, got);
++            return found;
++        };
++        defer t.gpa.free(path);
++        const node = t.insert(prompt[0..@min(prompt.len, st.at + s.rules.lookahead)], pages.items, path) catch {
++            give(t, &pages);
++            drop(t.family, got);
++            return found;
++        };
++        if (node.entry != null) { // the tree keeps this state's tokens already: its own copy wins
++            give(t, &pages);
++            drop(t.family, got);
++            return found;
++        }
++        const last = t.gpa.dupe(u32, prompt) catch {
++            give(t, &pages);
++            drop(t.family, got);
++            return found;
++        };
++        t.clock += 1;
++        node.entry = .{ .saved = got, .bytes = t.family.vtable.bytes(t.family.ptr, st.at), .born = @intCast(prompt.len), .used = t.clock, .last = last, .shared = st.shared };
++        t.snaps += 1;
++        t.counts.kept += 1;
++        give(t, &pages); // the tree holds the pages now; the recall's holds go
++        return node;
++    }
++
+     fn fail(s: *Store, at: u32, err: anyerror, shared: usize) Kept {
+         s.tree.counts.failed += 1;
+         note("keeping {d} tokens failed ({s}); a later turn prefills them", .{ at, @errorName(err) });
+@@ -326,4 +458,5 @@ fn note(comptime fmt: []const u8, args: anytype) void {
+ 
+ test {
+     _ = @import("prompt_radix_test.zig");
++    _ = @import("prompt_radix_disk_test.zig");
+ }
+diff --git a/zig/src/core/prompt_radix_disk_test.zig b/zig/src/core/prompt_radix_disk_test.zig
+new file mode 100644
+index 00000000..412ce943
+--- /dev/null
++++ b/zig/src/core/prompt_radix_disk_test.zig
+@@ -0,0 +1,403 @@
++//! The paged prompt store's disk tier (TF_KV_SHARE with --learn-conversations): a kept state's rows are the tree's
++//! pages, written behind and recalled into pool pages, over a fake pool and a tiny image, as rows_store's tests do.
++
++const std = @import("std");
++const pc = @import("prompt_cache.zig");
++const radix = @import("prompt_radix.zig");
++const rows = @import("rows_store.zig");
++const Allocator = std.mem.Allocator;
++const t = std.testing;
++
++const page_tokens = 4; // tokens a page holds (rules.page)
++const page_bytes = 8; // bytes of row data a page holds: its 4 tokens, 2 bytes a row
++const page_count = 16; // pages the pool has
++const words_bytes = 16; // the image's words: the position and the running sum
++const fixed_bytes = 8; // the image's fixed part past the rows: the slot's own
++
++/// A page pool as kv_pool.Pool's holds: `hold` takes free pages, `retain` one more holder.
++const Pool = struct {
++    refs: [page_count]u32 = std.mem.zeroes([page_count]u32),
++    mem: []u8 = &.{}, // the pages' bytes, the rig's
++
++    pub fn hold(p: *Pool, out: []u32) bool {
++        var n: usize = 0;
++        for (&p.refs, 0..) |*h, id| {
++            if (h.* != 0) continue;
++            out[n] = @intCast(id);
++            h.* = 1;
++            n += 1;
++            if (n == out.len) return true;
++        }
++        for (out[0..n]) |id| p.refs[id] = 0; // nothing held: what it took goes back
++        return false;
++    }
++
++    pub fn retain(p: *Pool, id: u32) void {
++        p.refs[id] += 1;
++    }
++
++    pub fn release(p: *Pool, id: u32) void {
++        p.refs[id] -= 1;
++    }
++
++    pub fn holders(p: *const Pool, id: u32) u32 {
++        return p.refs[id];
++    }
++
++    pub fn available(p: *const Pool) usize {
++        var n: usize = 0;
++        for (&p.refs) |h| if (h == 0) {
++            n += 1;
++        };
++        return n;
++    }
++};
++
++/// The family: the pool's pages' bytes in host memory, a state the words and fixed part past its pages' rows.
++const Fake = struct {
++    gpa: Allocator,
++    prompt: []const u32 = &.{},
++    pool: *Pool,
++    mem: []u8, // the pages' bytes: a page's rows at [0, page_bytes), as the paged caches sit on a page
++    live: usize = 0,
++    blanks: usize = 0,
++
++    fn of(ptr: *anyopaque) *Fake {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    /// A token row's 2 bytes, as a pass writes it into its page.
++    fn row(f: *const Fake, p: u32) [2]u8 {
++        const x = std.hash.Wyhash.hash(4, std.mem.sliceAsBytes(&[_]u32{f.prompt[p]}));
++        return .{ @truncate(x), @truncate(x >> 8) };
++    }
++
++    /// The stream's rows into the pages it took (a pass's writes), tokens [0, at).
++    fn fill(f: *Fake, pages: []const u32, at: u32) void {
++        for (0..at) |p| {
++            const r = f.row(@intCast(p));
++            const base = @as(usize, pages[p / page_tokens]) * page_bytes + (p % page_tokens) * 2;
++            @memcpy(f.mem[base..][0..2], &r);
++        }
++    }
++
++    /// The words and fixed part a fresh pass leaves: a state past its pages' rows.
++    fn build(f: *const Fake, at: u32, out: []u8) void {
++        std.mem.writeInt(u64, out[0..8], at, .little);
++        var sum: u64 = 0;
++        for (f.prompt[0..at]) |tok| sum = sum *% 31 +% tok;
++        std.mem.writeInt(u64, out[8..16], sum, .little);
++        @memcpy(out[16..24], "slotpart");
++    }
++
++    fn bytes(_: *anyopaque, _: u32) u64 {
++        return words_bytes + fixed_bytes; // the slot's bytes past the pages' rows
++    }
++
++    fn save(ptr: *anyopaque, _: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f = of(ptr);
++        if (at == 0 or at % page_tokens != 0 or at > f.prompt.len) return error.NotAtMark;
++        const k = try f.gpa.create(Kept);
++        errdefer f.gpa.destroy(k);
++        k.* = .{ .at = at, .slot = try f.gpa.alloc(u8, words_bytes + fixed_bytes) };
++        f.build(at, k.slot);
++        f.live += 1;
++        return k;
++    }
++
++    fn restore(ptr: *anyopaque, _: ?*anyopaque, saved: pc.Saved) anyerror!void {
++        const f = of(ptr);
++        const k: *Kept = @ptrCast(@alignCast(saved));
++        const want = try f.gpa.alloc(u8, k.slot.len);
++        defer f.gpa.free(want);
++        f.build(k.at, want);
++        if (!std.mem.eql(u8, want, k.slot)) return error.RestoreDiffered;
++    }
++
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f = of(ptr);
++        const k: *Kept = @ptrCast(@alignCast(saved));
++        f.gpa.free(k.slot);
++        f.gpa.destroy(k);
++        f.live -= 1;
++    }
++
++    fn family(f: *Fake) pc.Snapshots {
++        return .{ .ptr = f, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop, .rows = &image } };
++    }
++
++    const Kept = struct { at: u32, slot: []u8 };
++
++    /// The store's tiny image: the words, a state's rows a row a token (its pages' rows), the fixed part.
++    const image: rows.Image = .{ .parts = partsFn, .gather = gatherFn, .blank = blankFn, .scatter = scatterFn, .blank_pages = blankPagesFn };
++
++    fn partsFn(_: *anyopaque, at: u32, out: *std.ArrayList(rows.image.Part), a: Allocator) anyerror!void {
++        try out.appendSlice(a, &.{
++            .{ .bytes = words_bytes },
++            .{ .bytes = @as(u64, at) * 2, .row = 2 },
++            .{ .bytes = fixed_bytes },
++        });
++    }
++
++    /// Which bytes of the image [off, off + len) are: the words, a run of a page's rows, or the fixed part.
++    const Seg = union(enum) { words: usize, page: struct { id: u32, at: usize }, fixed: usize };
++
++    fn seg(_: *Fake, k: *Kept, pages: []const u32, off: u64, _: usize) !Seg {
++        const rows_end = words_bytes + @as(u64, k.at) * 2;
++        if (off < words_bytes) return .{ .words = @intCast(off) };
++        if (off < rows_end) {
++            const b = off - words_bytes;
++            const k_i = b / page_bytes;
++            if (k_i >= pages.len) return error.BadKeptRange;
++            return .{ .page = .{ .id = pages[@intCast(k_i)], .at = @intCast(b % page_bytes) } };
++        }
++        if (off < rows_end + fixed_bytes) return .{ .fixed = @intCast(off - rows_end) };
++        return error.BadKeptRange;
++    }
++
++    fn gatherFn(ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++        const f = of(ptr);
++        const k: *Kept = @ptrCast(@alignCast(saved));
++        var o: usize = 0;
++        for (ranges) |g| {
++            var done: u64 = 0;
++            while (done < g.len) {
++                const s = try seg(f, k, pages, g.off + done, @intCast(g.len - done));
++                const n: usize = switch (s) {
++                    .words => |at| @min(@as(usize, @intCast(g.len - done)), words_bytes - at),
++                    .page => |p| @min(@as(usize, @intCast(g.len - done)), page_bytes - p.at),
++                    .fixed => |at| @min(@as(usize, @intCast(g.len - done)), fixed_bytes - at),
++                };
++                const host = out[o..][0..n];
++                switch (s) {
++                    .words => |at| @memcpy(host, k.slot[at..][0..n]),
++                    .page => |p| @memcpy(host, f.mem[@as(usize, p.id) * page_bytes + p.at ..][0..n]),
++                    .fixed => |at| @memcpy(host, k.slot[words_bytes + at ..][0..n]),
++                }
++                done += n;
++                o += n;
++            }
++        }
++    }
++
++    fn blankFn(_: *anyopaque, _: u32) anyerror!pc.Saved {
++        return error.NoSlot; // the paged store recalls into pages, never into a copy alone
++    }
++
++    fn blankPagesFn(ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!pc.Saved {
++        const f = of(ptr);
++        if (at % page_tokens != 0) return error.BadKeptRange;
++        const k = try f.gpa.create(Kept);
++        errdefer f.gpa.destroy(k);
++        const slot = try f.gpa.alloc(u8, words_bytes + fixed_bytes);
++        errdefer f.gpa.free(slot);
++        @memset(slot, 0);
++        out.resize(f.gpa, at / page_tokens) catch return error.LaneMemory;
++        if (!f.pool.hold(out.items)) return error.LaneMemory; // the pages held for the caller's tree
++        k.* = .{ .at = at, .slot = slot };
++        f.live += 1;
++        f.blanks += 1;
++        return k;
++    }
++
++    fn scatterFn(ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++        const f = of(ptr);
++        const k: *Kept = @ptrCast(@alignCast(saved));
++        var o: usize = 0;
++        for (ranges) |g| {
++            var done: u64 = 0;
++            while (done < g.len) {
++                const s = try seg(f, k, pages, g.off + done, @intCast(g.len - done));
++                const n: usize = switch (s) {
++                    .words => |at| @min(@as(usize, @intCast(g.len - done)), words_bytes - at),
++                    .page => |p| @min(@as(usize, @intCast(g.len - done)), page_bytes - p.at),
++                    .fixed => |at| @min(@as(usize, @intCast(g.len - done)), fixed_bytes - at),
++                };
++                const part = in[o..][0..n];
++                switch (s) {
++                    .words => |at| @memcpy(k.slot[at..][0..n], part),
++                    .page => |p| @memcpy(f.mem[@as(usize, p.id) * page_bytes + p.at ..][0..n], part),
++                    .fixed => |at| @memcpy(k.slot[words_bytes + at ..][0..n], part),
++                }
++                done += n;
++                o += n;
++            }
++        }
++    }
++};
++
++/// The store over a fake pool: `mem` the pages' bytes, the disk tier attached.
++const Rig = struct {
++    gpa: Allocator,
++    f: Fake,
++    pool: Pool,
++    s: radix.Store,
++    r: *rows.Rows,
++
++    fn open(gpa: Allocator, root: []const u8, identity: u64) !*Rig {
++        const x = try gpa.create(Rig);
++        errdefer gpa.destroy(x);
++        const mem = try gpa.alloc(u8, page_count * page_bytes);
++        errdefer gpa.free(mem);
++        @memset(mem, 0);
++        x.* = .{ .gpa = gpa, .f = undefined, .pool = .{ .mem = mem }, .s = undefined, .r = undefined };
++        x.f = .{ .gpa = gpa, .pool = &x.pool, .mem = mem };
++        const family = x.f.family();
++        x.s = try radix.Store.init(gpa, family, radix.pagesOf(Pool, &x.pool, page_bytes), .{ .page = page_tokens, .min_gap = 8, .min_prompt = 0 });
++        errdefer x.s.deinit();
++        x.s.limit(.{ .pages = page_count, .snaps = 8 });
++        x.r = try rows.Rows.open(gpa, family, .{
++            .root = root,
++            .identity = identity,
++            .cap = 1 << 30,
++            .floor = 0,
++            .daily = 1 << 30,
++            .sync_writes = true,
++        });
++        errdefer x.r.deinit();
++        x.r.prefill_rate = 1.0; // a token a second: reading from disk pays over prefilling
++        x.s.attachDisk(x.r);
++        return x;
++    }
++
++    fn close(x: *Rig) void {
++        x.s.deinit(); // the writer's queued saves go first (their pages' holds back)
++        x.r.deinit();
++        x.gpa.free(x.f.mem);
++        x.gpa.destroy(x);
++    }
++
++    /// A pass of `prompt`: the pages a stream takes and fills with its rows, a keep at each mark, the stream's end
++    /// (its holds go; the tree's remain on the kept pages).
++    fn pass(x: *Rig, prompt: []const u32, marks: []const u32) !void {
++        x.f.prompt = prompt;
++        const np = prompt.len / page_tokens;
++        var mine: [page_count]u32 = undefined;
++        try t.expect(x.pool.hold(mine[0..np]));
++        x.f.fill(mine[0..np], @intCast(prompt.len));
++        for (marks) |m| {
++            var path: [page_count]u32 = undefined;
++            const kept = x.s.keep(prompt, m, null, mine[0 .. m / page_tokens], path[0 .. m / page_tokens]);
++            try t.expect(kept.held);
++        }
++        for (mine[0..np]) |id| x.pool.release(id);
++    }
++
++    /// The writer runs (sync writes): the queued saves land.
++    fn drain(x: *Rig) void {
++        while (rows.write.step(x.r)) {}
++    }
++
++    /// Whether the pages' rows of a state at `at` are a fresh pass's.
++    fn rowsOk(x: *Rig, pages: []const u32, at: u32) !void {
++        for (0..at) |p| {
++            const r = x.f.row(@intCast(p));
++            const base = @as(usize, pages[p / page_tokens]) * page_bytes + (p % page_tokens) * 2;
++            try t.expectEqualSlices(u8, &r, x.f.mem[base..][0..2]);
++        }
++    }
++};
++
++test "TF_KV_SHARE's disk tier: a 2-page state written behind, its pages held while the save reads them" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
++    defer t.allocator.free(root);
++    const x = try Rig.open(t.allocator, root, 9);
++    defer x.close();
++    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++    try x.pass(&prompt, &.{8});
++    x.drain();
++    try t.expectEqual(@as(usize, 1), x.s.tree.snaps);
++    try t.expectEqual(@as(usize, 2), x.s.tree.held_pages);
++    // the save ran: the state on disk, its pages the tree's alone again
++    try t.expectEqual(@as(usize, 1), x.r.states.items.len);
++    try t.expectEqual(@as(u64, 1), x.r.counts.writes);
++    try t.expectEqual(@as(usize, 0), x.s.saves.items.len);
++    for (x.s.find(&prompt).?.pages) |id| try t.expectEqual(@as(u32, 1), x.pool.holders(id));
++}
++
++test "TF_KV_SHARE's disk tier: an eviction while the save is queued stages it, its pages held to the end" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
++    defer t.allocator.free(root);
++    const x = try Rig.open(t.allocator, root, 10);
++    defer x.close();
++    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++    try x.pass(&prompt, &.{8});
++    // The save is queued, its pages held once more: the tree may drop the leaf under the writer and the pool
++    // cannot reuse the pages under it.
++    const node = x.s.find(&prompt).?;
++    try t.expectEqual(@as(u32, 2), x.pool.holders(node.pages[0])); // the tree's and the writer's
++    var full: [page_count - 2]u32 = undefined;
++    try t.expect(x.pool.hold(&full)); // the rest of the pool: no page free but the save's
++    x.s.tree.evict(node); // the store's evicting hook stages the queued save now
++    try t.expectEqual(@as(usize, 0), x.s.tree.snaps);
++    try t.expectEqual(@as(usize, 1), x.r.states.items.len); // the state landed before its pages went
++    try t.expectEqual(@as(u64, 1), x.r.counts.writes);
++    for (&full) |id| x.pool.release(id);
++    try t.expectEqual(@as(usize, page_count), x.pool.available()); // the writer's holds went with the write
++}
++
++test "TF_KV_SHARE's disk tier: a miss recalls the state into pool pages, its pages adopted like any kept state's" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
++    defer t.allocator.free(root);
++    {
++        const x = try Rig.open(t.allocator, root, 11);
++        defer x.close();
++        const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++        try x.pass(&prompt, &.{8});
++        x.drain();
++        try t.expectEqual(@as(usize, 1), x.r.states.items.len);
++    }
++    // A restart: a new store over the same pool reads the state back into pool pages it holds.
++    const x = try Rig.open(t.allocator, root, 11);
++    defer x.close();
++    const longer = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
++    x.f.prompt = &longer;
++    var adopt: std.ArrayList(u32) = .empty;
++    defer {
++        for (adopt.items) |id| x.pool.release(id); // the caller's holds; the tree's go with the store
++        adopt.deinit(t.allocator);
++    }
++    const plan = try x.s.begin(t.allocator, &longer, 12, &.{}, null, &adopt);
++    defer t.allocator.free(plan.marks);
++    try t.expectEqual(@as(u32, 8), plan.from); // the recalled state is the resume
++    try t.expectEqual(@as(usize, 2), adopt.items.len); // its 2 pages adopted
++    try t.expectEqual(@as(usize, 1), x.f.blanks);
++    try t.expectEqual(@as(u32, 2), x.pool.holders(adopt.items[0])); // the tree's and the caller's
++    try x.rowsOk(adopt.items, 8); // the rows came back into the pages, a fresh pass's bytes
++    try t.expectEqual(@as(usize, 1), x.f.live);
++    // The tree's state goes; a pool with no room left cannot recall: the pass runs from the start.
++    x.s.tree.evict(x.s.find(&longer).?);
++    var full: [page_count - 2]u32 = undefined;
++    try t.expect(x.pool.hold(&full));
++    const again = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++    var adopt2: std.ArrayList(u32) = .empty;
++    defer adopt2.deinit(t.allocator);
++    const plan2 = try x.s.begin(t.allocator, &again, 8, &.{}, null, &adopt2);
++    defer t.allocator.free(plan2.marks);
++    try t.expectEqual(@as(u32, 0), plan2.from);
++    try t.expectEqual(@as(usize, 0), adopt2.items.len);
++}
++
++test "TF_KV_SHARE's disk tier: two identities over one root keep their own directories and their own sets" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
++    defer t.allocator.free(root);
++    const x = try Rig.open(t.allocator, root, 12);
++    defer x.close();
++    const y = try Rig.open(t.allocator, root, 13);
++    defer y.close();
++    try t.expect(std.mem.eql(u8, x.r.root, y.r.root));
++    try t.expect(!std.mem.eql(u8, x.r.dir, y.r.dir)); // each identity word its own directory
++    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++    try x.pass(&prompt, &.{8});
++    x.drain();
++    try t.expectEqual(@as(usize, 1), x.r.states.items.len);
++    try t.expectEqual(@as(usize, 0), y.r.states.items.len); // the other identity's store holds none of it
++}
+diff --git a/zig/src/core/prompt_radix_tree.zig b/zig/src/core/prompt_radix_tree.zig
+index 14ea5eff..50a8c63e 100644
+--- a/zig/src/core/prompt_radix_tree.zig
++++ b/zig/src/core/prompt_radix_tree.zig
+@@ -50,6 +50,12 @@ pub const Node = struct {
+     used: u64 = 0,
+ };
+ 
++/// Called before a state's entry is freed (a paged store with a disk store stages a save still queued, rows_write).
++pub const Evict = struct {
++    ctx: *anyopaque,
++    call: *const fn (ctx: *anyopaque, n: *Node) void,
++};
++
+ pub const Tree = struct {
+     gpa: Allocator,
+     family: Snapshots,
+@@ -64,6 +70,7 @@ pub const Tree = struct {
+     held_pages: usize = 0,
+     snaps: usize = 0,
+     counts: Counts = .{},
++    on_evict: ?Evict = null,
+ 
+     pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, page: usize, ahead: usize) !Tree {
+         const root = try gpa.create(Node);
+@@ -219,6 +226,7 @@ pub const Tree = struct {
+     /// Frees the state at `n`, and the nodes below nothing keeps.
+     pub fn evict(t: *Tree, n: *Node) void {
+         const e = n.entry orelse return;
++        if (t.on_evict) |h| h.call(h.ctx, n); // a save still queued is staged now (its pages are held)
+         t.family.vtable.drop(t.family.ptr, e.saved);
+         t.gpa.free(e.last);
+         n.entry = null;
+diff --git a/zig/src/core/rows_fake.zig b/zig/src/core/rows_fake.zig
+index 49eb559e..38bd03af 100644
+--- a/zig/src/core/rows_fake.zig
++++ b/zig/src/core/rows_fake.zig
+@@ -38,7 +38,6 @@ pub const Fake = struct {
+     pub fn snapshots(f: *Fake) pc.Snapshots {
+         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .rows = &.{ .parts = partsFn, .gather = gatherFn, .blank = blankFn, .scatter = scatterFn } } };
+     }
+-
+     fn of(ptr: *anyopaque) *Fake {
+         return @ptrCast(@alignCast(ptr));
+     }
+@@ -133,7 +132,8 @@ pub const Fake = struct {
+     fn partsFn(_: *anyopaque, at: u32, out: *std.ArrayList(image.Part), a: Allocator) anyerror!void {
+         try layout(at, out, a);
+     }
+-    fn gatherFn(ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, out: []u8) anyerror!void {
++    fn gatherFn(ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, out: []u8) anyerror!void {
++        _ = pages;
+         const f = of(ptr);
+         f.gathered += 1;
+         if (f.gathers) |*n| if (n.* == 0) return error.GatherFailed else {
+@@ -157,7 +157,8 @@ pub const Fake = struct {
+         f.blanks += 1;
+         return k;
+     }
+-    fn scatterFn(ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, in: []const u8) anyerror!void {
++    fn scatterFn(ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, in: []const u8) anyerror!void {
++        _ = pages;
+         if (of(ptr).scatters) |*n| if (n.after == 0) return n.err else {
+             n.after -= 1;
+         };
+diff --git a/zig/src/core/rows_io.zig b/zig/src/core/rows_io.zig
+index 17db37d9..ccf65489 100644
+--- a/zig/src/core/rows_io.zig
++++ b/zig/src/core/rows_io.zig
+@@ -30,15 +30,17 @@ pub const Job = struct {
+     files: []File,
+     bytes: u64,
+     staged: u64,
++    final: bool = true, // the state's own file and metadata: its publish makes the entry (a piece names blocks alone)
++    new_blocks: u32 = 0, // a final job's: the pieces of this save that wrote blocks (its log line's count)
+     verify: bool = false,
+     began: i128 = 0,
+     done: std.atomic.Value(bool) = .init(false),
+     taken: bool = false,
+     failure: ?anyerror = null,
+ 
+-    /// The block files it writes: every file but the last, which is the state's own.
++    /// The block files it writes: every file but the last of a final job, which is the state's own.
+     pub fn blocks(j: *const Job) []File {
+-        return j.files[0..j.files.len -| 1];
++        return j.files[0 .. j.files.len - @intFromBool(j.final)];
+     }
+ 
+     pub fn destroy(j: *Job) void {
+@@ -138,7 +140,7 @@ pub const Worker = struct {
+     pub fn names(w: *Worker, name: chain.Name) bool {
+         w.lock();
+         defer w.mutex.unlock();
+-        for (w.slots) |s| if (s) |j| if (std.mem.eql(u8, &j.name, &name)) return true;
++        for (w.slots) |s| if (s) |j| if (j.final and std.mem.eql(u8, &j.name, &name)) return true;
+         return false;
+     }
+ 
+diff --git a/zig/src/core/rows_pool_select_test.zig b/zig/src/core/rows_pool_select_test.zig
+index beab09be..fff600b4 100644
+--- a/zig/src/core/rows_pool_select_test.zig
++++ b/zig/src/core/rows_pool_select_test.zig
+@@ -11,7 +11,7 @@ const Image = struct {
+     fn parts(_: *anyopaque, _: u32, out: *std.ArrayList(rows.image.Part), allocator: std.mem.Allocator) !void {
+         try out.append(allocator, .{ .bytes = 16 });
+     }
+-    fn gather(_: *anyopaque, saved: pc.Saved, _: []const rows.image.Range, out: []u8) !void {
++    fn gather(_: *anyopaque, saved: pc.Saved, _: []const u32, _: []const rows.image.Range, out: []u8) !void {
+         const state: *Fake.State = @ptrCast(@alignCast(saved));
+         std.mem.writeInt(u64, out[0..8], state.at, .little);
+         std.mem.writeInt(u64, out[8..16], state.sum, .little);
+@@ -23,7 +23,7 @@ const Image = struct {
+         defer f.at = previous;
+         return f.pooled().vtable.save(ptr, null, at);
+     }
+-    fn scatter(_: *anyopaque, saved: pc.Saved, _: []const rows.image.Range, bytes: []const u8) !void {
++    fn scatter(_: *anyopaque, saved: pc.Saved, _: []const u32, _: []const rows.image.Range, bytes: []const u8) !void {
+         const state: *Fake.State = @ptrCast(@alignCast(saved));
+         state.at = @intCast(std.mem.readInt(u64, bytes[0..8], .little));
+         state.sum = std.mem.readInt(u64, bytes[8..16], .little);
+diff --git a/zig/src/core/rows_read.zig b/zig/src/core/rows_read.zig
+index efd733e5..93e7f6e9 100644
+--- a/zig/src/core/rows_read.zig
++++ b/zig/src/core/rows_read.zig
+@@ -14,17 +14,32 @@ const Name = chain.Name;
+ 
+ /// Disk state `i` read into a new kept state of its family; a file that fails a check goes, with every state naming it.
+ pub fn read(r: *Rows, i: usize) !pc.Saved {
++    return readInto(r, i, null);
++}
++
++/// `read`, the state's leading rows taken into pool pages the store holds (their ids appended to `out`, each held for
++/// the caller; the family's `blank_pages`). Null when the family cannot: `read` alone.
++pub fn readPages(r: *Rows, i: usize, out: *std.ArrayList(u32)) !pc.Saved {
++    return readInto(r, i, out);
++}
++
++fn readInto(r: *Rows, i: usize, pages: ?*std.ArrayList(u32)) !pc.Saved {
+     const f = r.family.vtable;
+     const s = r.states.items[i];
+     const t0 = write.nowNs();
+     var plan = try prefetch.Plan.of(r, r.gpa, &s);
+     defer plan.deinit(r.gpa);
+     const ahead = if (r.fetch) |p| p.take(s.name, &plan) else null; // read on the I/O thread, its files checked there
+-    const saved = try r.img.blank(r.family.ptr, s.at);
++    var ids: []const u32 = &.{};
++    const saved = if (pages) |out| blk: {
++        const got = try r.img.blank_pages.?(r.family.ptr, s.at, out);
++        ids = out.items;
++        break :blk got;
++    } else try r.img.blank(r.family.ptr, s.at);
+     errdefer f.drop(r.family.ptr, saved);
+     var bytes: u64 = 0;
+     for (plan.pieces) |p| {
+-        if (ahead) |a| try scatter(r, p.name, prefetch.ext(p.kind), saved, plan.rangesOf(p), a.payload(p)) else bytes += try one(r, p.name, p.kind, prefetch.ext(p.kind), p.at, plan.rangesOf(p), saved);
++        if (ahead) |a| try scatter(r, p.name, prefetch.ext(p.kind), saved, ids, plan.rangesOf(p), a.payload(p)) else bytes += try one(r, p.name, p.kind, prefetch.ext(p.kind), p.at, plan.rangesOf(p), saved, ids);
+     }
+     if (ahead) |a| bytes = a.disk;
+     const ns = if (ahead) |a| a.ns else write.nowNs() - t0;
+@@ -37,7 +52,7 @@ pub fn read(r: *Rows, i: usize) !pc.Saved {
+ }
+ 
+ /// One file's payload read past the page cache, checked, and copied into `ranges` of `saved`; its bytes on disk.
+-fn one(r: *Rows, name: Name, kind: file.Kind, ext: []const u8, at: u32, ranges: []const image.Range, saved: pc.Saved) !u64 {
++fn one(r: *Rows, name: Name, kind: file.Kind, ext: []const u8, at: u32, ranges: []const image.Range, saved: pc.Saved, pages: []const u32) !u64 {
+     const n = image.total(ranges);
+     var buf: [1200]u8 = undefined;
+     const p = try file.path(&buf, r.dir, &chain.hex(name), ext, false);
+@@ -46,7 +61,7 @@ fn one(r: *Rows, name: Name, kind: file.Kind, ext: []const u8, at: u32, ranges:
+     if (o.trailer.payload != n or o.trailer.block != r.keying.block or o.trailer.at != at) return bad(r, name, ext, error.RowsRead);
+     const stage = try r.staged(n);
+     const got = file.payload(&o, stage) catch |err| return bad(r, name, ext, err);
+-    try scatter(r, name, ext, saved, ranges, got);
++    try scatter(r, name, ext, saved, pages, ranges, got);
+     return o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer);
+ }
+ 
+@@ -59,8 +74,8 @@ fn refused(err: anyerror) bool {
+ }
+ 
+ /// A file's payload copied into `ranges` of `saved`; a refusal of its words is a failed check of the file.
+-fn scatter(r: *Rows, name: Name, ext: []const u8, saved: pc.Saved, ranges: []const image.Range, in: []const u8) !void {
+-    r.img.scatter(r.family.ptr, saved, ranges, in) catch |err| return if (refused(err)) bad(r, name, ext, err) else err;
++fn scatter(r: *Rows, name: Name, ext: []const u8, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, in: []const u8) !void {
++    r.img.scatter(r.family.ptr, saved, pages, ranges, in) catch |err| return if (refused(err)) bad(r, name, ext, err) else err;
+ }
+ 
+ /// A file that failed its checks deleted, with every state that names it; the error passed on.
+diff --git a/zig/src/core/rows_stage_test.zig b/zig/src/core/rows_stage_test.zig
+index 5485058b..56b33274 100644
+--- a/zig/src/core/rows_stage_test.zig
++++ b/zig/src/core/rows_stage_test.zig
+@@ -1,6 +1,7 @@
+ //! Staging: a block still being written is charged and gathered once, and a save that fits the permit waits for it.
+ const std = @import("std");
+ const rows = @import("rows_store.zig");
++const pc = @import("prompt_cache.zig");
+ const fixture = @import("rows_async_fixture.zig");
+ const Fixture = fixture.Fixture;
+ const Hold = fixture.Gate;
+@@ -123,7 +124,7 @@ test "rows stage: a job a fence cancelled promises no block, so the next save wr
+     try t.expect(x.f.restored_ok);
+ }
+ 
+-test "rows stage: a save larger than the permit alone is skipped, not held" {
++test "rows stage: a save larger than the permit is written in pieces as it frees; past any piece it is skipped" {
+     const x = try Fixture.open("stage-big", .finish, false, 1 << 20);
+     defer x.close();
+     var hold: Hold = .{};
+@@ -132,17 +133,33 @@ test "rows stage: a save larger than the permit alone is skipped, not held" {
+     const first = fixture.prompt(22);
+     try x.keep(&first, 600);
+     try Hold.wait(&hold.entered);
+-    x.r.worker.?.limit = x.r.worker.?.bytes();
++    x.r.worker.?.limit = x.r.worker.?.bytes(); // the job in flight holds the whole permit
+     const second = fixture.prompt(23);
+     try x.keep(&second, 1000);
+-    try t.expectEqual(@as(u64, 1), x.r.counts.skipped);
+-    try t.expectEqual(@as(usize, 0), x.r.queue.items.len);
+-    try t.expectEqual(error.StagingFull, x.r.failures.records[0].?.err);
++    try t.expectEqual(@as(usize, 1), x.r.queue.items.len); // even a piece waits while the permit is held
++    try t.expectEqual(@as(u64, 0), x.r.counts.skipped);
+     try t.expectEqual(@as(usize, 1), x.r.worker.?.pending());
+     try t.expect(!rows.write.ready(x.r));
+     hold.release.store(true, .release);
+-    try x.settle();
+-    try t.expectEqual(@as(usize, 1), x.r.states.items.len);
++    try x.idle(2);
++    try t.expectEqual(@as(usize, 2), x.r.states.items.len); // written in pieces once the permit freed
++    // A save past any piece at all: a permit of none skips it, as one larger than the permit alone was skipped.
++    const y = try Fixture.open("stage-big-none", .finish, false, 1 << 20);
++    defer y.close();
++    var hold2: Hold = .{};
++    defer hold2.release.store(true, .release);
++    y.r.file_io = hold2.io();
++    const third = fixture.prompt(29);
++    try y.keep(&third, 600);
++    try Hold.wait(&hold2.entered);
++    y.r.worker.?.limit = 0;
++    const fourth = fixture.prompt(30);
++    try y.keep(&fourth, 600);
++    try t.expectEqual(@as(u64, 1), y.r.counts.skipped);
++    try t.expectEqual(error.StagingFull, y.r.failures.records[0].?.err);
++    hold2.release.store(true, .release);
++    try y.settle();
++    try t.expectEqual(@as(usize, 1), y.r.states.items.len);
+ }
+ 
+ test "rows stage: an eviction cannot wait, so a full permit skips the copy" {
+@@ -180,12 +197,13 @@ test "rows stage: a newer save that fits beside the jobs in flight is staged ahe
+     x.r.worker.?.limit = 2 * used - 1; // room beside the first job for less than another like it
+     const second = fixture.prompt(27);
+     try x.keep(&second, 600);
+-    try t.expectEqual(@as(usize, 1), x.r.queue.items.len);
++    try t.expectEqual(@as(usize, 1), x.r.queue.items.len); // the whole save waits: its first piece is staged
++    try t.expectEqual(@as(usize, 2), x.r.worker.?.pending());
+     try t.expect(!rows.write.ready(x.r));
+     const third = fixture.prompt(28);
+     try x.keep(&third, 300);
+-    try t.expectEqual(@as(usize, 2), x.r.worker.?.pending());
+-    try t.expectEqual(@as(usize, 1), x.r.queue.items.len);
++    try t.expectEqual(@as(usize, 2), x.r.queue.items.len); // both wait past their first pieces: the room is taken
++    try t.expectEqual(@as(usize, 3), x.r.worker.?.pending());
+     try t.expectEqual(@as(u64, 0), x.r.counts.skipped);
+     hold.release.store(true, .release);
+     try x.idle(3);
+@@ -227,7 +245,7 @@ test "rows stage: a save that waited for room and lost its entry is counted as s
+     const second = fixture.prompt(32);
+     try x.keep(&second, 600);
+     try t.expectEqual(@as(usize, 1), x.r.queue.items.len);
+-    for (x.s.entries.items, 0..) |e, i| if (e == x.r.waiting.?) {
++    for (x.s.entries.items, 0..) |e, i| if (e == @as(*pc.Entry, @ptrCast(@alignCast(x.r.waiting.?)))) {
+         x.s.remove(i);
+         break;
+     };
+@@ -258,7 +276,7 @@ test "rows stage: losing the older of two waiting saves counts it as skipped" {
+     try t.expectEqual(@as(usize, 2), x.r.queue.items.len);
+     const newer = x.r.waiting.?;
+     try t.expect(newer != older);
+-    for (x.s.entries.items, 0..) |e, i| if (e == older) {
++    for (x.s.entries.items, 0..) |e, i| if (e == @as(*pc.Entry, @ptrCast(@alignCast(older)))) {
+         x.s.remove(i);
+         break;
+     };
+@@ -266,7 +284,7 @@ test "rows stage: losing the older of two waiting saves counts it as skipped" {
+     try t.expectEqual(@as(u64, 1), x.r.counts.skipped);
+     try t.expectEqual(error.StagingFull, x.r.failures.records[0].?.err);
+     try t.expect(x.r.waiting == newer);
+-    try t.expect(x.r.queue.items[0].entry == newer and x.r.queue.items[0].waited);
++    try t.expect(x.r.queue.items[0].kept.owner == newer and x.r.queue.items[0].waited);
+     hold.release.store(true, .release);
+     try x.idle(2);
+     try t.expectEqual(@as(u64, 1), x.r.counts.skipped);
+@@ -295,7 +313,7 @@ test "rows stage: a save that waited and loses its entry after a reap still coun
+     try x.keep(&third, 600);
+     const staged_as = x.r.next_job;
+     try t.expectEqual(@as(usize, 1), x.r.queue.items.len);
+-    for (x.s.entries.items, 0..) |e, i| if (e == lost) {
++    for (x.s.entries.items, 0..) |e, i| if (e == @as(*pc.Entry, @ptrCast(@alignCast(lost)))) {
+         x.s.remove(i);
+         break;
+     };
+diff --git a/zig/src/core/rows_store.zig b/zig/src/core/rows_store.zig
+index 382ea4cb..b409f7f4 100644
+--- a/zig/src/core/rows_store.zig
++++ b/zig/src/core/rows_store.zig
+@@ -22,14 +22,49 @@ pub const block_tokens = 256;
+ pub const Image = struct {
+     /// A state's image at `at`, its parts in order, appended to `out`.
+     parts: *const fn (ptr: *anyopaque, at: u32, out: *std.ArrayList(image.Part), a: Allocator) anyerror!void,
+-    /// Copy into owned `out`; all GPU producers and copies must complete before returning.
+-    gather: *const fn (ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, out: []u8) anyerror!void,
++    /// Copy into owned `out`; all GPU producers and copies must complete before returning. `pages`: the pool pages a
++    /// paged store's state keeps its rows in, in token order (empty: the state's own storage holds every row).
++    gather: *const fn (ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, out: []u8) anyerror!void,
+     /// A new kept state of `at` tokens, its image filled by `scatter` and then restored as any other.
+     blank: *const fn (ptr: *anyopaque, at: u32) anyerror!pc.Saved,
+-    /// Copy `in`, back to back, into `ranges` of `saved`'s image.
+-    scatter: *const fn (ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, in: []const u8) anyerror!void,
++    /// Copy `in`, back to back, into `ranges` of `saved`'s image. `pages`: `gather`'s (a read into pool pages).
++    scatter: *const fn (ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, in: []const u8) anyerror!void,
+     /// Whether `saved`'s image can still be read whole (null: always).
+     whole: ?*const fn (ptr: *anyopaque, saved: pc.Saved) bool = null,
++    /// A new kept state of `at` tokens whose leading rows go into pool pages the store holds (their ids appended to
++    /// `out`, each held once more for the caller; the store's tree releases them when it takes the state), its slot
++    /// past them; null: `blank` alone (null with a paged store's recall: it cannot recall into pages).
++    blank_pages: ?*const fn (ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!pc.Saved = null,
++};
++
++/// A kept state as the disk store takes it, both stores': the flat cache's Entry (a copy holds every row), or a
++/// paged tree's node's (its rows in the tree's pages, each held once more while the save reads them).
++pub const Kept = struct {
++    /// Who owns the state: `dropped` and `evicted` match the queue by it.
++    owner: *anyopaque,
++    /// The state's tokens and the lookahead past them: the blocks are theirs.
++    tokens: []const u32,
++    /// Canonical row arithmetic through `at` (a paged store keeps none).
++    spans: []const Span = &.{},
++    at: u32,
++    saved: pc.Saved,
++    shared: bool = false,
++    /// The pool pages the state's rows sit in, in token order (a paged store's; empty: a copy holds every row).
++    pages: []const u32 = &.{},
++    /// Called when the save no longer reads the state (staged, ended or dropped): the store gives its pages back.
++    freed: ?Free = null,
++
++    /// Who the save's pages go back to, and how.
++    pub const Free = struct {
++        ctx: *anyopaque,
++        call: *const fn (ctx: *anyopaque, owner: *anyopaque) void,
++    };
++
++    /// The flat store's entry as a view: its tokens and spans, nothing held (the entry outlives the save, or its
++    /// eviction and drop say so first).
++    pub fn of(e: *pc.Entry) Kept {
++        return .{ .owner = e, .tokens = e.tokens, .spans = e.decode_spans, .at = e.at, .saved = e.saved, .shared = e.shared };
++    }
+ };
+ 
+ /// A state on disk: its name and position, what it read, its file's bytes and its blocks' (each counted whole).
+@@ -112,7 +147,7 @@ pub const Rows = struct {
+     stopped: bool = false,
+     flush_clock: ?u64 = null, // a close protects states touched after this clock from older queued saves
+     next_job: u64 = 0,
+-    waiting: ?*pc.Entry = null, // the newest save refused room; while it is next, step waits for a reap
++    waiting: ?*anyopaque = null, // the newest save refused room; while it is next, step waits for a reap
+     failures: write.Failures = .{},
+     fetch: ?*@import("rows_prefetch.zig").Prefetch = null, // states read ahead for queued requests (a lane host's)
+ 
+@@ -150,7 +185,10 @@ pub const Rows = struct {
+         write.stop(r, write.nowNs());
+         if (r.fetch) |f| f.destroy();
+         if (r.job) |j| write.abort(r, j);
+-        for (r.queue.items) |q| r.gpa.free(q.starts);
++        for (r.queue.items) |*q| {
++            write.gave(r, q);
++            r.gpa.free(q.starts);
++        }
+         for (r.states.items) |*s| freeState(r.gpa, s);
+         r.states.deinit(r.gpa);
+         r.blocks.deinit(r.gpa);
+@@ -390,7 +428,10 @@ pub const Rows = struct {
+     pub fn forgetAll(r: *Rows) u64 {
+         write.fence(r);
+         if (r.job) |j| write.abort(r, j);
+-        for (r.queue.items) |q| r.gpa.free(q.starts);
++        for (r.queue.items) |*q| {
++            write.gave(r, q);
++            r.gpa.free(q.starts);
++        }
+         r.queue.clearRetainingCapacity();
+         const before = r.held();
+         for (r.states.items) |*s| {
+diff --git a/zig/src/core/rows_verify.zig b/zig/src/core/rows_verify.zig
+index a0ee2379..b5b9c13e 100644
+--- a/zig/src/core/rows_verify.zig
++++ b/zig/src/core/rows_verify.zig
+@@ -8,10 +8,10 @@ const Rows = @import("rows_store.zig").Rows;
+ const piece: u64 = 16 << 20;
+ 
+ /// Disk state `i` read into a new state and compared with `saved`, the kept state it was written from; a line logged.
+-pub fn state(r: *Rows, i: usize, saved: pc.Saved) void {
++pub fn state(r: *Rows, i: usize, saved: pc.Saved, pages: []const u32) void {
+     const at = r.states.items[i].at;
+     const quiet = @import("builtin").is_test;
+-    compare(r, i, saved) catch |err| {
++    compare(r, i, saved, pages) catch |err| {
+         r.counts.differed += 1;
+         if (!quiet) std.log.err("imprint verify: {d} tokens read back differ or failed ({s})", .{ at, @errorName(err) });
+         return;
+@@ -20,7 +20,7 @@ pub fn state(r: *Rows, i: usize, saved: pc.Saved) void {
+     if (!quiet) std.log.info("imprint verify: {d} tokens read back byte-equal to the kept state ({d} so far)", .{ at, r.counts.verified });
+ }
+ 
+-fn compare(r: *Rows, i: usize, saved: pc.Saved) !void {
++fn compare(r: *Rows, i: usize, saved: pc.Saved, pages: []const u32) !void {
+     const at = r.states.items[i].at;
+     const parts = try r.parts(r.gpa, at);
+     defer r.gpa.free(parts);
+@@ -37,8 +37,8 @@ fn compare(r: *Rows, i: usize, saved: pc.Saved) !void {
+         while (done < p.bytes) {
+             const n = @min(piece, p.bytes - done);
+             const g = [_]image.Range{.{ .off = off + done, .len = n }};
+-            try r.img.gather(r.family.ptr, saved, &g, a[0..@intCast(n)]);
+-            try r.img.gather(r.family.ptr, back, &g, b[0..@intCast(n)]);
++            try r.img.gather(r.family.ptr, saved, pages, &g, a[0..@intCast(n)]);
++            try r.img.gather(r.family.ptr, back, &.{}, &g, b[0..@intCast(n)]);
+             if (!std.mem.eql(u8, a[0..@intCast(n)], b[0..@intCast(n)])) return error.ImageDiffers;
+             done += n;
+         }
+diff --git a/zig/src/core/rows_write.zig b/zig/src/core/rows_write.zig
+index 0a924ae9..e94d47e3 100644
+--- a/zig/src/core/rows_write.zig
++++ b/zig/src/core/rows_write.zig
+@@ -8,6 +8,7 @@ const chain = @import("rows_chain.zig");
+ const sync = @import("rows_write_sync.zig");
+ pub const io = @import("rows_io.zig");
+ const Rows = store.Rows;
++const Kept = store.Kept;
+ pub const Want = sync.Want;
+ pub const Queued = sync.Queued;
+ pub const Job = sync.Job;
+@@ -26,22 +27,41 @@ pub const Failures = struct {
+     }
+ };
+ 
+-pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
++pub fn queued(r: *Rows, kept: Kept, starts: []const u32) void {
+     if (r.stopped) return;
+-    sync.queued(r, e, starts);
++    sync.queued(r, kept, starts);
++}
++
++/// The store's hold on a queued save given up: its pages released, its tokens freed (the store's own copies).
++pub fn gave(_: *Rows, q: *const sync.Queued) void {
++    if (q.kept.freed) |f| f.call(f.ctx, q.kept.owner);
+ }
+ 
+ /// Eviction removes only a save still queued (staged work owns no entry); one that waited for room counts as skipped.
+-pub fn dropped(r: *Rows, e: *pc.Entry) void {
+-    if (r.waiting == e) r.waiting = null;
+-    for (r.queue.items) |q| if (q.entry == e) {
++pub fn dropped(r: *Rows, owner: *anyopaque) void {
++    if (r.waiting == owner) r.waiting = null;
++    for (r.queue.items, 0..) |*q, i| if (q.kept.owner == owner) {
+         if (q.waited and !r.stopped) {
+             r.next_job +%= 1; // the id a save staged now would take, so no job in flight shares it
+-            skip(r, chain.state(r.keying, e.tokens, e.decode_spans, q.starts, e.at), e.at, error.StagingFull);
++            skip(r, chain.state(r.keying, q.kept.tokens, q.kept.spans, q.starts, q.kept.at), q.kept.at, error.StagingFull);
+         }
++        r.gpa.free(q.starts);
++        gave(r, q);
++        _ = r.queue.orderedRemove(i);
+         break;
+     };
+-    sync.dropped(r, e);
++    sync.dropped(r, owner);
++}
++
++/// A paged store's eviction: a save still queued is written now (its pages are held; the state leaves the tree).
++pub fn evicting(r: *Rows, owner: *anyopaque) void {
++    if (r.sync_writes) return sync.evicting(r, owner);
++    if (r.stopped) return;
++    reap(r);
++    for (r.queue.items, 0..) |*q, i| if (q.kept.owner == owner) {
++        _ = stage(r, r.queue.orderedRemove(i), false);
++        return;
++    };
+ }
+ 
+ pub fn pending(r: *const Rows) bool {
+@@ -56,16 +76,16 @@ pub fn ready(r: *const Rows) bool {
+ 
+ /// Whether the newest queued save was refused room by the jobs in flight and none has been taken since.
+ fn blocked(r: *const Rows) bool {
+-    const e = r.waiting orelse return false;
+-    return r.queue.items.len > 0 and r.queue.items[r.queue.items.len - 1].entry == e;
++    const o = r.waiting orelse return false;
++    return r.queue.items.len > 0 and r.queue.items[r.queue.items.len - 1].kept.owner == o;
+ }
+ 
+ /// A spill copies the entry before RAM releases it, without waiting for filesystem work or a byte permit.
+-pub fn evicted(r: *Rows, e: *pc.Entry) void {
+-    if (r.sync_writes) return sync.evicted(r, e);
++pub fn evicted(r: *Rows, owner: *anyopaque) void {
++    if (r.sync_writes) return sync.evicted(r, owner);
+     if (r.spill == .off or r.stopped) return;
+     reap(r);
+-    for (r.queue.items, 0..) |q, i| if (q.entry == e) {
++    for (r.queue.items, 0..) |*q, i| if (q.kept.owner == owner) {
+         // The entry leaves RAM now, so a full permit skips it rather than hold it.
+         _ = stage(r, r.queue.orderedRemove(i), false);
+         return;
+@@ -179,6 +199,17 @@ pub fn reap(r: *Rows) void {
+ }
+ 
+ fn publish(r: *Rows, j: *io.Job) !void {
++    if (!j.final) {
++        // A piece's blocks: complete files, published as any state's (its state's entry comes with the final job).
++        try r.blocks.ensureUnusedCapacity(r.gpa, @intCast(j.files.len));
++        for (j.files) |*f| {
++            try f.writer.?.publish();
++            const refs = if (r.blocks.get(chain.stem(f.trailer.name))) |b| b.refs else 0;
++            r.blocks.putAssumeCapacity(chain.stem(f.trailer.name), .{ .bytes = f.bytes, .refs = refs });
++            r.spent(f.bytes);
++        }
++        return;
++    }
+     if (r.find(j.name)) |_| return;
+     if (!complete(r, j)) return error.MissingBlock;
+     var s: store.State = .{ .name = j.name, .at = j.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = j.files[j.files.len - 1].bytes, .rows = 0, .used = 0, .shared = j.shared };
+@@ -204,7 +235,7 @@ fn publish(r: *Rows, j: *io.Job) !void {
+     r.touch(r.states.items.len - 1);
+     r.counts.writes += 1;
+     if (j.verify) r.counts.verified += 1;
+-    if (!@import("builtin").is_test) std.log.info("imprint: {d} tokens on disk: {d} new blocks and its own {d} MiB ({d} MiB this state, {d} MiB of rows it shares) in {d:.0} ms", .{ j.at, j.files.len - 1, s.own >> 20, j.bytes >> 20, s.rows >> 20, @as(f64, @floatFromInt(nowNs() - j.began)) / 1e6 });
++    if (!@import("builtin").is_test) std.log.info("imprint: {d} tokens on disk: {d} new blocks and its own {d} MiB ({d} MiB this state, {d} MiB of rows it shares) in {d:.0} ms", .{ j.at, j.new_blocks, s.own >> 20, j.bytes >> 20, s.rows >> 20, @as(f64, @floatFromInt(nowNs() - j.began)) / 1e6 });
+ }
+ 
+ /// Whether every block the job's state names is on disk or among the files it publishes now.
+@@ -220,16 +251,20 @@ fn complete(r: *const Rows, j: *const io.Job) bool {
+ 
+ /// Whether `q` left the queue, staged or skipped; false when it waits for room and is queued again (`may_wait`).
+ fn stage(r: *Rows, q: Queued, may_wait: bool) bool {
+-    const at = q.entry.at;
++    const at = q.kept.at;
+     r.next_job +%= 1;
+-    const name = chain.state(r.keying, q.entry.tokens, q.entry.decode_spans, q.starts, at);
++    const name = chain.state(r.keying, q.kept.tokens, q.kept.spans, q.starts, at);
+     const j = sync.prepare(r, q) catch |err| {
++        gave(r, &q);
+         skip(r, name, at, err);
+         return true;
+     } orelse return true;
+     var queued_again = false;
+     defer {
+-        if (!queued_again) r.gpa.free(j.starts);
++        if (!queued_again) {
++            r.gpa.free(j.starts);
++            gave(r, &q); // staged or skipped: the save no longer reads the state
++        }
+         r.gpa.free(j.parts);
+         r.gpa.free(j.wants);
+         r.gpa.free(j.own);
+@@ -238,8 +273,8 @@ fn stage(r: *Rows, q: Queued, may_wait: bool) bool {
+     stageJob(r, j, may_wait) catch |err| {
+         if (err == error.StagingBusy) {
+             queued_again = true;
+-            r.waiting = q.entry;
+-            r.queue.appendAssumeCapacity(.{ .entry = q.entry, .starts = q.starts, .waited = true });
++            r.waiting = q.kept.owner;
++            r.queue.appendAssumeCapacity(.{ .kept = q.kept, .starts = q.starts, .waited = true });
+             return false;
+         }
+         skip(r, j.name, at, err);
+@@ -260,26 +295,93 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
+     if (r.worker == null) r.worker = try io.Worker.open(r.dir, r.staging_bytes, r.file_io);
+     const w = r.worker.?;
+     if (w.names(prepared.name)) return;
+-    const e = prepared.entry;
+-    const metadata = 4 * (3 + e.tokens.len + 2 * e.decode_spans.len + prepared.starts.len);
++    const kept = prepared.kept;
++    const metadata = 4 * (3 + kept.tokens.len + 2 * kept.spans.len + prepared.starts.len);
+     var promised: io.Promised = .empty;
+     defer promised.deinit(r.gpa);
+-    var count: usize = 0;
++    // The whole state as the one job a save has always staged, when the permit holds it; else its missing blocks a
++    // piece at a time, block edges between pieces, its own file and metadata last (a 600k state under a 1 GiB permit).
++    if (try whole(r, w, prepared, kept, &promised, metadata, may_wait)) return;
++    var wi: usize = 0;
++    var new_blocks: u32 = 0;
++    while (wi < prepared.wants.len) {
++        try w.promised(r.gpa, &promised);
++        var end = wi;
++        var bytes: u64 = 0;
++        var count: usize = 0;
++        while (end < prepared.wants.len) : (end += 1) {
++            const want = prepared.wants[end];
++            if (!lacks(r, &promised, want)) continue;
++            const next = bytes + want.bytes + @sizeOf(io.Job) + (count + 1) * @sizeOf(io.File) + 4 * @sizeOf([]const u8);
++            if (count > 0 and !w.fits(next)) break; // the permit holds this piece's blocks alone
++            if (count == 0 and !w.fits(next)) return if (may_wait and w.busy(next)) error.StagingBusy else error.StagingFull;
++            bytes += want.bytes;
++            count += 1;
++        }
++        if (count == 0) { // everything from `wi` on is on disk or in flight: the next run of missing blocks
++            wi = end;
++            continue;
++        }
++        try piece(r, w, prepared, kept, &promised, wi, end, bytes, count, may_wait);
++        new_blocks += @intCast(count);
++        wi = end;
++    }
++    // The state's own file and metadata last: its publish makes the entry, once every block it names is on disk.
+     try w.promised(r.gpa, &promised);
+-    var bytes = newBytes(r, &promised, prepared, metadata, &count);
++    const own_bytes = image.total(prepared.own) + metadata + @sizeOf(file.Trailer);
++    const charge = own_bytes + @sizeOf(io.Job) + @sizeOf(io.File) + prepared.wants.len * @sizeOf(Want) + 4 * @sizeOf([]const u8);
++    if (!w.fits(charge)) return if (may_wait and w.busy(charge)) error.StagingBusy else error.StagingFull;
++    const reserved = w.reserved();
++    if (!r.budget(own_bytes + reserved)) return error.DailyBudgetSpent;
++    if (!r.room(own_bytes + reserved)) return error.OverCap;
++    if (r.admission.reserve(r.dir, own_bytes) != .ready) return error.UnderFreeDiskFloor;
++    errdefer r.admission.finish(r.dir, own_bytes, true);
++    const j = try io.allocator.create(io.Job);
++    errdefer io.allocator.destroy(j);
++    var arena = std.heap.ArenaAllocator.init(io.allocator);
++    errdefer arena.deinit();
++    const a = arena.allocator();
++    const files = try a.alloc(io.File, 1);
++    files[0] = .{ .trailer = .{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = prepared.name, .at = kept.at, .block = r.keying.block, .flags = @intFromBool(kept.shared) }, .payload = try a.alloc(u8, @intCast(image.total(prepared.own))) };
++    if (files[0].payload.len > 0) try r.img.gather(r.family.ptr, kept.saved, kept.pages, prepared.own, files[0].payload);
++    const tokens = try a.dupe(u32, kept.tokens);
++    const spans = try a.dupe(@import("cache_modes.zig").Span, kept.spans);
++    const starts = try a.dupe(u32, prepared.starts);
++    const counts = try a.create([3]u32);
++    counts.* = .{ @intCast(tokens.len), @intCast(spans.len), @intCast(starts.len) };
++    files[0].meta = try a.dupe([]const u8, &.{ std.mem.asBytes(counts), std.mem.sliceAsBytes(tokens), std.mem.sliceAsBytes(spans), std.mem.sliceAsBytes(starts) });
++    const wants = try a.dupe(Want, prepared.wants);
++    r.next_job +%= 1;
++    j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = kept.at, .shared = kept.shared, .tokens = tokens, .spans = spans, .starts = starts, .wants = wants, .files = files, .bytes = own_bytes, .staged = charge, .final = true, .new_blocks = new_blocks, .verify = r.verify, .began = prepared.began };
++    w.submit(j);
++}
++
++/// The whole state as one job, gathered and submitted now; false when the staging permit cannot hold it, so its
++/// save goes in pieces (the budget, the cap or the floor refuse the save as they always have).
++fn whole(r: *Rows, w: *io.Worker, prepared: *const Job, kept: Kept, promised: *io.Promised, metadata: usize, _: bool) !bool {
++    var bytes: u64 = image.total(prepared.own) + metadata + @sizeOf(file.Trailer);
++    var count: usize = 1;
+     var charge: u64 = 0;
+     while (true) {
++        count = 1;
++        bytes = image.total(prepared.own) + metadata + @sizeOf(file.Trailer);
++        for (prepared.wants) |want| if (lacks(r, promised, want)) {
++            bytes += want.bytes;
++            count += 1;
++        };
+         charge = bytes + @sizeOf(io.Job) + count * @sizeOf(io.File) + prepared.wants.len * @sizeOf(Want) + 4 * @sizeOf([]const u8);
+-        if (!w.fits(charge)) return if (may_wait and w.busy(charge)) error.StagingBusy else error.StagingFull;
++        if (!w.fits(charge)) return false;
+         const reserved = w.reserved();
+         if (!r.budget(bytes + reserved)) return error.DailyBudgetSpent;
+         if (!r.room(bytes + reserved)) return error.OverCap;
+-        try w.promised(r.gpa, &promised); // a fence inside room frees the blocks cancelled jobs promised
+-        var again_count: usize = 0;
+-        const again = newBytes(r, &promised, prepared, metadata, &again_count);
+-        if (again == bytes) break;
+-        bytes = again;
+-        count = again_count;
++        try w.promised(r.gpa, promised); // a fence inside room frees the blocks cancelled jobs promised
++        var again: u64 = image.total(prepared.own) + metadata + @sizeOf(file.Trailer);
++        var again_count: usize = 1;
++        for (prepared.wants) |want| if (lacks(r, promised, want)) {
++            again += want.bytes;
++            again_count += 1;
++        };
++        if (again == bytes and again_count == count) break;
+     }
+     if (r.admission.reserve(r.dir, bytes) != .ready) return error.UnderFreeDiskFloor;
+     errdefer r.admission.finish(r.dir, bytes, true);
+@@ -290,25 +392,79 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
+     const a = arena.allocator();
+     const files = try a.alloc(io.File, count);
+     var built: usize = 0;
+-    for (prepared.wants) |want| if (lacks(r, &promised, want)) {
++    for (prepared.wants) |want| if (lacks(r, promised, want)) {
+         var ranges: std.ArrayList(image.Range) = .empty;
+         defer ranges.deinit(r.gpa);
+         try image.blockRanges(prepared.parts, r.keying.block, want.window, want.k, &ranges, r.gpa);
+         files[built] = .{ .trailer = .{ .kind = @backingInt(file.Kind.block), .payload = 0, .payload_hash = 0, .name = want.name, .block = r.keying.block }, .payload = try a.alloc(u8, @intCast(image.total(ranges.items))) };
+-        try r.img.gather(r.family.ptr, e.saved, ranges.items, files[built].payload);
++        try r.img.gather(r.family.ptr, kept.saved, kept.pages, ranges.items, files[built].payload);
+         built += 1;
+     };
+     const own = &files[built];
+-    own.* = .{ .trailer = .{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = prepared.name, .at = e.at, .block = r.keying.block, .flags = @intFromBool(e.shared) }, .payload = try a.alloc(u8, @intCast(image.total(prepared.own))) };
+-    if (own.payload.len > 0) try r.img.gather(r.family.ptr, e.saved, prepared.own, own.payload);
+-    const tokens = try a.dupe(u32, e.tokens);
+-    const spans = try a.dupe(@import("cache_modes.zig").Span, e.decode_spans);
++    own.* = .{ .trailer = .{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = prepared.name, .at = kept.at, .block = r.keying.block, .flags = @intFromBool(kept.shared) }, .payload = try a.alloc(u8, @intCast(image.total(prepared.own))) };
++    if (own.payload.len > 0) try r.img.gather(r.family.ptr, kept.saved, kept.pages, prepared.own, own.payload);
++    const tokens = try a.dupe(u32, kept.tokens);
++    const spans = try a.dupe(@import("cache_modes.zig").Span, kept.spans);
+     const starts = try a.dupe(u32, prepared.starts);
+     const counts = try a.create([3]u32);
+     counts.* = .{ @intCast(tokens.len), @intCast(spans.len), @intCast(starts.len) };
+     own.meta = try a.dupe([]const u8, &.{ std.mem.asBytes(counts), std.mem.sliceAsBytes(tokens), std.mem.sliceAsBytes(spans), std.mem.sliceAsBytes(starts) });
+     const wants = try a.dupe(Want, prepared.wants);
+-    j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = e.at, .shared = e.shared, .tokens = tokens, .spans = spans, .starts = starts, .wants = wants, .files = files, .bytes = bytes, .staged = charge, .verify = r.verify, .began = prepared.began };
++    j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = kept.at, .shared = kept.shared, .tokens = tokens, .spans = spans, .starts = starts, .wants = wants, .files = files, .bytes = bytes, .staged = charge, .final = true, .new_blocks = @intCast(built), .verify = r.verify, .began = prepared.began };
++    w.submit(j);
++    return true;
++}
++
++/// One piece of a state's missing blocks, gathered now and submitted (its bytes reserved under the free-disk floor).
++fn piece(r: *Rows, w: *io.Worker, prepared: *const Job, kept: Kept, promised: *io.Promised, from: usize, end: usize, bytes_in: u64, count_in: usize, may_wait: bool) !void {
++    var bytes = bytes_in;
++    var count = count_in;
++    var charge: u64 = 0;
++    while (true) {
++        charge = bytes + @sizeOf(io.Job) + count * @sizeOf(io.File) + 4 * @sizeOf([]const u8);
++        if (!w.fits(charge)) return if (may_wait and w.busy(charge)) error.StagingBusy else error.StagingFull;
++        const reserved = w.reserved();
++        if (!r.budget(bytes + reserved)) return error.DailyBudgetSpent;
++        if (!r.room(bytes + reserved)) return error.OverCap;
++        try w.promised(r.gpa, promised); // a fence inside room frees the blocks cancelled jobs promised
++        var again: u64 = 0;
++        var again_count: usize = 0;
++        for (prepared.wants[from..end]) |want| if (lacks(r, promised, want)) {
++            again += want.bytes;
++            again_count += 1;
++        };
++        if (again_count == count and again == bytes) break;
++        if (again_count == 0) return; // the piece's blocks all went to another job in flight: the next piece's
++        bytes = again;
++        count = again_count;
++    }
++    if (r.admission.reserve(r.dir, bytes) != .ready) return error.UnderFreeDiskFloor;
++    errdefer r.admission.finish(r.dir, bytes, true);
++    const j = try io.allocator.create(io.Job);
++    errdefer io.allocator.destroy(j);
++    var arena = std.heap.ArenaAllocator.init(io.allocator);
++    errdefer arena.deinit();
++    const a = arena.allocator();
++    const files = try a.alloc(io.File, count);
++    var built: usize = 0;
++    var wants: std.ArrayList(Want) = .empty;
++    errdefer wants.deinit(r.gpa);
++    for (prepared.wants[from..end]) |want| if (lacks(r, promised, want)) {
++        var ranges: std.ArrayList(image.Range) = .empty;
++        defer ranges.deinit(r.gpa);
++        try image.blockRanges(prepared.parts, r.keying.block, want.window, want.k, &ranges, r.gpa);
++        files[built] = .{ .trailer = .{ .kind = @backingInt(file.Kind.block), .payload = 0, .payload_hash = 0, .name = want.name, .block = r.keying.block }, .payload = try a.alloc(u8, @intCast(image.total(ranges.items))) };
++        try r.img.gather(r.family.ptr, kept.saved, kept.pages, ranges.items, files[built].payload);
++        built += 1;
++        try wants.append(r.gpa, want);
++    };
++    const want_slice = a.dupe(Want, wants.items) catch |err| {
++        wants.deinit(r.gpa);
++        return err;
++    };
++    wants.deinit(r.gpa);
++    r.next_job +%= 1;
++    j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = kept.at, .shared = kept.shared, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .wants = want_slice, .files = files, .bytes = bytes, .staged = charge, .final = false };
+     w.submit(j);
+ }
+ 
+@@ -317,13 +473,3 @@ fn lacks(r: *const Rows, promised: *const io.Promised, want: Want) bool {
+     const n = chain.stem(want.name);
+     return !r.blocks.contains(n) and !promised.contains(n);
+ }
+-
+-fn newBytes(r: *const Rows, promised: *const io.Promised, j: *const Job, metadata: usize, count: *usize) u64 {
+-    var bytes = image.total(j.own) + metadata + @sizeOf(file.Trailer);
+-    count.* = 1;
+-    for (j.wants) |want| if (lacks(r, promised, want)) {
+-        bytes += want.bytes;
+-        count.* += 1;
+-    };
+-    return bytes;
+-}
+diff --git a/zig/src/core/rows_write_sync.zig b/zig/src/core/rows_write_sync.zig
+index f6c4b396..634d5508 100644
+--- a/zig/src/core/rows_write_sync.zig
++++ b/zig/src/core/rows_write_sync.zig
+@@ -16,16 +16,16 @@ const piece: u64 = 16 << 20;
+ /// One whole block a state names: its name, group (window), index and file bytes.
+ pub const Want = struct { name: Name, window: u32, k: u32, bytes: u64 };
+ 
+-/// A kept entry waiting to be written, with the chunk starts below it (a planned family's state depends on them).
++/// A kept state waiting to be written, with the chunk starts below it (a planned family's state depends on them).
+ pub const Queued = struct {
+-    entry: *pc.Entry,
++    kept: rows_store.Kept,
+     starts: []u32,
+     waited: bool = false, // the jobs in flight once left it no room, so losing its entry counts as a skipped save
+ };
+ 
+ /// A kept state being written: the blocks the disk lacks, then its own file a piece at a time.
+ pub const Job = struct {
+-    entry: *pc.Entry,
++    kept: rows_store.Kept,
+     starts: []u32,
+     name: Name,
+     parts: []image.Part,
+@@ -41,20 +41,26 @@ pub const Job = struct {
+     began: i128 = 0,
+ };
+ 
+-/// A newly kept entry joins the queue (the RAM store calls this on every new keep), with the request's chunk starts.
+-pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
+-    const own = rows_store.startsBelow(r, r.gpa, starts, e.at) catch return;
+-    r.queue.append(r.gpa, .{ .entry = e, .starts = own }) catch r.gpa.free(own);
++/// A newly kept state joins the queue (the store calls this on every new keep), with the request's chunk starts.
++pub fn queued(r: *Rows, kept: rows_store.Kept, starts: []const u32) void {
++    const own = rows_store.startsBelow(r, r.gpa, starts, kept.at) catch return;
++    r.queue.append(r.gpa, .{ .kept = kept, .starts = own }) catch r.gpa.free(own);
+ }
+ 
+-/// An entry leaving the RAM store leaves the queue, and its write is given up if under way.
+-pub fn dropped(r: *Rows, e: *pc.Entry) void {
+-    for (r.queue.items, 0..) |q, i| if (q.entry == e) {
++/// The store's hold on a queued save given up: its pages released (nothing held: the flat store's).
++pub fn gave(_: *Rows, q: *const Queued) void {
++    if (q.kept.freed) |f| f.call(f.ctx, q.kept.owner);
++}
++
++/// A state leaving the RAM store leaves the queue, and its write is given up if under way.
++pub fn dropped(r: *Rows, owner: *anyopaque) void {
++    for (r.queue.items, 0..) |*q, i| if (q.kept.owner == owner) {
+         r.gpa.free(q.starts);
++        gave(r, q);
+         _ = r.queue.orderedRemove(i);
+         break;
+     };
+-    if (r.job) |j| if (j.entry == e) abort(r, j);
++    if (r.job) |j| if (j.kept.owner == owner) abort(r, j);
+ }
+ 
+ /// Whether writing waits; spill-only RAM entries wait for eviction or the close-time flush.
+@@ -63,14 +69,28 @@ pub fn pending(r: *const Rows) bool {
+ }
+ 
+ /// --spill-gib: an entry evicted from RAM is written now, unless the disk holds it already; the write under way first.
+-pub fn evicted(r: *Rows, e: *pc.Entry) void {
++pub fn evicted(r: *Rows, owner: *anyopaque) void {
+     if (r.spill == .off) return;
+-    if (r.job) |j| if (j.entry != e) while (r.job != null) {
++    if (r.job) |j| if (j.kept.owner != owner) while (r.job != null) {
++        _ = step(r);
++    };
++    if (r.job == null) {
++        const i = for (r.queue.items, 0..) |*q, k| {
++            if (q.kept.owner == owner) break k;
++        } else return;
++        if (!begin(r, r.queue.orderedRemove(i))) return;
++    }
++    while (r.job != null) _ = step(r);
++}
++
++/// A paged store's eviction: a save still queued is written now (its pages are held; the state leaves the tree).
++pub fn evicting(r: *Rows, owner: *anyopaque) void {
++    if (r.job) |j| if (j.kept.owner != owner) while (r.job != null) {
+         _ = step(r);
+     };
+     if (r.job == null) {
+-        const i = for (r.queue.items, 0..) |q, k| {
+-            if (q.entry == e) break k;
++        const i = for (r.queue.items, 0..) |*q, k| {
++            if (q.kept.owner == owner) break k;
+         } else return;
+         if (!begin(r, r.queue.orderedRemove(i))) return;
+     }
+@@ -89,7 +109,7 @@ pub fn step(r: *Rows) bool {
+     const j = r.job orelse return start(r);
+     unit(r, j) catch |err| {
+         r.counts.failed += 1;
+-        pc.note("imprint: writing {d} tokens failed ({s}); they stay in RAM only", .{ j.entry.at, @errorName(err) });
++        pc.note("imprint: writing {d} tokens failed ({s}); they stay in RAM only", .{ j.kept.at, @errorName(err) });
+         end(r, j, false);
+     };
+     return true;
+@@ -121,13 +141,14 @@ fn start(r: *Rows) bool {
+ fn begin(r: *Rows, q: Queued) bool {
+     const j = (prepare(r, q) catch |err| {
+         r.counts.skipped += 1;
+-        pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ q.entry.at, @errorName(err) });
++        pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ q.kept.at, @errorName(err) });
++        gave(r, &q);
+         return false;
+     }) orelse return false;
+     r.job = j;
+     admit(r, j) catch |err| {
+         r.counts.skipped += 1;
+-        pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ j.entry.at, @errorName(err) });
++        pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ j.kept.at, @errorName(err) });
+         abort(r, j);
+         return false;
+     };
+@@ -138,24 +159,25 @@ fn begin(r: *Rows, q: Queued) bool {
+ pub fn prepare(r: *Rows, q: Queued) !?*Job {
+     const gpa = r.gpa;
+     errdefer gpa.free(q.starts);
+-    const e = q.entry;
+-    const name = chain.state(r.keying, e.tokens, e.decode_spans, q.starts, e.at);
++    const kept = q.kept;
++    const name = chain.state(r.keying, kept.tokens, kept.spans, q.starts, kept.at);
+     if (r.find(name)) |i| {
+         r.touch(i);
+         gpa.free(q.starts);
++        gave(r, &q);
+         return null;
+     }
+-    if (r.img.whole) |whole| if (!whole(r.family.ptr, e.saved)) return error.NotWhole;
+-    const parts = try r.parts(gpa, e.at);
++    if (r.img.whole) |whole| if (!whole(r.family.ptr, kept.saved)) return error.NotWhole;
++    const parts = try r.parts(gpa, kept.at);
+     errdefer gpa.free(parts);
+     var wants: std.ArrayList(Want) = .empty;
+     errdefer wants.deinit(gpa);
+-    try r.blockNames(gpa, parts, e.tokens, e.decode_spans, q.starts, e.at, &wants);
++    try r.blockNames(gpa, parts, kept.tokens, kept.spans, q.starts, kept.at, &wants);
+     var own: std.ArrayList(image.Range) = .empty;
+     errdefer own.deinit(gpa);
+-    try image.ownRanges(parts, e.at, r.keying.block, &own, gpa);
++    try image.ownRanges(parts, kept.at, r.keying.block, &own, gpa);
+     const j = try gpa.create(Job);
+-    j.* = .{ .entry = e, .starts = q.starts, .name = name, .parts = parts, .wants = &.{}, .own = &.{}, .began = nowNs() };
++    j.* = .{ .kept = kept, .starts = q.starts, .name = name, .parts = parts, .wants = &.{}, .own = &.{}, .began = nowNs() };
+     j.wants = wants.toOwnedSlice(gpa) catch |err| {
+         gpa.destroy(j);
+         return err;
+@@ -170,11 +192,11 @@ pub fn prepare(r: *Rows, q: Queued) !?*Job {
+ 
+ /// The job's new bytes checked against today's budget, the cap (evicting by value) and the free-disk floor.
+ fn admit(r: *Rows, j: *Job) !void {
+-    const e = j.entry;
++    const kept = j.kept;
+     for (j.wants) |w| if (!r.blocks.contains(chain.stem(w.name))) {
+         j.bytes += w.bytes;
+     };
+-    j.bytes += image.total(j.own) + 4 * (3 + e.tokens.len + 2 * e.decode_spans.len + j.starts.len) + @sizeOf(file.Trailer);
++    j.bytes += image.total(j.own) + 4 * (3 + kept.tokens.len + 2 * kept.spans.len + j.starts.len) + @sizeOf(file.Trailer);
+     if (!r.budget(j.bytes)) return error.DailyBudgetSpent;
+     if (!r.room(j.bytes)) return error.OverCap;
+     switch (r.admission.reserve(r.dir, j.bytes)) {
+@@ -185,7 +207,7 @@ fn admit(r: *Rows, j: *Job) !void {
+ 
+ /// The job's next unit of work.
+ fn unit(r: *Rows, j: *Job) !void {
+-    if (r.img.whole) |whole| if (!whole(r.family.ptr, j.entry.saved)) return error.NotWhole;
++    if (r.img.whole) |whole| if (!whole(r.family.ptr, j.kept.saved)) return error.NotWhole;
+     const gather = r.img.gather;
+     while (j.next < j.wants.len and r.blocks.contains(chain.stem(j.wants[j.next].name))) j.next += 1;
+     if (j.next < j.wants.len) {
+@@ -195,7 +217,7 @@ fn unit(r: *Rows, j: *Job) !void {
+         try image.blockRanges(j.parts, r.keying.block, w.window, w.k, &ranges, r.gpa);
+         const n = image.total(ranges.items);
+         const stage = try r.staged(n);
+-        try gather(r.family.ptr, j.entry.saved, ranges.items, stage[0..@intCast(n)]);
++        try gather(r.family.ptr, j.kept.saved, j.kept.pages, ranges.items, stage[0..@intCast(n)]);
+         var wr = try file.Writer.open(r.dir, &chain.hex(w.name), ".blk");
+         errdefer wr.abort();
+         wr.io = r.file_io;
+@@ -227,19 +249,19 @@ fn unit(r: *Rows, j: *Job) !void {
+             }
+         }
+         const stage = try r.staged(n);
+-        try gather(r.family.ptr, j.entry.saved, pieces.items, stage[0..@intCast(n)]);
++        try gather(r.family.ptr, j.kept.saved, j.kept.pages, pieces.items, stage[0..@intCast(n)]);
+         try j.writer.?.append(stage[0..@intCast(n)]);
+         return;
+     }
+-    const e = j.entry;
+-    const counts = [3]u32{ @intCast(e.tokens.len), @intCast(e.decode_spans.len), @intCast(j.starts.len) };
+-    const meta = [_][]const u8{ std.mem.sliceAsBytes(&counts), std.mem.sliceAsBytes(e.tokens), std.mem.sliceAsBytes(e.decode_spans), std.mem.sliceAsBytes(j.starts) };
+-    const bytes = try j.writer.?.finish(.{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = j.name, .at = e.at, .block = r.keying.block, .flags = @intFromBool(e.shared) }, &meta, true);
++    const kept = j.kept;
++    const counts = [3]u32{ @intCast(kept.tokens.len), @intCast(kept.spans.len), @intCast(j.starts.len) };
++    const meta = [_][]const u8{ std.mem.sliceAsBytes(&counts), std.mem.sliceAsBytes(kept.tokens), std.mem.sliceAsBytes(kept.spans), std.mem.sliceAsBytes(j.starts) };
++    const bytes = try j.writer.?.finish(.{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = j.name, .at = kept.at, .block = r.keying.block, .flags = @intFromBool(kept.shared) }, &meta, true);
+     j.writer = null;
+     r.spent(bytes);
+-    var s: rows_store.State = .{ .name = j.name, .at = e.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = bytes, .rows = 0, .used = 0, .shared = e.shared };
+-    s.tokens = try r.gpa.dupe(u32, e.tokens);
+-    s.spans = r.gpa.dupe(Span, e.decode_spans) catch |err| {
++    var s: rows_store.State = .{ .name = j.name, .at = kept.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = bytes, .rows = 0, .used = 0, .shared = kept.shared };
++    s.tokens = try r.gpa.dupe(u32, kept.tokens);
++    s.spans = r.gpa.dupe(Span, kept.spans) catch |err| {
+         r.gpa.free(s.tokens);
+         return err;
+     };
+@@ -251,9 +273,9 @@ fn unit(r: *Rows, j: *Job) !void {
+     r.touch(r.states.items.len - 1);
+     r.counts.writes += 1;
+     const ms = @as(f64, @floatFromInt(nowNs() - j.began)) / 1e6;
+-    if (!@import("builtin").is_test) std.log.info("imprint: {d} tokens on disk: {d} new blocks and its own {d} MiB ({d} MiB this state, {d} MiB of rows it shares) in {d:.0} ms", .{ e.at, j.blocks, bytes >> 20, j.bytes >> 20, s.rows >> 20, ms });
++    if (!@import("builtin").is_test) std.log.info("imprint: {d} tokens on disk: {d} new blocks and its own {d} MiB ({d} MiB this state, {d} MiB of rows it shares) in {d:.0} ms", .{ kept.at, j.blocks, bytes >> 20, j.bytes >> 20, s.rows >> 20, ms });
++    if (r.verify) @import("rows_verify.zig").state(r, r.states.items.len - 1, kept.saved, kept.pages);
+     finishJob(r, j, true);
+-    if (r.verify) @import("rows_verify.zig").state(r, r.states.items.len - 1, e.saved);
+ }
+ 
+ /// The job under way given up (its entry left RAM, or the store closes): its file in progress goes.
+@@ -271,6 +293,7 @@ fn end(r: *Rows, j: *Job, disk_ok: bool) void {
+ 
+ fn finishJob(r: *Rows, j: *Job, ok: bool) void {
+     if (j.reserved) r.admission.finish(r.dir, j.bytes, ok);
++    if (j.kept.freed) |f| f.call(f.ctx, j.kept.owner); // the write no longer reads the state: its pages go back
+     r.gpa.free(j.starts);
+     r.gpa.free(j.parts);
+     r.gpa.free(j.wants);
+diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
+index ab8bcda0..1bc9c0e6 100644
+--- a/zig/src/families/flashnext/cuda_disk.zig
++++ b/zig/src/families/flashnext/cuda_disk.zig
+@@ -74,11 +74,13 @@ pub fn Kept(comptime F: type) type {
+             st.history = w.history;
+         }
+ 
+-        fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++        fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++            _ = pages;
+             try copy(of(ptr), @ptrCast(@alignCast(saved)), ranges, out, true);
+         }
+ 
+-        fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++        fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++            _ = pages;
+             try copy(of(ptr), @ptrCast(@alignCast(saved)), ranges, @constCast(in), false);
+         }
+ 
+@@ -231,7 +233,7 @@ test "Flash Next completion: a kept state's copy out or in that fails part way d
+         OneCopy.queued = 0;
+         OneCopy.pending = 0;
+         const ranges = [_]rows.image.Range{ .{ .off = 0, .len = words + 512 }, .{ .off = words + 512, .len = if (refused) 512 else 1024 } };
+-        const got = if (out) K.image.gather(&c, &st, &ranges, &host) else K.image.scatter(&c, &st, &ranges, &host);
++        const got = if (out) K.image.gather(&c, &st, &.{}, &ranges, &host) else K.image.scatter(&c, &st, &.{}, &ranges, &host);
+         try std.testing.expectError(if (refused) error.NotReady else error.BadKeptRange, got);
+         try std.testing.expectEqual(@as(usize, 1), OneCopy.queued);
+         try std.testing.expectEqual(@as(usize, 0), OneCopy.pending); // the caller's `host` may go: nothing copies on it
+diff --git a/zig/src/families/glm/cuda_disk_image.zig b/zig/src/families/glm/cuda_disk_image.zig
+index 8305163d..8db83033 100644
+--- a/zig/src/families/glm/cuda_disk_image.zig
++++ b/zig/src/families/glm/cuda_disk_image.zig
+@@ -10,7 +10,8 @@ const window_rows = st_mod.window_rows;
+ 
+ /// The image's first bytes: the format, the position, the head's rows, both ring bases and the KDA copy bits. A
+ /// KV-sharded state (TF_GLM_KV_SHARD) also names its home part and the parts its pool had in the format word; the
+-/// image's bytes are the same either way, as its latent rows come from the home rank alone (`route`).
++/// image's bytes are the same either way, as its latent rows come from the home rank alone (`route`). A store under
++/// TF_KV_SHARE (--learn-conversations beside it) writes the pages layout instead: its rows sit in the pool's pages.
+ pub const Words = struct {
+     at: u64,
+     mtp_len: u64,
+@@ -18,28 +19,44 @@ pub const Words = struct {
+     mtp_base: u64,
+     cur: u64,
+     home: ?u8 = null, // the part that held its latent rows when it was written (null: unsharded)
++    pages: bool = false, // the pages layout: its rows are the tree's pages' (cuda_glm_disk's store under TF_KV_SHARE)
+ 
+     pub const count = 6;
+     pub const bytes: u64 = count * 8;
+     const format: u64 = 1;
+     const sharded: u64 = 3; // | home << 8 | kv_parts << 16
++    const pages_fmt: u64 = 4; // the pages layout
++    const pages_sharded: u64 = 5; // the pages layout, sharded: | home << 8 | kv_parts << 16
+     pub const kv_parts: u64 = 2; // a sharded pool's parts (TP=2 alone)
+ 
+     pub fn encode(w: Words) [count]u64 {
+-        const f = if (w.home) |h| if (mut(.words_no_home)) format else sharded | @as(u64, h) << 8 | kv_parts << 16 else format;
++        const f = if (w.home) |h|
++            (if (mut(.words_no_home)) format else (if (w.pages) pages_sharded else sharded) | @as(u64, h) << 8 | kv_parts << 16)
++        else if (w.pages) pages_fmt else format;
+         return .{ f, w.at, w.mtp_len, w.base, w.mtp_base, w.cur };
+     }
+ 
+     /// Words read back: refused unless the format is one of these and the state stands at `at`; a sharded state's
+     /// home within its parts, and those parts the two of TP=2.
+     pub fn decode(x: [count]u64, at: u32) !Words {
+-        const home: ?u8 = switch (x[0] & 0xff) {
+-            format => if (x[0] == format) null else return error.DiskWords,
+-            sharded => if (x[0] >> 24 == 0 and (x[0] >> 16 & 0xff) == kv_parts and (x[0] >> 8 & 0xff) < kv_parts) @intCast(x[0] >> 8 & 0xff) else return error.DiskWords,
++        var home: ?u8 = null;
++        var paged = false;
++        switch (x[0] & 0xff) {
++            format => if (x[0] != format) return error.DiskWords,
++            pages_fmt => {
++                if (x[0] != pages_fmt) return error.DiskWords;
++                paged = true;
++            },
++            sharded, pages_sharded => {
++                paged = x[0] & 0xff == pages_sharded;
++                if (x[0] >> 24 == 0 and (x[0] >> 16 & 0xff) == kv_parts and (x[0] >> 8 & 0xff) < kv_parts) {
++                    home = @intCast(x[0] >> 8 & 0xff);
++                } else return error.DiskWords;
++            },
+             else => return error.DiskWords,
+-        };
++        }
+         if (x[1] != at) return error.DiskWords;
+-        return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5], .home = home };
++        return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5], .home = home, .pages = paged };
+     }
+ };
+ 
+@@ -120,6 +137,48 @@ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator
+     try out.append(a, .{ .bytes = sh.tail });
+ }
+ 
++/// The image at `at` when its rows sit in the pool's pages (TF_KV_SHARE's disk store): the words, then each DSA
++/// layer's rows (its latent codes, scales and whole pooled keys, addressed through the tree's page ids), then the
++/// snapshot's fixed parts in the order its slot holds them (the arena head, per layer the rings and the pools past
++/// the mark, the MTP head's caches, the tail).
++pub fn pageParts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
++    if (at == 0 or at % sparse.pool != 0 or at > sh.capacity) return error.SnapshotShape;
++    try out.append(a, .{ .bytes = Words.bytes });
++    const pooled: u64 = at / sparse.pool;
++    for (0..sh.layers) |_| {
++        const c = cache(sh, at);
++        try out.append(a, .{ .bytes = c[0], .row = sh.latent }); // the pages' rows, a row a token
++        if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = 4 });
++        try out.append(a, .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool });
++    }
++    try out.append(a, .{ .bytes = sh.prefix });
++    for (0..sh.layers) |_| {
++        const c = cache(sh, at);
++        try out.appendSlice(a, &.{ .{ .bytes = c[2] }, .{ .bytes = c[3] }, .{ .bytes = c[4] - pooled * sh.pooled_row } });
++    }
++    if (sh.head) for (cache(sh, sh.headRows(at))) |n| if (n > 0) try out.append(a, .{ .bytes = n });
++    try out.append(a, .{ .bytes = sh.tail });
++}
++
++/// The bytes of a pages-layout state's rows (every row part between the words and the fixed parts).
++pub fn pageRowsBytes(sh: Shape, at: u32) u64 {
++    var n: u64 = 0;
++    const pooled: u64 = at / sparse.pool;
++    for (0..sh.layers) |_| {
++        const c = cache(sh, at);
++        n += c[0] + c[1] + pooled * sh.pooled_row;
++    }
++    return n;
++}
++
++/// How many bytes of a pages-layout row part one pool page carries there: its rows' span, a page's worth (a part's
++/// byte `b` sits in page ids[b / span] at b % span, as layout.Plan's `piece` addresses a paged cache's).
++pub fn pageSpan(sh: Shape, p: Part) u64 {
++    if (p.row == sh.latent) return @import("cuda_state.zig").page_rows * sh.latent;
++    if (p.row == 4) return @import("cuda_state.zig").page_rows * 4;
++    return @as(u64, @import("cuda_state.zig").page_rows / sparse.pool) * sh.pooled_row; // whole pooled keys
++}
++
+ /// The image's segments in order for a state at `at` whose head holds `mtp_len` rows (0 without a head).
+ pub fn segments(sh: Shape, at: u32, mtp_len: u64, out: *std.ArrayList(Seg), a: std.mem.Allocator) !void {
+     return segmentsFor(sh, at, mtp_len, true, out, a);
+diff --git a/zig/src/families/glm/cuda_disk_ranks.zig b/zig/src/families/glm/cuda_disk_ranks.zig
+index 04c8d9dc..5714a2a5 100644
+--- a/zig/src/families/glm/cuda_disk_ranks.zig
++++ b/zig/src/families/glm/cuda_disk_ranks.zig
+@@ -33,7 +33,7 @@ pub fn wordsOf(e: anytype, id: u64) !image.Words {
+     if (s.cur.len > 64) return error.SnapshotShape;
+     var cur: u64 = 0;
+     for (s.cur, 0..) |b, i| cur |= @as(u64, b) << @intCast(i);
+-    return .{ .at = s.pos, .mtp_len = s.mtp_len, .base = s.bases[0], .mtp_base = s.bases[1], .cur = cur, .home = homeOf(e, s) };
++    return .{ .at = s.pos, .mtp_len = s.mtp_len, .base = s.bases[0], .mtp_base = s.bases[1], .cur = cur, .home = homeOf(e, s), .pages = s.shared > 0 };
+ }
+ 
+ /// Bytes [off, off + host.len) of this rank's image of `id`, out (lease to host) or in; unsealed: before its head only.
+diff --git a/zig/src/families/glm/cuda_disk_shard_test.zig b/zig/src/families/glm/cuda_disk_shard_test.zig
+index af44baeb..a5733580 100644
+--- a/zig/src/families/glm/cuda_disk_shard_test.zig
++++ b/zig/src/families/glm/cuda_disk_shard_test.zig
+@@ -516,7 +516,14 @@ test "GLM disk image: a sharded read's words: format 3 names a home within two p
+     const w: image.Words = .{ .at = at, .mtp_len = 0, .base = 0, .mtp_base = 0, .cur = 5, .home = 1 };
+     const x = w.encode();
+     try expectEqual(@as(?u8, 1), (try image.Words.decode(x, at)).home);
+-    for ([_]u64{ 3 | 2 << 8 | 2 << 16, 3 | 0 << 8 | 3 << 16, 3 | 1 << 8 | 2 << 16 | 1 << 24, 1 | 1 << 8, 2, 4 }) |bad| {
++    // the pages layout (TF_KV_SHARE's store): formats 4 and 5 say so, a home beside it as sharding's does
++    const pw: image.Words = .{ .at = at, .mtp_len = 0, .base = 0, .mtp_base = 0, .cur = 5, .pages = true };
++    const ps: image.Words = .{ .at = at, .mtp_len = 0, .base = 0, .mtp_base = 0, .cur = 5, .home = 1, .pages = true };
++    try expectEqual(@as(u64, 4), pw.encode()[0]);
++    try expectEqual(@as(u64, 5 | 1 << 8 | 2 << 16), ps.encode()[0]);
++    try expect((try image.Words.decode(pw.encode(), at)).pages);
++    try expectEqual(@as(?u8, 1), (try image.Words.decode(ps.encode(), at)).home);
++    for ([_]u64{ 3 | 2 << 8 | 2 << 16, 3 | 0 << 8 | 3 << 16, 3 | 1 << 8 | 2 << 16 | 1 << 24, 1 | 1 << 8, 2, 4 | 1 << 8, 5, 6 }) |bad| {
+         var y = x;
+         y[0] = bad;
+         try expectError(error.DiskWords, image.Words.decode(y, at));
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index e0017aad..74a55019 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -476,6 +476,7 @@ pub fn share_pool(ptr: *anyopaque) ?kp.Pool {
+         .inPart = partsInPart,
+         .onePart = partsOnePart,
+         .setReclaim = partsSetReclaim,
++        .holdPages = partsHoldPages,
+         .ctx = &x.parts,
+     } };
+     return .{ .one = &p.pool };
+@@ -517,6 +518,15 @@ fn partsSetReclaim(ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void {
+     partsOf(ctx).setReclaim(part, hook);
+ }
+ 
++/// A recalled state's pages held in one part with room (its pools reclaiming first), as global ids.
++fn partsHoldPages(ctx: *anyopaque, out: []u32) bool {
++    const x = partsOf(ctx);
++    const part = x.choose(out.len, null) orelse return false;
++    if (!x.pools[part].hold(out)) return false;
++    for (out) |*id| id.* += @as(u32, @intCast(part * x.h));
++    return true;
++}
++
+ /// TF_KV_SHARE: the store the prompt passes keep and resume through, on rank 0's pages (null: none).
+ pub fn share_attach(ptr: *anyopaque, prompts: ?kp.Prompts) void {
+     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 291ed2d0..61efd740 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -188,7 +188,11 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
+     if (!ringHolds(bases[0], s.pos, rows) or !ringHolds(bases[1], mtp_len, rows)) return error.DiskWords;
+     // TF_GLM_KV_SHARD: off its home rank the copy packs every part but the latent rows, as keepAs leaves it
+     const own = if (s.home) |h| h == e.share.rank else true;
+-    const n = try layout.Plan.sizeFor(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, own, s.cur);
++    // a state whose leading rows are the shared store's pages (TF_KV_SHARE's recall): its slot's parts past them
++    const n = if (s.shared > 0)
++        try layout.Plan.sizeForShared(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, s.shared, own, s.cur)
++    else
++        try layout.Plan.sizeFor(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, own, s.cur);
+     if (n == 0 or n > s.lease.count() * pages.page) return error.SnapshotSize;
+     for (s.cur, 0..) |*b, i| b.* = @intCast(cur >> @intCast(i) & 1);
+     s.len = n;
+diff --git a/zig/src/families/qwen3_5/cuda_disk.zig b/zig/src/families/qwen3_5/cuda_disk.zig
+index 7012486d..91b740d0 100644
+--- a/zig/src/families/qwen3_5/cuda_disk.zig
++++ b/zig/src/families/qwen3_5/cuda_disk.zig
+@@ -39,7 +39,8 @@ fn wordsOf(c: *const Copy) Words {
+     return .{ .at = @intCast(c.at), .delta = c.delta, .format = @backingInt(c.format) };
+ }
+ 
+-fn gather(_: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++fn gather(_: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++    _ = pages;
+     const c: *const Copy = @ptrCast(@alignCast(saved));
+     const w = wordsOf(c);
+     var o: usize = 0;
+@@ -76,7 +77,8 @@ pub fn blankCopy(e: *engine.Engine, at: u32) !*Copy {
+     return copy;
+ }
+ 
+-fn scatter(_: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++fn scatter(_: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++    _ = pages;
+     const c: *Copy = @ptrCast(@alignCast(saved));
+     var w = wordsOf(c);
+     var o: usize = 0;
+diff --git a/zig/src/families/qwen3_5/cuda_disk_test.zig b/zig/src/families/qwen3_5/cuda_disk_test.zig
+index 91e5b796..529012a3 100644
+--- a/zig/src/families/qwen3_5/cuda_disk_test.zig
++++ b/zig/src/families/qwen3_5/cuda_disk_test.zig
+@@ -91,7 +91,7 @@ fn imageOf(a: std.mem.Allocator, f: *Fixture, c: *Copy) ![]u8 {
+     defer parts.deinit(a);
+     try disk.partsOf(&f.e, @intCast(c.at), &parts, a);
+     const out = try a.alloc(u8, @intCast(rows.image.imageBytes(parts.items)));
+-    try disk.image.gather(&f.t, c, &.{.{ .off = 0, .len = out.len }}, out);
++    try disk.image.gather(&f.t, c, &.{}, &.{.{ .off = 0, .len = out.len }}, out);
+     return out;
+ }
+ 
+@@ -123,7 +123,7 @@ test "gather and scatter give back the copy byte for byte; a copy kept with imag
+     const back: *Copy = @ptrCast(@alignCast(try disk.image.blank(&f.t, 512)));
+     defer reuse.dropCopy(&f.e, back);
+     // two pieces, split inside the words: the store reads blocks and a state's own ranges apart
+-    try disk.image.scatter(&f.t, back, &.{ .{ .off = 0, .len = 9 }, .{ .off = 9, .len = img.len - 9 } }, img);
++    try disk.image.scatter(&f.t, back, &.{}, &.{ .{ .off = 0, .len = 9 }, .{ .off = 9, .len = img.len - 9 } }, img);
+     try std.testing.expectEqualSlices(u8, c.host.bytes[0..c.len], back.host.bytes[0..back.len]);
+     try std.testing.expectEqual(@as(i32, -3), back.delta);
+     try std.testing.expect(disk.image.whole.?(&f.t, c));
+@@ -136,7 +136,7 @@ test "gather and scatter give back the copy byte for byte; a copy kept with imag
+     const other: *Copy = @ptrCast(@alignCast(try disk.image.blank(&f.t, 512)));
+     defer reuse.dropCopy(&f.e, other);
+     other.format = .bf16;
+-    try std.testing.expectError(error.KeptWordsDiffer, disk.image.scatter(&f.t, other, &.{.{ .off = 0, .len = img.len }}, img));
++    try std.testing.expectError(error.KeptWordsDiffer, disk.image.scatter(&f.t, other, &.{}, &.{.{ .off = 0, .len = img.len }}, img));
+ }
+ 
+ /// Every file under `path` whose name ends in `ext`: cut to 100 bytes, or byte 40 overwritten.
+@@ -163,8 +163,8 @@ fn entry(a: std.mem.Allocator, c: *Copy, prompt: []u32) !*pc.Entry {
+ fn writeBoth(a: std.mem.Allocator, f: *Fixture, o: rows.Options, prompt: []u32, short: *Copy, long: *Copy) !void {
+     const r = try rows.Rows.open(std.testing.allocator, f.snapshots(), o);
+     defer r.deinit();
+-    rows.write.queued(r, try entry(a, short, prompt), &.{ 0, 512 });
+-    rows.write.queued(r, try entry(a, long, prompt), &.{ 0, 512 });
++    rows.write.queued(r, pc.rows.Kept.of(try entry(a, short, prompt)), &.{ 0, 512 });
++    rows.write.queued(r, pc.rows.Kept.of(try entry(a, long, prompt)), &.{ 0, 512 });
+     _ = rows.write.drain(r, rows.write.nowNs() + 3 * std.time.ns_per_s); // the write worker publishes the states
+     try std.testing.expectEqual(@as(usize, 2), r.states.items.len);
+     try std.testing.expectEqual(@as(usize, 4), r.blocks.count()); // 512 and 1024 tokens on a 512-row chunk grid: two blocks shared
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 0ff9c99e..ca732ca4 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -209,6 +209,13 @@ const no_stream = "the CUDA memory budget fits no stream: one at a {d}-token win
+     "lower --context, or free device memory";
+ const too_many = "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, " ++
+     "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
++/// Whether the family keeps its shared store's states on disk beside TF_KV_SHARE: GLM unsharded (its store's image
++/// carries the pages; sharded, whose image splits a state's rows by rank, keeps the pair refused for now).
++fn shareDisk(comptime F: type, loaded: anytype) bool {
++    if (F != glm.native) return false;
++    return !loaded.target.settings.kv_shard.on;
++}
++
+ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+     if (refusals.family(F, o)) |why| {
+         problem.* = why;
+@@ -351,8 +358,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     };
+     defer if (!opened) loaded.deinit(loaded.ctx);
+     const share = try prompt_pages.wanted(F, loaded); // TF_KV_SHARE: the cache is pool pages, kept by the family's store
+-    if (o.learn_conversations and share) {
+-        problem.* = "--learn-conversations writes the host prompt cache's states, and TF_KV_SHARE keeps prompts as pool pages instead: serve with one of the two";
++    if (o.learn_conversations and share and !shareDisk(F, loaded)) {
++        problem.* = "--learn-conversations writes the host prompt cache's states, and TF_KV_SHARE keeps prompts as pool pages instead: serve with one of the two (GLM-5.3-Flash unsharded keeps both: its store's states on disk carry their pages)";
+         return null;
+     }
+     const taps = record.taps(loaded); // --record is refused before the host is made, so a refusal holds nothing
+@@ -461,6 +468,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     const share_limit = if (!share) 0 else if (slots != null) paged.?.snaps else try @import("core").kv_prompts.sharing(); // what its slots hold
+     if (comptime @hasDecl(F, "share_attach")) if (share and (if (comptime F.share_kept_ppm == 0) share_limit > 0 else cache > 0)) { // GLM keeps copies: the store opens when its slots hold a state
+         h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), share_limit);
++        if (o.learn_conversations) if (o.learn) |root| if (F == glm.native) {
++            try @import("cuda_glm_disk.zig").attachShare(a, io, &g.ctx, o, root, kernels, loaded, h.prompts.?);
++        };
+     };
+     errdefer if (h.prompts) |x| x.close();
+     var conversations = false;
+diff --git a/zig/src/native/cuda_disk.zig b/zig/src/native/cuda_disk.zig
+index 8e0679a6..9d42ebab 100644
+--- a/zig/src/native/cuda_disk.zig
++++ b/zig/src/native/cuda_disk.zig
+@@ -37,7 +37,8 @@ fn where(sh: kept.Shape, off: u64) struct { part: enum { words, kv, mamba }, at:
+     return .{ .part = .mamba, .at = @intCast(off - words - sh.kv) };
+ }
+ 
+-fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++    _ = pages;
+     const t = target(ptr);
+     const copy: *kept.Copy = @ptrCast(@alignCast(saved));
+     const sh = kept.shape(t, copy.pos);
+@@ -61,7 +62,8 @@ fn blank(ptr: *anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
+     return @ptrCast(try kept.blank(target(ptr), at));
+ }
+ 
+-fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++    _ = pages;
+     const t = target(ptr);
+     const copy: *kept.Copy = @ptrCast(@alignCast(saved));
+     const sh = kept.shape(t, copy.pos);
+@@ -144,7 +146,7 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, t: *Target) !
+     if (!whole(t, saved)) return error.ProbeUnmarked;
+     const sh = kept.shape(t, 4136);
+     const bytes = try a.alloc(u8, words + sh.kv + sh.mamba);
+-    try gather(t, saved, &.{ .{ .off = 0, .len = words }, .{ .off = words, .len = sh.kv }, .{ .off = words + sh.kv, .len = sh.mamba } }, bytes);
++    try gather(t, saved, &.{}, &.{ .{ .off = 0, .len = words }, .{ .off = words, .len = sh.kv }, .{ .off = words + sh.kv, .len = sh.mamba } }, bytes);
+     // the row count: the last window's, from whatever ran first (a new build measures its windows)
+     @memset(bytes[8..words], 0);
+     return .{ .hash = std.hash.Wyhash.hash(0x6375, bytes), .rate = @as(f64, @floatFromInt(toks.len)) / (@as(f64, @floatFromInt(@max(ns, 1))) / 1e9) };
+diff --git a/zig/src/native/cuda_glm_disk.zig b/zig/src/native/cuda_glm_disk.zig
+index f0967d2a..8c6a8019 100644
+--- a/zig/src/native/cuda_glm_disk.zig
++++ b/zig/src/native/cuda_glm_disk.zig
+@@ -6,6 +6,7 @@ const api = @import("engine_api");
+ const lanes = @import("lanes");
+ const glm = @import("glm_cuda");
+ const cuda_disk = @import("cuda_disk.zig");
++const prompt_pages = @import("cuda_prompt_pages.zig");
+ const img = glm.disk_image;
+ const ranks = glm.disk_ranks;
+ const rows = api.prompt_cache.rows;
+@@ -15,12 +16,21 @@ const Allocator = std.mem.Allocator;
+ 
+ const t = std.testing;
+ 
+-pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole };
++pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole, .blank_pages = blankPages };
+ 
+ /// Every rank's prefix bytes, read at attach (one GLM engine a process; rank 0 alone serves).
+ var prefix_buf: [8]u64 = undefined;
+ var prefixes: []const u64 = &.{};
+ 
++/// The store's layout: its states' rows in the pool's pages (TF_KV_SHARE's --learn-conversations), set once at the
++/// share attach; without it every state is a copy, as 0109's store has always written.
++var pages_mode: bool = false;
++
++/// Whether the store keeps the pages layout (a test's and the image's read of the mode).
++pub fn sharedLayout() bool {
++    return pages_mode;
++}
++
+ fn engineOf(ptr: *anyopaque) *Engine {
+     return @ptrCast(@alignCast(ptr));
+ }
+@@ -28,8 +38,10 @@ fn engineOf(ptr: *anyopaque) *Engine {
+ fn parts(ptr: *anyopaque, at: u32, out: *std.ArrayList(rows.image.Part), a: Allocator) anyerror!void {
+     var list: std.ArrayList(img.Part) = .empty;
+     defer list.deinit(a);
+-    try img.storeParts(try ranks.shape(engineOf(ptr)), prefixes, at, &list, a);
++    const sh = try ranks.shape(engineOf(ptr));
++    if (pages_mode) try img.pageParts(sh, at, &list, a) else try img.parts(sh, at, &list, a);
+     for (list.items) |p| try out.append(a, .{ .bytes = p.bytes, .row = p.row, .per = p.per });
++    for (prefixes[1..]) |p| try out.append(a, .{ .bytes = p });
+ }
+ 
+ /// The other ranks asleep before a disk call go back to sleep after it (their lines, not NCCL, wait meanwhile).
+@@ -65,14 +77,103 @@ fn homeOf(e: *Engine, id: u64) !?u8 {
+     return ranks.homeOf(e, e.snaps.get(id) orelse return error.NoKeptState);
+ }
+ 
+-fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
+     const e = engineOf(ptr);
+     const k: *Kept = @ptrCast(@alignCast(saved));
+     const rest = Rest.of(e);
+     defer rest.done();
++    if (pages_mode) return gatherPages(e, k, pages, ranges, out);
+     try ranks.gatherWith(RankIo{ .e = e, .id = k.id }, try ranks.shape(e), prefixes, k.at, try homeOf(e, k.id), ranges, out, e.gpa);
+ }
+ 
++/// A pages-layout state's image bytes over `ranges` into `out`: the words from the engine's fields, the rows from the
++/// pool's pages (a piece a page-run, as snapshot_pages.moveParts copies), the fixed parts from the slot's lease in the
++/// image's fixed order, and each other rank's prefix through the link (rank 0's files, as every store's).
++fn gatherPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++    if (pages.len == 0) return error.NoPages;
++    const sh = try ranks.shape(e);
++    var list: std.ArrayList(img.Part) = .empty;
++    defer list.deinit(e.gpa);
++    try img.pageParts(sh, k.at, &list, e.gpa);
++    const s = e.snaps.get(k.id) orelse return error.NoKeptState;
++    const p = e.pages orelse return error.NoPages;
++    const page = p.layout.pageBytes();
++    const arena: u64 = if (p.arena) |a| a.ptr else return error.NoPages;
++    var words = (try ranks.wordsOf(e, k.id)).encode();
++    var own: u64 = 0; // rank 0's image bytes: the words, the rows and the fixed parts; the rank prefixes follow
++    for (list.items) |part| own += part.bytes;
++    var o: usize = 0;
++    for (ranges) |g| {
++        const end = g.off + g.len;
++        var base: u64 = 0; // the part's first image byte
++        var lease: u64 = 0; // the slot's bytes before this fixed part
++        for (list.items, 0..) |part, pi| {
++            defer {
++                base += part.bytes;
++                if (pi > 0 and part.row == 0) lease += part.bytes;
++            }
++            const lo = @max(g.off, base);
++            const hi = @min(end, base + part.bytes);
++            if (lo >= hi) continue;
++            const host = out[o + @as(usize, @intCast(lo - g.off)) ..][0..@intCast(hi - lo)];
++            const within = lo - base;
++            if (pi == 0) {
++                @memcpy(host, std.mem.sliceAsBytes(&words)[@intCast(within)..][0..host.len]);
++            } else if (part.row > 0) {
++                try pageRows(e, part, sh, pages, within, host, arena, page);
++            } else try leaseRead(e, &s, lease + within, host);
++        }
++        var pre = own; // each other rank's prefix through the link, as the flat store's
++        var r: u32 = 1;
++        while (r < prefixes.len) : (r += 1) {
++            const lo = @max(g.off, pre);
++            const hi = @min(end, pre + prefixes[r]);
++            if (lo < hi) try ranks.take(e, r, k.id, img.Words.bytes + (lo - pre), out[o + @as(usize, @intCast(lo - g.off)) ..][0..@intCast(hi - lo)]);
++            pre += prefixes[r];
++        }
++        if (end > pre) return error.SnapshotShape;
++        o += @intCast(g.len);
++    }
++}
++
++/// A row part's bytes [within, within + host.len) read from the pool's pages: byte b in page ids[b / span] at
++/// b % span (`pageSpan`), a `cuMemcpyDtoH` a page-run.
++fn pageRows(e: *Engine, part: img.Part, sh: img.Shape, pages: []const u32, within: u64, host: []u8, arena: u64, page: u64) !void {
++    const span = img.pageSpan(sh, part);
++    var done: usize = 0;
++    while (done < host.len) {
++        const b = within + done;
++        const k = b / span;
++        if (k >= pages.len) return error.SnapshotShape;
++        const n: usize = @intCast(@min(host.len - done, span - b % span));
++        try e.d.check(e.d.api.cuMemcpyDtoH_v2(host[done..].ptr, arena + @as(u64, pages[k]) * page + b % span, n), "cuMemcpyDtoH");
++        done += n;
++    }
++}
++
++/// The slot's lease bytes [at, at + host.len) read (the fixed parts): its device pages a copy, its pinned host pages a memcpy.
++fn leaseRead(e: *Engine, s: anytype, at: u64, host: []u8) !void {
++    const sp = e.snap_pages orelse return error.NoSnapshotCache;
++    const page = glm.snapshots.pages.page;
++    if (at + host.len > s.lease.count() * page) return error.SnapshotSize;
++    const nd = s.lease.dev.ids.items.len;
++    var done: usize = 0;
++    while (done < host.len) {
++        const x = at + done;
++        const k: usize = @intCast(x / page);
++        const n = @min(host.len - done, page - x % page);
++        if (k < nd) {
++            const src = (sp.arena orelse return error.NoSnapshotRoom).ptr + @as(u64, s.lease.dev.ids.items[k]) * page + x % page;
++            try e.d.check(e.d.api.cuMemcpyDtoH_v2(host[done..].ptr, src, @intCast(n)), "cuMemcpyDtoH");
++        } else {
++            const buf = (sp.host orelse return error.NoSnapshotRoom).bytes;
++            const from: usize = @as(usize, @intCast(s.lease.host.ids.items[k - nd])) * page + @as(usize, @intCast(x % page));
++            @memcpy(host[done..][0..n], buf[from..][0..n]);
++        }
++        done += n;
++    }
++}
++
+ /// A new id leased at `at` on every rank, filled by `scatter` and sealed by the words in its last one.
+ fn blank(ptr: *anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
+     const e = engineOf(ptr);
+@@ -84,8 +185,54 @@ fn blank(ptr: *anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
+     return @ptrCast(k);
+ }
+ 
++/// A new kept state of `at` tokens whose leading rows go into pool pages the store holds (`out` their ids, each held
++/// for the caller's tree), its slot past them: a recall's blank under TF_KV_SHARE. The pages lie in one part under
++/// TF_GLM_KV_SHARD (the part with room, as a fresh stream's `Parts.choose`), a recall's home part.
++fn blankPages(ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!api.prompt_cache.Saved {
++    const e = engineOf(ptr);
++    const rest = Rest.of(e);
++    defer rest.done();
++    const p = e.pages orelse return error.NoPages;
++    const n = at / glm.state.page_rows;
++    if (n == 0) return error.SnapshotShape;
++    const ids = try e.gpa.alloc(u32, n);
++    errdefer e.gpa.free(ids);
++    if (!holdPages(p, ids)) return error.LaneMemory;
++    errdefer givePages(p, ids);
++    const id = try ranks.blank(e, at);
++    errdefer e.dropState(id);
++    const k = try e.gpa.create(Kept);
++    errdefer e.gpa.destroy(k);
++    k.* = .{ .id = id, .at = at };
++    // the slot's seal and restore size it past the pages' rows (cuda_snapshots.seal reads s.shared)
++    e.snaps.getPtr(id).?.shared = n;
++    try out.appendSlice(e.gpa, ids);
++    e.gpa.free(ids);
++    return @ptrCast(k);
++}
++
++/// `n` pool pages held for a recalled state: the pool's, or a sharded pool's one part with room (global ids).
++fn holdPages(p: anytype, out: []u32) bool {
++    if (p.shard) |x| {
++        const part = x.parts.choose(out.len, null) orelse return false;
++        if (!x.parts.pools[part].hold(out)) return false;
++        for (out) |*id| id.* += @as(u32, @intCast(part * x.parts.h));
++        return true;
++    }
++    return p.pool.hold(out);
++}
++
++/// A recalled state's pages given back (its tree did not take them: a failed read or insert).
++fn givePages(p: anytype, ids: []const u32) void {
++    if (p.shard) |x| {
++        for (ids) |id| x.parts.release(id);
++        return;
++    }
++    for (ids) |id| p.pool.release(id);
++}
++
+ /// The last scatter brings the state's own file, words first: every rank seals it then (the words place the head).
+-fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
+     const e = engineOf(ptr);
+     const k: *Kept = @ptrCast(@alignCast(saved));
+     const rest = Rest.of(e);
+@@ -96,10 +243,93 @@ fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.
+         @memcpy(std.mem.sliceAsBytes(&x), in[0..img.Words.bytes]);
+         try ranks.seal(e, k.id, try img.Words.decode(x, k.at));
+     }
++    if (pages_mode) return scatterPages(e, k, pages, ranges, in);
+     // the blank's home (cuda_disk_ranks.readHome), not the words': a sharded state's latent rows to that rank alone
+     try ranks.scatterWith(RankIo{ .e = e, .id = k.id }, try ranks.shape(e), prefixes, k.at, try homeOf(e, k.id), ranges, in, e.gpa);
+ }
+ 
++/// A pages-layout state's image bytes from `in` into its pool pages and its slot's lease (the words went with the
++/// seal), and each other rank's prefix through the link: the read-back of a recall into pool pages.
++fn scatterPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++    if (pages.len == 0) return error.NoPages;
++    const sh = try ranks.shape(e);
++    var list: std.ArrayList(img.Part) = .empty;
++    defer list.deinit(e.gpa);
++    try img.pageParts(sh, k.at, &list, e.gpa);
++    const s = e.snaps.get(k.id) orelse return error.NoKeptState;
++    const p = e.pages orelse return error.NoPages;
++    const page = p.layout.pageBytes();
++    const arena: u64 = if (p.arena) |a| a.ptr else return error.NoPages;
++    var own: u64 = 0;
++    for (list.items) |part| own += part.bytes;
++    var o: usize = 0;
++    for (ranges) |g| {
++        const end = g.off + g.len;
++        var base: u64 = 0;
++        var lease: u64 = 0;
++        for (list.items, 0..) |part, pi| {
++            defer {
++                base += part.bytes;
++                if (pi > 0 and part.row == 0) lease += part.bytes;
++            }
++            const lo = @max(g.off, base);
++            const hi = @min(end, base + part.bytes);
++            if (lo >= hi) continue;
++            const bytes = in[o + @as(usize, @intCast(lo - g.off)) ..][0..@intCast(hi - lo)];
++            const within = lo - base;
++            if (pi == 0) continue; // the words went with the seal
++            if (part.row > 0) try pageWrite(e, part, sh, pages, within, bytes, arena, page) else try leaseWrite(e, &s, lease + within, bytes);
++        }
++        var pre = own;
++        var r: u32 = 1;
++        while (r < prefixes.len) : (r += 1) {
++            const lo = @max(g.off, pre);
++            const hi = @min(end, pre + prefixes[r]);
++            if (lo < hi) try ranks.put(e, r, k.id, img.Words.bytes + (lo - pre), in[o + @as(usize, @intCast(lo - g.off)) ..][0..@intCast(hi - lo)]);
++            pre += prefixes[r];
++        }
++        if (end > pre) return error.SnapshotShape;
++        o += @intCast(g.len);
++    }
++}
++
++/// A row part's bytes written into the pool's pages: byte b in page ids[b / span] at b % span, an `cuMemcpyHtoD` a page-run.
++fn pageWrite(e: *Engine, part: img.Part, sh: img.Shape, pages: []const u32, within: u64, bytes: []const u8, arena: u64, page: u64) !void {
++    const span = img.pageSpan(sh, part);
++    var done: usize = 0;
++    while (done < bytes.len) {
++        const b = within + done;
++        const k = b / span;
++        if (k >= pages.len) return error.SnapshotShape;
++        const n: usize = @intCast(@min(bytes.len - done, span - b % span));
++        try e.d.check(e.d.api.cuMemcpyHtoD_v2(arena + @as(u64, pages[k]) * page + b % span, bytes[done..].ptr, n), "cuMemcpyHtoD");
++        done += n;
++    }
++}
++
++/// The slot's lease bytes [at, at + bytes.len) written: its device pages a copy, its pinned host pages a memcpy.
++fn leaseWrite(e: *Engine, s: anytype, at: u64, bytes: []const u8) !void {
++    const sp = e.snap_pages orelse return error.NoSnapshotCache;
++    const page = glm.snapshots.pages.page;
++    if (at + bytes.len > s.lease.count() * page) return error.SnapshotSize;
++    const nd = s.lease.dev.ids.items.len;
++    var done: usize = 0;
++    while (done < bytes.len) {
++        const x = at + done;
++        const k: usize = @intCast(x / page);
++        const n = @min(bytes.len - done, page - x % page);
++        if (k < nd) {
++            const dst = (sp.arena orelse return error.NoSnapshotRoom).ptr + @as(u64, s.lease.dev.ids.items[k]) * page + x % page;
++            try e.d.check(e.d.api.cuMemcpyHtoD_v2(dst, bytes[done..].ptr, @intCast(n)), "cuMemcpyHtoD");
++        } else {
++            const buf = (sp.host orelse return error.NoSnapshotRoom).bytes;
++            const from: usize = @as(usize, @intCast(s.lease.host.ids.items[k - nd])) * page + @as(usize, @intCast(x % page));
++            @memcpy(buf[from..][0..n], bytes[done..][0..n]);
++        }
++        done += n;
++    }
++}
++
+ fn whole(ptr: *anyopaque, saved: api.prompt_cache.Saved) bool {
+     const k: *Kept = @ptrCast(@alignCast(saved));
+     const s = engineOf(ptr).snaps.get(k.id) orelse return false;
+@@ -142,7 +372,7 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !
+     var total = own;
+     for (prefixes[1..]) |p| total += p;
+     const bytes = try a.alloc(u8, @intCast(total));
+-    try gather(e, saved, &.{.{ .off = 0, .len = total }}, bytes);
++    try gather(e, saved, &.{}, &.{.{ .off = 0, .len = total }}, bytes); // the probe is a copied state: no pages
+     const shared = bytes[@intCast(img.Words.bytes + sh.prefix)..@intCast(own)];
+     const theirs = try a.alloc(u8, shared.len);
+     // each rank's copy of what it holds (under TF_GLM_KV_SHARD the latent rows on the probe's home alone)
+@@ -205,6 +435,50 @@ fn stagingOf(text: ?[]const u8) error{BadStagingGib}!u64 {
+     return std.mem.alignBackward(u64, @intFromFloat(g * (1 << 30)), rows.file.alignment);
+ }
+ 
++/// --learn-conversations with TF_KV_SHARE: the shared store's states on disk, their rows in the pool's pages and
++/// their slots' parts in rank 0's files (the pages layout: its own identity, so the two stores' sets never mix).
++pub fn attachShare(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, x: *prompt_pages.Adapter) !void {
++    const e: *Engine = loaded.target;
++    if (e.share.world > prefix_buf.len) return error.TooManyRanks;
++    try ranks.prefixes(e, prefix_buf[0..e.share.world]);
++    prefixes = prefix_buf[0..e.share.world];
++    const sh = try ranks.shape(e);
++    var facts: std.ArrayList(u64) = .empty;
++    defer facts.deinit(a);
++    try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null), 1 }); // 1: the pages layout
++    try facts.appendSlice(a, prefixes);
++    try facts.append(a, glm.forward.window_rows); // states kept at another window width are another store's
++    const was = e.share_pages;
++    const held = if (e.pages) |pg| pg.prompts else null;
++    // the probe keeps a whole copy through its own mark hook, as without the share: the store stands aside for it
++    e.share_pages = false;
++    if (e.pages) |pg| pg.prompts = null;
++    const p = probe(a, io, loaded.backend, e) catch |err| {
++        e.share_pages = was;
++        if (e.pages) |pg| pg.prompts = held;
++        return err;
++    };
++    e.share_pages = was;
++    if (e.pages) |pg| pg.prompts = held;
++    pages_mode = true;
++    const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
++    const gibs = struct {
++        fn bytes(g: f64) u64 {
++            return @intFromFloat(g * (1 << 30));
++        }
++    }.bytes;
++    const raw = std.c.getenv("TF_GLM_LEARN_STAGING_GIB");
++    const named = raw != null and std.mem.trim(u8, std.mem.span(raw.?), " \t").len > 0;
++    const staging_bytes = try stagingOf(if (raw) |v| std.mem.span(v) else null);
++    const r = try rows.Rows.open(x.gpa, x.store.tree.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = x.store.rules.lookahead, .planned = x.store.rules.planned, .grid = x.store.rules.grid, .staging_bytes = staging_bytes });
++    r.prefill_rate = p.rate;
++    x.store.attachDisk(r);
++    x.disk = r;
++    var permit_buf: [48]u8 = undefined;
++    const permit = if (named) try std.fmt.bufPrint(&permit_buf, "; staging {d} GiB", .{staging_bytes >> 30}) else "";
++    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts, pages and parts{s})", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len, permit });
++}
++
+ test {
+     std.testing.refAllDecls(@This());
+ }
+diff --git a/zig/src/native/cuda_prompt_pages.zig b/zig/src/native/cuda_prompt_pages.zig
+index cfdcf7bb..07126345 100644
+--- a/zig/src/native/cuda_prompt_pages.zig
++++ b/zig/src/native/cuda_prompt_pages.zig
+@@ -32,6 +32,9 @@ pub const Adapter = struct {
+     part: [2]Part = undefined, // each part's reclaim hook (the parts variant)
+     detach: *const fn (*anyopaque) void,
+     target: *anyopaque,
++    /// --learn-conversations beside TF_KV_SHARE: the states' disk store (cuda_glm_disk.attachShare); closed with the
++    /// store, whose deinit lets the writer's queued saves go first.
++    disk: ?*api.prompt_cache.rows.Rows = null,
+ 
+     /// The family's store, its pool's reclaim evicting the tree's idle pages — one pool's all of them, a sharded
+     /// pool's each part its own leaves (below); null: the family has no pool.
+@@ -79,6 +82,7 @@ pub const Adapter = struct {
+         .release = PartsPages.release,
+         .holders = PartsPages.holders,
+         .available = PartsPages.available,
++        .hold = PartsPages.hold,
+     };
+ 
+     const PartsPages = struct {
+@@ -101,6 +105,11 @@ pub const Adapter = struct {
+             const s = parts(ptr);
+             return s.available(s.ctx);
+         }
++        fn hold(ptr: *anyopaque, out: []u32) bool {
++            const s = parts(ptr);
++            const f = s.holdPages orelse return false;
++            return f(s.ctx, out);
++        }
+     };
+ 
+     fn Detach(comptime F: type) type {
+@@ -111,7 +120,8 @@ pub const Adapter = struct {
+         };
+     }
+ 
+-    /// The family stops calling, the pool's reclaim goes, the tree drops its states and releases its pages.
++    /// The family stops calling, the pool's reclaim goes, the tree drops its states and releases its pages; a disk
++    /// store closes with it, its queued saves let go first (its pages' holds back, its tokens freed).
+     pub fn close(x: *Adapter) void {
+         x.detach(x.target);
+         switch (x.src) {
+@@ -119,6 +129,7 @@ pub const Adapter = struct {
+             .parts => |s| for (0..s.count) |i| s.setReclaim(s.ctx, i, null),
+         }
+         x.store.deinit();
++        if (x.disk) |r| r.deinit();
+         x.gpa.destroy(x);
+     }
+ 
+-- 
+2.56.0
+

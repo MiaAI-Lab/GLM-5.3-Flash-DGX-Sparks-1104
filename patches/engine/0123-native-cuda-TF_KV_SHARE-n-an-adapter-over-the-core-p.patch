@@ -1,0 +1,684 @@
+From f2bc69a66df06a1405eb856aa8f392c571e4a101 Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] native cuda: TF_KV_SHARE=n, an adapter over the core pool in
+ one prompt_radix store
+
+Ported from upstream 40c03bf13. Kept prompt states are held as the pool's own pages by reference in one radix store, n the number of kept states; off by default. Families opt in; GLM follows in a later patch.
+---
+ zig/build/cuda.zig                     |   1 +
+ zig/src/core/kv_pool.zig               |  26 +++-
+ zig/src/core/kv_pool_test.zig          |  56 +++++++++
+ zig/src/core/kv_prompts.zig            |  89 +++++++++++++
+ zig/src/core/root.zig                  |   2 +
+ zig/src/native/cuda.zig                |  21 +++-
+ zig/src/native/cuda_host_close.zig     |   1 +
+ zig/src/native/cuda_kv_pool.zig        |  44 +++----
+ zig/src/native/cuda_kv_safety_test.zig |   2 +-
+ zig/src/native/cuda_prompt_pages.zig   | 165 +++++++++++++++++++++++++
+ 10 files changed, 377 insertions(+), 30 deletions(-)
+ create mode 100644 zig/src/core/kv_prompts.zig
+ create mode 100644 zig/src/native/cuda_prompt_pages.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index e2ba56e8..596c8ec8 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -107,6 +107,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     runner.addImport("glm_cuda", glm_cuda);
+     for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
+     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
++    runner.addImport("prompt_pages", b.createModule(.{ .root_source_file = b.path("zig/src/native/cuda_prompt_pages.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = mods.api }, .{ .name = "core", .module = mods.core } } })); // TF_KV_SHARE's store, for the pages checks
+     const runner_exe = b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner });
+     b.installArtifact(runner_exe);
+     // tf-tp-watch-check: the ranks' lines with no GPU or NCCL; a failing or dying rank stops every rank
+diff --git a/zig/src/core/kv_pool.zig b/zig/src/core/kv_pool.zig
+index 73d10a81..8f3cf45b 100644
+--- a/zig/src/core/kv_pool.zig
++++ b/zig/src/core/kv_pool.zig
+@@ -56,6 +56,8 @@ pub const Budget = struct {
+     window: u64 = 0,
+     /// The engine's own rows are pages too: a window of them first, then the cache after the windows the room holds.
+     engine_paged: bool = false,
++    /// Parts per million of the cache that kept states hold as pool pages (TF_KV_SHARE): made pages past the windows.
++    kept_ppm: u32 = 0,
+     /// The cache is set aside before the room is counted in windows (TF_PROMPT_CACHE_FIRST=1): the other streams
+     /// share the pages left, at least the engine's own window, instead of the cache taking what whole windows leave.
+     cache_first: bool = false,
+@@ -63,7 +65,7 @@ pub const Budget = struct {
+ 
+ /// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams; `skipped`: cache bytes
+ /// a family's rule gave the pages instead (native's plan: a device share too small for one of its states).
+-pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize, skipped: u64 = 0 };
++pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize, skipped: u64 = 0, kept: u64 = 0 }; // kept: the cache bytes made pages
+ 
+ /// The prompt cache's split: slots for its snapshots, the rest for their copied KV rows (no slot: no cache).
+ pub fn split(cache: u64, snap_bytes: u64, named: ?usize) struct { snaps: usize, copied: u64 } {
+@@ -82,10 +84,12 @@ pub fn plan(l: Layout, b: Budget) error{ NoStream, TooMany }!Plan {
+     const fit = @min(extra, left / each);
+     if (fit < extra and b.fixed) return error.TooMany;
+     left -= fit * l.fixed_bytes;
+-    const c = split(@min(b.cache, left -| held(l, b, fit)), l.snap_bytes, b.snaps);
++    const cache = @min(b.cache, left -| held(l, b, fit));
++    const kept = cache / 1_000_000 * b.kept_ppm + cache % 1_000_000 * b.kept_ppm / 1_000_000; // the cache's share as pages
++    const c = split(cache - kept, l.snap_bytes, b.snaps);
+     left -= c.snaps * l.snap_bytes + c.copied;
+-    const most: u64 = if (b.window > 0) (fit + @intFromBool(b.engine_paged)) * l.pages(b.window) + fit * l.runPages() else std.math.maxInt(u64);
+-    return .{ .lanes = @intCast(1 + fit), .snaps = c.snaps, .copied = c.copied, .pages = @intCast(@min((left + own) / l.pageBytes(), most)) };
++    const most: u64 = if (b.window > 0) (fit + @intFromBool(b.engine_paged)) * l.pages(b.window) + fit * l.runPages() + kept / l.pageBytes() else std.math.maxInt(u64);
++    return .{ .lanes = @intCast(1 + fit), .snaps = c.snaps, .copied = c.copied, .pages = @intCast(@min((left + own) / l.pageBytes(), most)), .kept = kept };
+ }
+ 
+ /// Whether `b.cache` fits whole in what `plan` leaves it: the room past the engine and a fixed part and page a stream.
+@@ -254,6 +258,20 @@ pub const Pool = struct {
+         l.promised += n;
+     }
+ 
++    /// `out.len` free pages the store holds itself (a kept state's copied rows), the store reclaiming first if it must.
++    pub fn hold(p: *Pool, out: []u32) bool {
++        if (p.available() < out.len) if (p.reclaim) |r| {
++            _ = r.call(r.ctx, out.len);
++        };
++        if (p.available() < out.len) return false;
++        for (out) |*id| {
++            p.nfree -= 1;
++            id.* = p.free[p.nfree];
++            p.ownership(id.*, 1, 0);
++        }
++        return true;
++    }
++
+     /// The part of `l`'s promise it has not taken goes back.
+     pub fn unpromise(p: *Pool, l: *Lease) void {
+         p.promised -= l.promised;
+diff --git a/zig/src/core/kv_pool_test.zig b/zig/src/core/kv_pool_test.zig
+index cfa2a16d..d04485d0 100644
+--- a/zig/src/core/kv_pool_test.zig
++++ b/zig/src/core/kv_pool_test.zig
+@@ -404,3 +404,59 @@ test "combined page cap: all three windows and only the two extra streams' recur
+     b.engine_paged = false;
+     try expectEqual(@as(usize, 10), (try kv.plan(l, b)).pages);
+ }
++
++test "TF_KV_SHARE's plan: the cache's kept share becomes pool pages past the windows, the rest stays copies" {
++    const l: kv.Layout = .{ .fixed_bytes = 10, .token_bytes = 3, .page_tokens = 4, .snap_bytes = 0 };
++    const b: kv.Budget = .{ .room = 10_000, .engine = 5, .lanes = 3, .cache = 120, .window = 9, .engine_paged = true };
++    const copies = try kv.plan(l, b);
++    var shared = b;
++    shared.kept_ppm = 500_000; // half the cache's bytes are kept states' pages
++    const pages = try kv.plan(l, shared);
++    try expectEqual(copies.lanes, pages.lanes);
++    try expectEqual(copies.copied - 60, pages.copied);
++    try expectEqual(copies.pages + 60 / l.pageBytes(), pages.pages);
++    try expectEqual(@as(u64, 60), pages.kept);
++    shared.kept_ppm = 0;
++    try expectEqual(copies, try kv.plan(l, shared));
++}
++
++test "the store holds free pages itself: never promised ones, released back to the free list" {
++    var p = try kv.Pool.init(std.testing.allocator, 4, 1);
++    defer p.deinit();
++    var l: kv.Lease = .{};
++    try p.promise(&l, 2);
++    var ids: [2]u32 = undefined;
++    try expect(p.hold(&ids)); // two free past the promise
++    try expect(!p.hold(ids[0..1])); // none left unpromised
++    try expectEqual(@as(usize, 2), p.census().kept);
++    for (ids) |id| p.release(id);
++    p.finish(&l);
++    try expect(p.idle());
++    try expectEqual(@as(usize, 4), p.available());
++}
++
++const Shed = struct {
++    pool: *kv.Pool,
++    kept: []const u32,
++    calls: usize = 0,
++    fn call(ctx: *anyopaque, want: usize) bool {
++        const x: *Shed = @ptrCast(@alignCast(ctx));
++        x.calls += 1;
++        for (x.kept) |id| x.pool.release(id);
++        return x.pool.available() >= want;
++    }
++};
++
++test "a hold past the free pages asks the store to reclaim first, as a promise does" {
++    var p = try kv.Pool.init(std.testing.allocator, 3, 1);
++    defer p.deinit();
++    var old: [3]u32 = undefined;
++    try expect(p.hold(&old)); // the store's own pages fill the pool
++    var shed: Shed = .{ .pool = &p, .kept = &old };
++    p.reclaim = .{ .ctx = &shed, .call = Shed.call };
++    var ids: [2]u32 = undefined;
++    try expect(p.hold(&ids));
++    try expectEqual(@as(usize, 1), shed.calls);
++    for (ids) |id| p.release(id);
++    try expect(p.idle());
++}
+diff --git a/zig/src/core/kv_prompts.zig b/zig/src/core/kv_prompts.zig
+new file mode 100644
+index 00000000..8ee361ee
+--- /dev/null
++++ b/zig/src/core/kv_prompts.zig
+@@ -0,0 +1,89 @@
++//! TF_KV_SHARE: what a family on the core pool calls of one prompt store over its pages (native/cuda_prompt_pages.zig).
++const std = @import("std");
++
++/// Where a pass resumes and the marks it keeps states at (`marks` the store's allocation, freed by `free`).
++pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
++
++/// The store as a family sees it: a prompt pass begins, keeps at its marks, and reports once its prompt is in.
++pub const Prompts = struct {
++    ctx: *anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        /// The deepest state `prompt` resumes: its pages into `adopt` (held once more), the rest restored into `owner`.
++        begin: *const fn (ctx: *anyopaque, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!Plan,
++        /// At `at` the store takes the pages of `mine` it lacks and the state; `path`'s first n replace the stream's.
++        keep: *const fn (ctx: *anyopaque, prompt: []const u32, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize,
++        /// One log line after a prompt pass: where it resumed and how many states it kept.
++        report: *const fn (ctx: *anyopaque, prompt: usize, from: u32, kept: u64) void,
++        free: *const fn (ctx: *anyopaque, marks: []const u32) void,
++    };
++
++    pub fn begin(p: Prompts, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) !Plan {
++        return p.vtable.begin(p.ctx, prompt, history_len, shared, owner, adopt);
++    }
++
++    pub fn keep(p: Prompts, prompt: []const u32, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize {
++        return p.vtable.keep(p.ctx, prompt, at, owner, mine, path);
++    }
++
++    pub fn report(p: Prompts, prompt: usize, from: u32, kept: u64) void {
++        p.vtable.report(p.ctx, prompt, from, kept);
++    }
++
++    pub fn free(p: Prompts, marks: []const u32) void {
++        p.vtable.free(p.ctx, marks);
++    }
++};
++
++/// A kept state's copied rows in store-held pages: byte o in chunk c = o / chunk, region c % regions, page c / regions.
++pub const Blob = struct {
++    ids: []const u32,
++    chunk: u64, // the bytes one page holds in one region (a layer's K or V)
++    regions: usize,
++
++    /// Pages that hold `bytes` this way.
++    pub fn pagesFor(bytes: u64, chunk: u64, regions: usize) usize {
++        const page = chunk * regions;
++        return @intCast((bytes + page - 1) / page);
++    }
++
++    /// Bytes [off, off + len) as pieces inside one chunk: f(ctx, region, page id, in-chunk offset, from `off`, len).
++    pub fn each(b: Blob, off: u64, len: u64, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize, u32, u64, u64, u64) anyerror!void) !void {
++        var o = off;
++        while (o < off + len) {
++            const c = o / b.chunk;
++            const within = o % b.chunk;
++            const n = @min(off + len - o, b.chunk - within);
++            const k: usize = @intCast(c / b.regions);
++            if (k >= b.ids.len) return error.PastBlob;
++            try f(ctx, @intCast(c % b.regions), b.ids[k], within, o - off, n);
++            o += n;
++        }
++    }
++};
++
++/// TF_KV_SHARE=n: keep prompts as pool pages and at most n states past them (0 or unset: copies, as before).
++pub fn sharing() error{BadKvShare}!usize {
++    const v = std.c.getenv("TF_KV_SHARE") orelse return 0;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch error.BadKvShare;
++}
++
++const testing = std.testing;
++
++const Pieces = struct {
++    got: *std.ArrayList([5]u64),
++    fn add(p: Pieces, region: usize, id: u32, within: u64, from: u64, n: u64) anyerror!void {
++        try p.got.append(testing.allocator, .{ region, id, within, from, n });
++    }
++};
++
++test "a blob's bytes walk its regions a chunk at a time, then its next page; a run splits at chunk edges" {
++    const b: Blob = .{ .ids = &.{ 7, 3 }, .chunk = 10, .regions = 2 };
++    try testing.expectEqual(@as(usize, 2), Blob.pagesFor(21, 10, 2));
++    var got: std.ArrayList([5]u64) = .empty;
++    defer got.deinit(testing.allocator);
++    try b.each(5, 30, Pieces{ .got = &got }, Pieces.add); // bytes 5..35: chunks 0 (page 7, K), 1 (page 7, V), 2 (page 3, K), 3 (page 3, V)
++    try testing.expectEqualSlices([5]u64, &.{ .{ 0, 7, 5, 0, 5 }, .{ 1, 7, 0, 5, 10 }, .{ 0, 3, 0, 15, 10 }, .{ 1, 3, 0, 25, 5 } }, got.items);
++    try testing.expectError(error.PastBlob, b.each(39, 2, Pieces{ .got = &got }, Pieces.add));
++}
+diff --git a/zig/src/core/root.zig b/zig/src/core/root.zig
+index 096bfc06..96bb7edf 100644
+--- a/zig/src/core/root.zig
++++ b/zig/src/core/root.zig
+@@ -56,6 +56,7 @@ pub const dense_ref = @import("dense_ref.zig");
+ 
+ pub const checkpoint_weights = @import("checkpoint_weights.zig");
+ pub const kv_pool = @import("kv_pool.zig");
++pub const kv_prompts = @import("kv_prompts.zig");
+ 
+ test {
+     _ = checkpoint_weights;
+@@ -108,6 +109,7 @@ test {
+     _ = @import("nvfp4_fixture_test.zig");
+     _ = @import("drafter_release_test.zig");
+     _ = kv_pool;
++    _ = kv_prompts;
+ }
+ 
+ pub const frame_rounds = @import("frame_rounds.zig");
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index c8f07354..d5f77937 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -22,6 +22,7 @@ const Allocator = std.mem.Allocator;
+ pub const budget = @import("cuda_memory.zig");
+ const lane_backend = @import("cuda_bound.zig");
+ const snaps = @import("cuda_snaps.zig");
++const prompt_pages = @import("cuda_prompt_pages.zig");
+ const slide_adapter = @import("slide_adapter.zig");
+ const cuda_disk = @import("cuda_disk.zig");
+ const vision_offer = @import("cuda_vision_offer.zig");
+@@ -76,6 +77,7 @@ pub const Host = struct {
+     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
+     warm_quiet: u64 = 0, // ns a warm pass waits for other work before its first chunk: the family's `warm_quiet`
++    prompts: ?*prompt_pages.Adapter = null, // TF_KV_SHARE: the family's prompts as its pool's pages (no `store` then)
+     learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
+     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV parts (GLM's TF_GLM_KV_SHARD), for /health and /metrics
+     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
+@@ -348,6 +350,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         }
+     };
+     defer if (!opened) loaded.deinit(loaded.ctx);
++    const share = try prompt_pages.wanted(F, loaded); // TF_KV_SHARE: the cache is pool pages, kept by the family's store
++    if (o.learn_conversations and share) {
++        problem.* = "--learn-conversations writes the host prompt cache's states, and TF_KV_SHARE keeps prompts as pool pages instead: serve with one of the two";
++        return null;
++    }
+     const taps = record.taps(loaded); // --record is refused before the host is made, so a refusal holds nothing
+     if (o.record) |dir| if (try record.refusal(a, io, o.model_type, dir, taps)) |why| {
+         problem.* = why;
+@@ -379,7 +386,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+             .reserve = .{ .bytes = after.reserve, .least = @intFromFloat(budget.floor(after.unified).least * (1 << 30)), .limited = after.limit != null },
+             .min_state = if (comptime @hasDecl(F, "snap_min_bytes")) F.snap_min_bytes(loaded.target) else 0,
+         };
+-        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), facts) orelse return null;
++        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), facts, if (share) 1_000_000 else 0) orelse return null;
+         break :blk paged.?.lanes;
+     } else budget.admit(grow, served.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
+         problem.* = switch (e) {
+@@ -413,16 +420,19 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     h.readiness(F);
+     const held = served.stream_bytes * (streams -| free);
+     const kept = kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
++    const cache = kept.copied;
+     var cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
+     const shown = try kv_pages.text(F, a, served.stream_bytes, layout, paged, kv_pages.enginePaged(loaded), @intCast(window), kept, o.kv8);
++    // TF_QWEN_KV_SHARE: the family keeps prompts itself, over its pool's pages
++    const cache_text = if (share) ", the prompt cache over the pool's pages" else shown[1];
+     h.startup = try std.fmt.allocPrint(gpa, @import("cuda_startup.zig").format, .{
+         capability, device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(learn_bytes)}) else "", streams, if (streams == 1) "" else "s", shown[0], toGib(room), toGib(after.reserve), @import("cuda_startup.zig").rows(F, loaded), if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+-        shown[1],   if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
++        cache_text, if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
+     });
+     errdefer gpa.free(h.startup);
+     const kept_budget: u64 = if (comptime @hasDecl(F, "snap_save")) try kv_pages.storeBudget(F, loaded.target, kept) else 0; // card and host tier
+     if (cache_capacity) |*c| c.budget_bytes = kept_budget; // the startup warning and metrics read what the store keeps in
+-    if (@hasDecl(F, "snap_save") and kept_budget > 0) {
++    if (@hasDecl(F, "snap_save") and kept_budget > 0 and !share) {
+         const pc = api.prompt_cache;
+         const store = try gpa.create(pc.Store);
+         errdefer gpa.destroy(store);
+@@ -445,6 +455,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         };
+     }
+     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
++    if (comptime @hasDecl(F, "share_attach")) if (share and cache > 0) {
++        h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), try @import("core").kv_prompts.sharing());
++    };
++    errdefer if (h.prompts) |x| x.close();
+     var conversations = false;
+     if (@hasDecl(F, "slide")) if (loaded.learns != null) {
+         const Slide = slide_adapter.Adapter(F.slide);
+@@ -510,6 +524,7 @@ test {
+     _ = refusals;
+     _ = lane_backend;
+     _ = snaps;
++    _ = prompt_pages;
+     _ = cuda_device; // the device and variable tests
+     _ = windows;
+ }
+diff --git a/zig/src/native/cuda_host_close.zig b/zig/src/native/cuda_host_close.zig
+index 2c1363ea..0a59fedd 100644
+--- a/zig/src/native/cuda_host_close.zig
++++ b/zig/src/native/cuda_host_close.zig
+@@ -8,6 +8,7 @@ pub fn close(h: anytype) void {
+     if (h.recording) |r| r.free(h.gpa);
+     failed_load.closeEntry(if (h.gpu) |g| &g.ctx else null) catch {};
+     if (h.store) |s| kv_pages.closeStore(h.gpa, s);
++    if (h.prompts) |x| x.close(); // its pages back to the pool before the family frees the pool
+     if (h.slide) |s| h.slide_free.?(h.gpa, s);
+     h.gpa.free(h.dir);
+     h.served.close(h.gpa);
+diff --git a/zig/src/native/cuda_kv_pool.zig b/zig/src/native/cuda_kv_pool.zig
+index 8b9a67d5..c54689f8 100644
+--- a/zig/src/native/cuda_kv_pool.zig
++++ b/zig/src/native/cuda_kv_pool.zig
+@@ -84,10 +84,10 @@ pub const Facts = struct { reserve: ?Reserve = null, min_state: u64 = 0 };
+ /// The pool beside the engine's own sequence (in `model`: a window, or on pages its fixed part); null: see `problem`.
+ /// A family that keeps states past the card (`snap_host_tier`) gives the pages a device share under one state
+ /// (`facts.min_state`): it would hold none of its own, and the states go to the host tier (Plan.skipped says how much).
+-pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, facts: Facts) !?Plan {
++pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, facts: Facts, kept_ppm: u32) !?Plan {
+     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
+     const want = if (host_mode) 0 else budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
+-    var b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged, .cache_first = cacheFirst() };
++    var b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged, .kept_ppm = if (host_mode) 0 else kept_ppm, .cache_first = cacheFirst() };
+     var p = kv_pool.plan(l, b) catch |e| {
+         problem.* = try refusal(a, l, b, e, window, rows, facts.reserve);
+         return null;
+@@ -162,7 +162,7 @@ pub const Kept = struct { snaps: usize, copied: u64, snap_bytes: u64, host: bool
+ pub fn kept(comptime F: type, loaded: anytype, paged: ?Plan, o: api.Open, room: u64, held: u64, host_budget: u64, host_mode: bool) Kept {
+     if (host_mode) return .{ .snaps = 0, .copied = hostBudget(o, host_budget), .snap_bytes = stagingBytes(F, loaded, hostBudget(o, host_budget)), .host = true, .most = named(o) orelse std.math.maxInt(usize) };
+     // on pages the plan set the cache aside already; `held` counts every stream at a whole window
+-    if (comptime !@hasDecl(F, "snap_slots")) return .{ .snaps = 0, .copied = if (!@hasDecl(F, "snap_save")) 0 else if (paged) |p| p.copied else budget.cacheBytes(o.prompt_cache_gib, room, held), .snap_bytes = 0, .skipped = if (paged) |p| p.skipped else 0 };
++    if (comptime !@hasDecl(F, "snap_slots")) return .{ .snaps = 0, .copied = if (!@hasDecl(F, "snap_save")) 0 else if (paged) |p| p.copied + p.kept else budget.cacheBytes(o.prompt_cache_gib, room, held), .snap_bytes = 0, .skipped = if (paged) |p| p.skipped else 0 }; // kept: the store's budget, held as pool pages
+     const b: u64 = loaded.snap_bytes;
+     const s = if (paged) |p| kv_pool.split(p.snaps * b + p.copied, b, p.snaps) else kv_pool.split(budget.cacheBytes(o.prompt_cache_gib, room, held), b, named(o));
+     return .{ .snaps = s.snaps, .copied = s.copied, .snap_bytes = b };
+@@ -283,11 +283,11 @@ test "kv pages: an engine whose own rows are pages plans a window of them first,
+     const l: kv_pool.Layout = .{ .fixed_bytes = 180 << 20, .token_bytes = 13_056, .page_tokens = 512, .snap_bytes = 0 };
+     const o: api.Open = .{ .dir = "", .model_type = "g", .lanes = 4, .prompt_cache_gib = 4 };
+     try std.testing.expect(enginePaged(.{ .layout = @as(?kv_pool.Layout, l), .engine_paged = true }) and !enginePaged(.{ .layout = @as(?kv_pool.Layout, l) }));
+-    const p = (try plan(Owned, a, l, 40 << 30, o, 8192, &problem, false, true, .{})).?;
++    const p = (try plan(Owned, a, l, 40 << 30, o, 8192, &problem, false, true, .{}, 0)).?;
+     try std.testing.expectEqual(@as(u32, 4), p.lanes);
+     try std.testing.expectEqual(@as(usize, 4 * 17), p.pages); // every stream at most 8,192 rows and a verify window: 17 pages
+     const floor = 17 * l.pageBytes();
+-    try std.testing.expectEqual(@as(?Plan, null), try plan(Owned, a, l, floor - 1, o, 8192, &problem, false, true, .{}));
++    try std.testing.expectEqual(@as(?Plan, null), try plan(Owned, a, l, floor - 1, o, 8192, &problem, false, true, .{}, 0));
+     try std.testing.expect(std.mem.indexOf(u8, problem, "8192-token window") != null);
+     const shown = (try text(Owned, a, 180 << 20, l, p, true, 8192, .{ .snaps = 0, .copied = 4 << 30, .snap_bytes = 0 }, false))[0];
+     try std.testing.expectEqualStrings("the engine's own and 3 more taking 68 pages of 512 rows (0.42 GiB) as they need them (enough for one at a 8192-token window), 180 MiB fixed each", shown);
+@@ -347,7 +347,7 @@ test "KV admission: a refusal prices the running states beside the fixed part an
+     var problem: []const u8 = "";
+     const l: kv_pool.Layout = .{ .fixed_bytes = 1 << 30, .token_bytes = 1 << 28, .page_tokens = 4, .snap_bytes = 1, .run_bytes = 1 << 30 };
+     const o: api.Open = .{ .dir = "", .model_type = "n", .lanes = 2, .lanes_fixed = true, .prompt_cache_gib = 0 };
+-    try std.testing.expectEqual(@as(?Plan, null), try plan(struct {}, arena.allocator(), l, 2 << 30, o, 8, &problem, false, false, .{}));
++    try std.testing.expectEqual(@as(?Plan, null), try plan(struct {}, arena.allocator(), l, 2 << 30, o, 8, &problem, false, false, .{}, 0));
+     try std.testing.expect(std.mem.indexOf(u8, problem, "needs 3.00 GiB") != null);
+     try std.testing.expect(std.mem.indexOf(u8, problem, "state runs") != null);
+ }
+@@ -377,10 +377,10 @@ test "kv merge: beside a host tier, a device share under one state goes to the K
+     const own = l.pages(864_256 + 8) * page; // the engine's own 864,256-token window: 1,689 pages
+     const share: u64 = 188_753_152; // the 0.176 GiB production's room left the device cache
+     const room = own + 3 * l.fixed_bytes + 3 * page + share;
+-    const before = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{})).?; // no state size: as before
++    const before = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{}, 0)).?; // no state size: as before
+     try std.testing.expectEqual(share, before.copied);
+     try std.testing.expectEqual(@as(usize, 1692), before.pages); // production's pool: 866,304 tokens
+-    const p = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state })).?;
++    const p = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0)).?;
+     try std.testing.expectEqual(@as(u64, 0), p.copied);
+     try std.testing.expectEqual(share, p.skipped);
+     try std.testing.expectEqual(@as(usize, 1692 + share / page), p.pages); // 57 pages more: 895,488 tokens
+@@ -411,17 +411,17 @@ test "kv merge: beside a host tier, a device share under one state goes to the K
+     try std.testing.expectEqual(@as(usize, 1), Quiet.warned);
+     // a share that holds one state stays on the card, as does any share of a family without a host tier
+     const roomy = room - share + glm_min_state;
+-    const held = (try plan(Glm, a, l, roomy, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state })).?;
++    const held = (try plan(Glm, a, l, roomy, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0)).?;
+     try std.testing.expectEqual(glm_min_state, held.copied);
+     try std.testing.expectEqual(@as(u64, 0), held.skipped);
+     const NoHost = struct {
+         pub const snap_save = 1;
+         pub const window_rows = 8;
+     };
+-    try std.testing.expectEqual(share, (try plan(NoHost, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state })).?.copied);
++    try std.testing.expectEqual(share, (try plan(NoHost, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0)).?.copied);
+     // a cache turned off (--prompt-cache-gib 0) skips nothing
+     const off: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = 4, .lanes_fixed = true, .prompt_cache_gib = 0 };
+-    const none = (try plan(Glm, a, l, room, off, 864_256, &problem, false, true, .{ .min_state = glm_min_state })).?;
++    const none = (try plan(Glm, a, l, room, off, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0)).?;
+     try std.testing.expectEqual(@as(u64, 0), none.copied + none.skipped);
+ }
+ 
+@@ -455,7 +455,7 @@ test "kv merge: a refused --parallel names what would fit: the streams the room
+     const o: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = 4, .lanes_fixed = true };
+     const reserve: Reserve = .{ .bytes = 4 * gib, .least = gib / 2 };
+     const room: u64 = 6359 << 20; // 6.21 GiB, production's at reserve 4: three streams' fixed parts are 0.05 GiB short
+-    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = reserve }));
++    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = reserve }, 0));
+     // the old words stay (start.sh greps them), the engine's own window is named, then the clause
+     try std.testing.expect(std.mem.indexOf(u8, problem, "--parallel 4 needs 1.12 GiB for its other streams' fixed parts") != null);
+     try std.testing.expect(std.mem.indexOf(u8, problem, "beside the engine's own 864256-token window (5.14 GiB of KV pages)") != null);
+@@ -465,28 +465,28 @@ test "kv merge: a refused --parallel names what would fit: the streams the room
+     try std.testing.expectEqual(@as(?u32, 3), fit.parallel);
+     // each named value, set alone, serves all four streams (and not a byte past the reserve's hundredth)
+     const lower: u64 = @intFromFloat(fit.reserve.? * @as(f64, @floatFromInt(gib)));
+-    try std.testing.expect((try plan(Glm, a, l, room + reserve.bytes - lower, o, 864_256, &problem, false, true, .{})) != null);
++    try std.testing.expect((try plan(Glm, a, l, room + reserve.bytes - lower, o, 864_256, &problem, false, true, .{}, 0)) != null);
+     try std.testing.expect(lower + (gib / 100) > reserve.bytes - (l.pages(864_264) * l.pageBytes() + 3 * (l.fixed_bytes + l.pageBytes()) - room));
+-    try std.testing.expect((try plan(Glm, a, l, room, o, fit.context.?, &problem, false, true, .{})) != null);
+-    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, fit.context.? + 512, &problem, false, true, .{}));
++    try std.testing.expect((try plan(Glm, a, l, room, o, fit.context.?, &problem, false, true, .{}, 0)) != null);
++    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, fit.context.? + 512, &problem, false, true, .{}, 0));
+     const three: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = fit.parallel.?, .lanes_fixed = true };
+-    try std.testing.expect((try plan(Glm, a, l, room, three, 864_256, &problem, false, true, .{})) != null);
++    try std.testing.expect((try plan(Glm, a, l, room, three, 864_256, &problem, false, true, .{}, 0)) != null);
+     // a reserve at the engine's floor that still falls short, or a memory limit, names none
+-    _ = try plan(Glm, a, l, room - 4 * gib, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = gib / 2 + gib / 4, .least = gib / 2 } });
++    _ = try plan(Glm, a, l, room - 4 * gib, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = gib / 2 + gib / 4, .least = gib / 2 } }, 0);
+     try std.testing.expectEqual(@as(?f64, null), (try fitOf(problem)).reserve);
+-    _ = try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = 4 * gib, .least = gib / 2, .limited = true } });
++    _ = try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = 4 * gib, .least = gib / 2, .limited = true } }, 0);
+     try std.testing.expectEqual(@as(?f64, null), (try fitOf(problem)).reserve);
+     // a room under the engine's own window: no stream fits, so --parallel names none; the reserve and --context do
+-    _ = try plan(Glm, a, l, 5 * gib, o, 864_256, &problem, false, true, .{ .reserve = reserve });
++    _ = try plan(Glm, a, l, 5 * gib, o, 864_256, &problem, false, true, .{ .reserve = reserve }, 0);
+     try std.testing.expect(std.mem.indexOf(u8, problem, "one at a 864256-token window takes 5.14 GiB of KV pages, and the budget leaves 5.00 GiB") != null);
+     const none = try fitOf(problem);
+     try std.testing.expectEqual(@as(?u32, null), none.parallel);
+-    try std.testing.expect((try plan(Glm, a, l, 5 * gib, o, none.context.?, &problem, false, true, .{})) != null);
++    try std.testing.expect((try plan(Glm, a, l, 5 * gib, o, none.context.?, &problem, false, true, .{}, 0)) != null);
+     const lifted = 5 * gib + reserve.bytes - @as(u64, @intFromFloat(none.reserve.? * @as(f64, @floatFromInt(gib))));
+-    try std.testing.expect((try plan(Glm, a, l, lifted, o, 864_256, &problem, false, true, .{})) != null);
++    try std.testing.expect((try plan(Glm, a, l, lifted, o, 864_256, &problem, false, true, .{}, 0)) != null);
+     // a family whose own window is in the model's bytes: no --context in its clause
+     const NotPaged = struct {};
+-    _ = try plan(NotPaged, a, l, l.fixed_bytes, o, 8192, &problem, false, false, .{ .reserve = reserve });
++    _ = try plan(NotPaged, a, l, l.fixed_bytes, o, 8192, &problem, false, false, .{ .reserve = reserve }, 0);
+     try std.testing.expect(std.mem.endsWith(u8, problem, "(now 4.00)"));
+     try std.testing.expectEqual(@as(?u32, 1), (try fitOf(problem)).parallel);
+ }
+diff --git a/zig/src/native/cuda_kv_safety_test.zig b/zig/src/native/cuda_kv_safety_test.zig
+index 573f551f..0227be7b 100644
+--- a/zig/src/native/cuda_kv_safety_test.zig
++++ b/zig/src/native/cuda_kv_safety_test.zig
+@@ -20,7 +20,7 @@ pub fn run(comptime planner: type, disabled: bool) !void {
+         var allocations: usize = 0;
+         const left = try planner.startupRoom(F, arena.allocator(), loaded, o, available, 1 << 30, &problem);
+         if (left) |room| {
+-            const plan = (try planner.plan(F, arena.allocator(), layout, room, o, 1024, &problem, true, planner.enginePaged(loaded), .{})).?;
++            const plan = (try planner.plan(F, arena.allocator(), layout, room, o, 1024, &problem, true, planner.enginePaged(loaded), .{}, 0)).?;
+             const kept = planner.kept(F, loaded, plan, o, room, 0, 1 << 30, planner.host(F, loaded));
+             var store: api.prompt_cache.Store = undefined;
+             if (kept.copied > 0) try planner.store(F, &store, &allocations, kept);
+diff --git a/zig/src/native/cuda_prompt_pages.zig b/zig/src/native/cuda_prompt_pages.zig
+new file mode 100644
+index 00000000..b0454947
+--- /dev/null
++++ b/zig/src/native/cuda_prompt_pages.zig
+@@ -0,0 +1,165 @@
++//! TF_KV_SHARE=n: a CUDA family on the core pool keeps prompts as its pool's pages in one prompt_radix store.
++const std = @import("std");
++const api = @import("engine_api");
++const core = @import("core");
++const snaps = @import("cuda_snaps.zig");
++const radix = api.prompt_radix;
++const kv = core.kv_pool;
++const hooks = core.kv_prompts;
++const Allocator = std.mem.Allocator;
++
++/// Whether the family keeps prompts this way: it declares the hooks, its streams are on pages and TF_KV_SHARE is set.
++pub fn wanted(comptime F: type, loaded: anytype) !bool {
++    return could(F, loaded) and try hooks.sharing() > 0;
++}
++
++/// Whether TF_KV_SHARE would keep the family's prompts this way: it declares the hooks and its streams are on pages.
++pub fn could(comptime F: type, loaded: anytype) bool {
++    if (comptime !@hasDecl(F, "share_attach")) return false;
++    return loaded.layout != null;
++}
++
++/// What the unpaged store's note on a state past its whole budget adds: the setting, where `could` holds.
++pub fn hint(comptime F: type, loaded: anytype) []const u8 {
++    return if (could(F, loaded)) "; TF_KV_SHARE=n keeps a prompt's rows as the pool's pages instead of copying them" else "";
++}
++
++/// The store over the family's pool: its pages in the tree, the rest of a state from the family's `snap_*` decls.
++pub const Adapter = struct {
++    gpa: Allocator,
++    pool: *kv.Pool,
++    store: radix.Store,
++    detach: *const fn (*anyopaque) void,
++    target: *anyopaque,
++
++    /// The family's store, its pool's reclaim evicting the tree's idle pages; null: the family has no pool.
++    pub fn open(comptime F: type, gpa: Allocator, target: anytype, page_tokens: u32, snap_limit: usize) !?*Adapter {
++        const pool = F.share_pool(target) orelse return null;
++        const x = try gpa.create(Adapter);
++        errdefer gpa.destroy(x);
++        var rules = snaps.cacheRules(F);
++        rules.page = page_tokens;
++        if (comptime @hasDecl(F, "share_grid")) {
++            rules.planned = true;
++            rules.grid = F.share_grid;
++        }
++        rules.min_gap = 256;
++        rules.tail = true;
++        const copies: radix.Snapshots = .{ .ptr = target, .vtable = &snaps.Snaps(F, null).vtable };
++        x.* = .{ .gpa = gpa, .pool = pool, .store = try radix.Store.init(gpa, copies, radix.pagesOf(kv.Pool, pool, pool.page_bytes), rules), .detach = Detach(F).call, .target = target };
++        x.store.limit(.{ .pages = pool.total(), .snaps = snap_limit });
++        pool.reclaim = .{ .ctx = x, .call = reclaim }; // a promise or a hold evicts the tree's idle pages before it fails
++        F.share_attach(target, .{ .ctx = x, .vtable = &vtable });
++        return x;
++    }
++
++    fn Detach(comptime F: type) type {
++        return struct {
++            fn call(target: *anyopaque) void {
++                F.share_attach(target, null);
++            }
++        };
++    }
++
++    /// The family stops calling, the pool's reclaim goes, the tree drops its states and releases its pages.
++    pub fn close(x: *Adapter) void {
++        x.detach(x.target);
++        x.pool.reclaim = null;
++        x.store.deinit();
++        x.gpa.destroy(x);
++    }
++
++    fn of(ctx: *anyopaque) *Adapter {
++        return @ptrCast(@alignCast(ctx));
++    }
++
++    fn reclaim(ctx: *anyopaque, want: usize) bool {
++        return of(ctx).store.reclaim(want);
++    }
++
++    fn begin(ctx: *anyopaque, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!hooks.Plan {
++        const x = of(ctx);
++        const p = try x.store.begin(x.gpa, prompt, history_len, shared, owner, adopt);
++        return .{ .from = p.from, .marks = p.marks };
++    }
++
++    fn keep(ctx: *anyopaque, prompt: []const u32, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize {
++        return of(ctx).store.keep(prompt, at, owner, mine, path).shared;
++    }
++
++    fn report(ctx: *anyopaque, prompt: usize, from: u32, kept: u64) void {
++        of(ctx).store.report(prompt, from, kept);
++    }
++
++    fn free(ctx: *anyopaque, marks: []const u32) void {
++        of(ctx).gpa.free(marks);
++    }
++
++    const vtable: hooks.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .free = free };
++};
++
++const testing = std.testing;
++
++/// A family over a real pool whose states are a byte each, its pages its streams' (a host test's stand-in).
++const Fake = struct {
++    pool: kv.Pool,
++    prompts: ?hooks.Prompts = null,
++    saved: u8 = 0,
++    restored: ?*anyopaque = null,
++
++    fn of(p: *anyopaque) *Fake {
++        return @ptrCast(@alignCast(p));
++    }
++    pub fn share_pool(p: *anyopaque) ?*kv.Pool {
++        return &of(p).pool;
++    }
++    pub fn share_attach(p: *anyopaque, prompts: ?hooks.Prompts) void {
++        of(p).prompts = prompts;
++    }
++    pub fn snap_bytes(_: *anyopaque, _: u32) u64 {
++        return 1;
++    }
++    pub fn snap_save(p: *anyopaque, _: ?*anyopaque, _: u32) anyerror!*anyopaque {
++        return @ptrCast(&of(p).saved);
++    }
++    pub fn snap_restore(p: *anyopaque, _: ?*anyopaque, saved: *anyopaque) anyerror!void {
++        of(p).restored = saved;
++    }
++    pub fn snap_drop(_: *anyopaque, _: *anyopaque) void {}
++    pub const snap_lookahead: u32 = 0;
++};
++
++test "TF_KV_SHARE's adapter: a kept prompt's pages resume a later one, adopted; closing gives every page back" {
++    var f: Fake = .{ .pool = try kv.Pool.init(testing.allocator, 8, 1) };
++    defer f.pool.deinit();
++    const x = (try Adapter.open(Fake, testing.allocator, &f, 4, 4)).?;
++    const p = f.prompts.?;
++    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++    var lease: kv.Lease = .{};
++    try f.pool.promise(&lease, 3);
++    try f.pool.cover(&lease, 3, null);
++    var path: [2]u32 = undefined;
++    var owner: u8 = 0;
++    try testing.expectEqual(@as(usize, 2), p.keep(&prompt, 8, &owner, lease.ids.items[0..2], &path));
++    try testing.expectEqualSlices(u32, lease.ids.items[0..2], &path);
++    f.pool.finish(&lease);
++    var adopt: std.ArrayList(u32) = .empty;
++    defer adopt.deinit(testing.allocator);
++    const plan = try p.begin(&prompt, 10, &.{}, &owner, &adopt);
++    defer p.free(plan.marks);
++    try testing.expectEqual(@as(u32, 8), plan.from);
++    try testing.expectEqualSlices(u32, &path, adopt.items);
++    try testing.expect(f.restored != null);
++    for (adopt.items) |id| f.pool.release(id);
++    x.close();
++    try testing.expect(f.prompts == null and f.pool.idle() and f.pool.available() == 8);
++}
++
++test "TF_KV_SHARE: a state past the unpaged cache's whole budget names it where the family on pages could keep it" {
++    const l: kv.Layout = .{ .fixed_bytes = 0, .token_bytes = 1, .page_tokens = 4, .snap_bytes = 0 };
++    const paged: struct { layout: ?kv.Layout } = .{ .layout = l };
++    const windows: struct { layout: ?kv.Layout } = .{ .layout = null };
++    try testing.expect(std.mem.indexOf(u8, hint(Fake, paged), "TF_KV_SHARE=n") != null);
++    try testing.expectEqualStrings("", hint(Fake, windows)); // a window a stream: the store cannot share
++    try testing.expectEqualStrings("", hint(struct {}, paged)); // a family without the store's hooks
++}
+-- 
+2.56.0
+
