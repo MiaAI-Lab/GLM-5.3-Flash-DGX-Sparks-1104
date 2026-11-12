@@ -1,5 +1,17 @@
 # Changelog
 
+- **2026-11-12** -- engine patch 0122, backported from upstream ashhart/TensorFold#2276 (`882ca0a7`, devopsfortunato;
+  fixes ashhart/TensorFold#2256): `remaining()` in `core/lane_host_fill.zig` counted only `stream.cached`, which stays
+  0 until the backend restores a kept state in the job's first prompt step, so a resumed turn with a long cached
+  history was ranked as a whole cold prompt and waited behind a cold prefill whose remaining rows were fewer than its
+  whole prompt. It now counts `max(stream.cached, stream.reuse.at)` for a job that has not begun filling and whose
+  restore has not failed. Scheduling order only. A/B on a pair (laidick, 0001-0121 without and with 0122, same
+  fatbins, two passes each, `PARALLEL=3`, 1M window, `CACHE_FIRST=1 PROMPT_CACHE_GIB=32`, reserve 9.5): a cached 375k
+  turn queued while a cold 60k prompt filled, with a cold 355k prompt queued before it, got its first token in
+  8.57 s / 8.57 s against 41.6 s / 41.7 s; the 60k prompt took 46.0 s / 46.0 s against 37.6 s / 37.8 s, the 355k one
+  282-283 s in all four; every reply byte-identical across all four. Host: `test-lane-api-host` 409/409 (408/408
+  without 0122), `test-glm-scheduling-host` 40/40.
+
 - **2026-11-11** -- `MEMORY_RESERVE_GIB=6.5` and `CACHE_FIRST=1` are the defaults everywhere, the pair included (the
   reserve was 12, and the pair ran 9.5 in its `local.sh`; cache-first was off), with `PROMPT_CACHE_GIB` 5 on the pair
   (8 and 4 at four Sparks, as below). Cache-first is part of it: at 6.5 and windows first the pair's page pool would
