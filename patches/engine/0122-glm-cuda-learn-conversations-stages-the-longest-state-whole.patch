@@ -1,0 +1,86 @@
+From 91edcb00867ee375b2b01e0589a4f13a22db0fc5 Mon Sep 17 00:00:00 2001
+From: Robert Wojciechowski <24755+wojo@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:00:29 -0500
+Subject: [PATCH] glm cuda: --learn-conversations stages the longest state
+ whole, not under the 1 GiB default permit
+
+cuda_glm_disk.attach opened the rows store with its default staging permit, 1 GiB. A save is staged whole, so at
+about 18.5 KiB a token every state past roughly 55K tokens was skipped: `imprint: saving 124928 tokens skipped
+(StagingFull)`, whatever --learn-gib said, and a long conversation was prefilled cold after a restart.
+
+The permit is now what the longest state asks cold (its image at the capacity's whole pools, 16 bytes a token of
+metadata, 16 MiB for the job's records), within the RAM store's budget: a state the prompt cache cannot keep is
+never saved. This is the rule upstream's rows.attach applies (ashhart/TensorFold#1411, abf0701c1), written out
+here because this pin's store has no `longest` option. The start-up line names it: "a save stages up to N MiB".
+Staged bytes are host memory for the length of a save, so the largest save now takes up to the prompt cache's
+size from the reserve on rank 0.
+
+Test (the GLM set, cuda_disk_image_test.zig): a 124,928-token state is past the default and within the permit,
+the budget caps it, and a store too small to keep the state leaves the default.
+---
+ zig/src/families/glm/cuda_disk_image.zig      | 11 +++++++++++
+ zig/src/families/glm/cuda_disk_image_test.zig |  9 +++++++++
+ zig/src/native/cuda_glm_disk.zig              |  7 ++++++-
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_disk_image.zig b/zig/src/families/glm/cuda_disk_image.zig
+index 8305163d3..0fb0e29ad 100644
+--- a/zig/src/families/glm/cuda_disk_image.zig
++++ b/zig/src/families/glm/cuda_disk_image.zig
+@@ -92,6 +92,17 @@ pub const Shape = struct {
+     }
+ };
+ 
++/// The longest state's position: the capacity's whole pools, the last one `storeParts` takes.
++pub fn longest(sh: Shape) u32 {
++    return sh.capacity - sh.capacity % sparse.pool;
++}
++
++/// The staging permit: `default`, or what a cold state of `at` tokens and `bytes` asks (its image, 16 bytes a token of
++/// metadata at most, 16 MiB for the job's own records), within the RAM store's `budget`: a state it cannot keep is never saved.
++pub fn permit(default: u64, bytes: u64, at: u32, budget: u64) u64 {
++    return @max(default, @min(bytes + 16 * @as(u64, at) + (16 << 20), budget));
++}
++
+ /// One cache's parts in the lease's order, for `n` rows: latent, scales, the two index rings, the pooled keys.
+ fn cache(sh: Shape, n: u64) [5]u64 {
+     return .{
+diff --git a/zig/src/families/glm/cuda_disk_image_test.zig b/zig/src/families/glm/cuda_disk_image_test.zig
+index 92892fa83..8a17007b4 100644
+--- a/zig/src/families/glm/cuda_disk_image_test.zig
++++ b/zig/src/families/glm/cuda_disk_image_test.zig
+@@ -327,3 +327,12 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
+     }
+     try snaps.seal(&e, 9, 0, .{ back, 0 }, 0); // no head rows yet (as without drafts): the main ring holds the state's rows
+ }
++test "GLM disk permit: a 124,928-token state is staged whole within the RAM store's budget, never under the default" {
++    const gib: u64 = 1 << 30;
++    const state: u64 = 124_928 * 18_944; // about 2.2 GiB, past the 1 GiB default
++    try std.testing.expect(state > gib);
++    try std.testing.expect(image.permit(gib, state, 124_928, 8 * gib) >= state + 16 * 124_928);
++    try std.testing.expectEqual(4 * gib, image.permit(gib, 20 * gib, 1_048_576, 4 * gib)); // the budget caps it
++    try std.testing.expectEqual(gib, image.permit(gib, state, 124_928, gib / 2)); // a store too small to keep it: the default
++    try std.testing.expectEqual(gib, image.permit(gib, 0, 0, 8 * gib));
++}
+diff --git a/zig/src/native/cuda_glm_disk.zig b/zig/src/native/cuda_glm_disk.zig
+index b84e78e90..245a7a398 100644
+--- a/zig/src/native/cuda_glm_disk.zig
++++ b/zig/src/native/cuda_glm_disk.zig
+@@ -182,8 +182,13 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
+     // spill stays off: an eviction would gather on rank 0 mid-pass while the other ranks wait in the gate's all-reduce
+     const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid });
+     r.prefill_rate = p.rate;
++    // a save is staged whole: the permit takes the longest state the RAM store can keep, not the 1 GiB default
++    if (r.parts(a, img.longest(sh))) |ps| {
++        defer a.free(ps);
++        r.staging_bytes = img.permit(r.staging_bytes, rows.image.imageBytes(ps), img.longest(sh), store.budget);
++    } else |err| std.log.warn("glm: the longest state is not priced ({s}): a save stages up to the default", .{@errorName(err)});
+     store.disk = r;
+-    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts)", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len });
++    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts; a save stages up to {d} MiB)", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len, r.staging_bytes >> 20 });
+ }
+ 
+ test {
+-- 
+2.54.0 (Apple Git-157)
+
