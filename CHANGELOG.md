@@ -1,5 +1,13 @@
 # Changelog
 
+- **2026-11-11** -- Engine patch 0122: `LEARN_GIB` saves long states (issue 35's `StagingFull`). The rows store's
+  staging permit was a fixed 1 GiB, which stopped every state past roughly 55K tokens from reaching the disk; it is
+  now the longest state's size within the prompt cache's size, the rule upstream applies in ashhart/TensorFold#1411.
+  The startup line reads `a save stages up to N MiB`. Staged bytes are host memory on rank 0 for the length of a save,
+  so a save can now take up to the prompt cache's size from `MEMORY_RESERVE_GIB`: measured only at a 12.5 reserve
+  (lowest MemAvailable 12.1 GiB on rank 0 through a 122,880-token save, an eviction and a restart), not at 6.5. The
+  daily budget (`--learn-daily-gib`, 32 by default) is unchanged: `SERVE_EXTRA_ARGS='--learn-daily-gib N'` raises it.
+
 - **2026-11-11** -- `MEMORY_RESERVE_GIB=6.5` and `CACHE_FIRST=1` are the defaults everywhere, the pair included (the
   reserve was 12, and the pair ran 9.5 in its `local.sh`; cache-first was off), with `PROMPT_CACHE_GIB` 5 on the pair
   (8 and 4 at four Sparks, as below). Cache-first is part of it: at 6.5 and windows first the pair's page pool would
