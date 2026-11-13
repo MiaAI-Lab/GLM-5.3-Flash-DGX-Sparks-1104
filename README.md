@@ -19,7 +19,7 @@
 
 **Engine: TensorFold 1.1.9** (`tensorfold-native --version`), upstream commit
 [`f350cd3e`](https://github.com/ashhart/TensorFold/commit/f350cd3ea253a042e205746928271f9d8f71a82d) plus this recipe's
-121 engine patches (`patches/engine/`).
+122 engine patches (`patches/engine/`).
 
 This recipe serves GLM-5.3-Flash from an EXL3 checkpoint on **two NVIDIA DGX Sparks** (GB10, 128 GB unified memory
 each) at tensor parallel 2, one rank on each Spark, over their ConnectX-7 link. It uses TensorFold's native Zig/CUDA
@@ -49,7 +49,7 @@ The engine is TensorFold 1.1.9 at commit `f350cd3e` ([ashhart/TensorFold](https:
 
 ## What is checked
 
-121 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
+The 121-patch base applies to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
 reaches the worker by content; link discovery finds both PCIe twins of the cabled port and the RoCE v2 GID that
 holds each port's own IPv4; NCCL and the engine's RDMA all-gather run over the cable; the full 1,048,576-token window
 serves 8 streams beside a 3.6 GiB prompt cache; greedy replies are byte-stable across every change
@@ -314,9 +314,9 @@ and MMLU 88.4%, thinking-on categories unchanged.
 
 ## Engine patches
 
-`patches/engine/` holds 121 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
+`patches/engine/` holds 122 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0106 and 0111-0121 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. None is GB10-specific: the arch-gated kernels test
+0094-0106 and 0111-0122 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -345,6 +345,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0119 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (0039 had 16), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Fixes what the wider window exposes on this stack: shared-window scratch is said outright (a 32-row segment no longer shrinks the KDA projection buffer to 4 bytes or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. Not taken: load-timed pricing, 15-deep MTP chains, and #1779's shared reservation (upstream turned it off for DFlash2, cc2fa8d23). On the pair (2026-11-11, greedy, token hashes identical): a 1,195-token file rewrite at one stream 151 to 201-205 tok/s decode (14.9 to 26.6 tokens a round); prose at 1/4/8 streams and four-stream rewrites unchanged; 34 MiB more fixed memory a stream |
 | 0120 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids and leave the reply as they do. A name the tokenizer does not hold refuses the start; unset, the EOS list is the checkpoint's |
 | 0121 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default (`THINK_OFF_SPLIT=0`; 1024 is the hold the author measured)): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, whole and streamed alike (a stream holds its content until the token, the hold or the end). A close after the hold stays text; raw completions, the JSON channel and logprobs requests are never split. Tests: `zig build test-think-off-split-host` |
+| 0122 | Bounded disk restore fallback, from upstream [#2442](https://github.com/ashhart/TensorFold/pull/2442): after a refused read, try the next-longest compatible shorter disk state once. Retains 0113's two-tier lease checks and an existing RAM fallback after two failures; four host regressions and a two-Spark recovery [receipt](docs/speed/disk-restore-fallback-20261109/README.md). Previously numbered 0114 in that historical experiment |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 

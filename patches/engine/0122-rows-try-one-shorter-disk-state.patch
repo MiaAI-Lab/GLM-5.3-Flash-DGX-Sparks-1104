@@ -1,0 +1,306 @@
+From 71d6d7a2cdc4d74771b51e33a401794494cf0854 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:23:11 +0800
+Subject: [PATCH] rows: try one shorter disk state after a refused read
+ (backport #2442)
+
+Backported from 12d61cb6b96c968aab76b8c53444380e66a76f53 to f350cd3e with recipe patches 0001-0112. Retains the two-tier GLM snapshot budget checks from 0109 and registers the original fallback tests through rows_store.zig on this pin.
+
+Integration note: now numbered 0122 after main renumbered 0107-0117 to 0111-0121. The two-tier checks originally in 0109 are now in 0113; the diff below is unchanged.
+
+The pinned recipe retains a valid RAM state when a disk restore fails. Preserve that behavior after both bounded disk attempts as well, with an additional regression covering two damaged disk states beside a valid shorter RAM state. Name the actual terminal fallback in the log.
+---
+ zig/src/core/rows_fallback_test.zig      | 163 +++++++++++++++++++++++
+ zig/src/core/rows_read.zig               |  20 ++-
+ zig/src/core/rows_recall_select_test.zig |   2 +-
+ zig/src/core/rows_select.zig             |  19 ++-
+ zig/src/core/rows_store.zig              |   1 +
+ 5 files changed, 200 insertions(+), 5 deletions(-)
+ create mode 100644 zig/src/core/rows_fallback_test.zig
+
+diff --git a/zig/src/core/rows_fallback_test.zig b/zig/src/core/rows_fallback_test.zig
+new file mode 100644
+index 0000000..68e7046
+--- /dev/null
++++ b/zig/src/core/rows_fallback_test.zig
+@@ -0,0 +1,163 @@
++//! A multi-turn chain's disk states, with its longest files damaged after catalog opening.
++const std = @import("std");
++const platform = @import("sys");
++const pc = @import("prompt_cache.zig");
++const rows = @import("rows_store.zig");
++const fake = @import("rows_fake.zig");
++const t = std.testing;
++const a = t.allocator;
++const rules: pc.Rules = .{ .min_prompt = 0, .min_gap = 1, .lookahead = 1 };
++fn options(root: []const u8) rows.Options {
++    return .{ .sync_writes = true, .root = root, .identity = 322, .cap = 1 << 26, .floor = 0, .daily = 1 << 28, .lookahead = 1 };
++}
++fn seed(root: []const u8, prompt: []const u32) !void {
++    var f: fake.Fake = .{ .gpa = a, .prompt = prompt };
++    const r = try rows.Rows.open(a, f.snapshots(), options(root));
++    defer r.deinit();
++    var s = pc.Store.init(a, f.snapshots(), rules, 1 << 30);
++    defer s.deinit();
++    s.disk = r;
++    for ([_]u32{ 1000, 2000, 3000, 4000 }) |at| {
++        f.at = at;
++        try t.expect(s.keep(prompt, at, null, &.{}, &.{}));
++        while (rows.write.step(r)) {}
++    }
++    try t.expectEqual(@as(usize, 4), r.states.items.len);
++}
++fn damage(r: *rows.Rows, at: u32) !void {
++    const st = for (r.states.items) |s| {
++        if (s.at == at) break s;
++    } else return error.NoState;
++    var buf: [1200]u8 = undefined;
++    const path = try rows.file.path(&buf, r.dir, &rows.chain.hex(st.name), ".st", false);
++    const fd = platform.c.open(path, .{ .ACCMODE = .RDWR }, @as(platform.c.mode_t, 0));
++    try t.expect(fd >= 0);
++    defer _ = platform.c.close(fd);
++    var byte: [1]u8 = undefined;
++    try t.expectEqual(@as(isize, 1), platform.c.pread(fd, &byte, 1, 0));
++    byte[0] ^= 128;
++    try t.expectEqual(@as(isize, 1), platform.c.pwrite(fd, &byte, 1, 0));
++}
++test "restore fallback: one shorter disk read, then zero even when a third state remains" {
++    for (0..3) |bad| {
++        var tmp = t.tmpDir(.{});
++        defer tmp.cleanup();
++        const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
++        defer a.free(root);
++        var prompt: [5000]u32 = undefined;
++        for (&prompt, 0..) |*token, i| token.* = @intCast(17 + i % 997);
++        try seed(root, &prompt);
++        var f: fake.Fake = .{ .gpa = a, .prompt = &prompt };
++        const r = try rows.Rows.open(a, f.snapshots(), options(root));
++        defer r.deinit();
++        var s = pc.Store.init(a, f.snapshots(), rules, 1 << 30);
++        defer s.deinit();
++        s.disk = r;
++        var eligible: usize = 0;
++        for (r.states.items) |*st| eligible += @intFromBool(r.matches(st, &prompt, &.{}, &.{}));
++        for (0..bad) |i| try damage(r, @intCast(4000 - 1000 * i));
++        const plan = try s.begin(a, &prompt, 4500, &.{}, &.{}, null, &.{});
++        defer a.free(plan.marks);
++        try t.expectEqual(fake.fresh(&prompt), f.pass(&s, plan));
++        try t.expectEqual(@as(usize, 4), eligible);
++        try t.expectEqual(@as(u32, if (bad == 0) 4000 else if (bad == 1) 3000 else 0), plan.from);
++        try t.expectEqual(@as(u64, if (bad < 2) 1 else 0), r.counts.reads);
++        try t.expectEqual(@as(u64, @intCast(bad)), r.counts.failed);
++        try t.expect(f.restored_ok);
++        for (s.entries.items) |e| try t.expectEqual(@as(u32, 0), e.borrowers);
++    }
++}
++
++test "restore fallback: two damaged disk states retain a valid shorter RAM state" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
++    defer a.free(root);
++    var prompt: [5000]u32 = undefined;
++    for (&prompt, 0..) |*token, i| token.* = @intCast(17 + i % 997);
++    try seed(root, &prompt);
++    var f: fake.Fake = .{ .gpa = a, .prompt = &prompt, .at = 1000 };
++    const r = try rows.Rows.open(a, f.snapshots(), options(root));
++    defer r.deinit();
++    var s = pc.Store.init(a, f.snapshots(), rules, 1 << 30);
++    defer s.deinit();
++    try t.expect(s.keep(&prompt, 1000, null, &.{}, &.{}));
++    s.disk = r;
++    try damage(r, 4000);
++    try damage(r, 3000);
++    const plan = try s.begin(a, &prompt, 4500, &.{}, &.{}, null, &.{});
++    defer a.free(plan.marks);
++    try t.expectEqual(@as(u32, 1000), plan.from);
++    try t.expectEqual(fake.fresh(&prompt), f.pass(&s, plan));
++    try t.expect(f.restored_ok);
++    try t.expectEqual(@as(u64, 0), r.counts.reads);
++    try t.expectEqual(@as(u64, 2), r.counts.failed);
++    for (s.entries.items) |e| try t.expectEqual(@as(u32, 0), e.borrowers);
++}
++
++test "restore fallback: a size refusal tries only the next position, with files retained" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
++    defer a.free(root);
++    var prompt: [5000]u32 = undefined;
++    for (&prompt, 0..) |*token, i| token.* = @intCast(23 + i % 991);
++    try seed(root, &prompt);
++    for ([_]bool{ false, true }) |both| {
++        var f: fake.Fake = .{ .gpa = a, .prompt = &prompt };
++        const r = try rows.Rows.open(a, f.snapshots(), options(root));
++        defer r.deinit();
++        var s = pc.Store.init(a, f.snapshots(), rules, 1 << 30);
++        defer s.deinit();
++        s.disk = r;
++        const Refuse = struct {
++            var limit: u32 = 4000;
++            var attempted: [2]u32 = undefined;
++            var n: usize = 0;
++            fn blank(ptr: *anyopaque, at: u32) anyerror!pc.Saved {
++                if (n == attempted.len) return error.UnboundedRestoreRetry;
++                attempted[n] = at;
++                n += 1;
++                if (at >= limit) return error.SnapshotSize;
++                return fake.Fake.snapshots(@ptrCast(@alignCast(ptr))).vtable.rows.?.blank(ptr, at);
++            }
++        };
++        Refuse.limit = if (both) 3000 else 4000;
++        Refuse.n = 0;
++        var image = r.img.*;
++        image.blank = Refuse.blank;
++        r.img = &image;
++        const plan = try s.begin(a, &prompt, 0, &.{}, &.{}, null, &.{});
++        defer a.free(plan.marks);
++        try t.expectEqual(@as(u32, if (both) 0 else 3000), plan.from);
++        try t.expectEqualSlices(u32, &.{ 4000, 3000 }, &Refuse.attempted);
++        try t.expectEqual(@as(usize, 2), Refuse.n);
++        try t.expectEqual(fake.fresh(&prompt), f.pass(&s, plan));
++        try t.expectEqual(@as(usize, 4), r.states.items.len);
++        try t.expectEqual(@as(u64, 0), r.counts.failed);
++    }
++}
++
++test "restore fallback: the next compatible position wins over a cheaper shorter read" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
++    defer a.free(root);
++    var prompt: [5000]u32 = @splat(11);
++    try seed(root, &prompt);
++    var f: fake.Fake = .{ .gpa = a, .prompt = &prompt };
++    const r = try rows.Rows.open(a, f.snapshots(), options(root));
++    defer r.deinit();
++    var s = pc.Store.init(a, f.snapshots(), rules, 1 << 30);
++    defer s.deinit();
++    s.disk = r;
++    r.prefill_rate = 1000;
++    r.read_rate = 1e9;
++    for (r.states.items) |*state| if (state.at == 3000) {
++        state.own = 8_000_000_000;
++    };
++    const choice = @import("rows_select.zig").shorter(&s, &prompt, &.{}, &.{}, null, 4000);
++    try t.expectEqual(@as(u32, 3000), r.states.items[choice.restore.?].at);
++    prompt[0] = 12;
++    try t.expect(@import("rows_select.zig").shorter(&s, &prompt, &.{}, &.{}, null, 4000).restore == null);
++}
+diff --git a/zig/src/core/rows_read.zig b/zig/src/core/rows_read.zig
+index efd733e..b233497 100644
+--- a/zig/src/core/rows_read.zig
++++ b/zig/src/core/rows_read.zig
+@@ -103,14 +103,28 @@ fn present(r: *Rows, i: usize) !void {
+ 
+ /// A disk state reaching further than `have`, read back into a new RAM entry where that costs less than prefilling.
+ pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry) ?*pc.Entry {
++    var before: ?u32 = null;
++    return attempt(s, prompt, born, starts, spans, have, &before) catch
++        (attempt(s, prompt, born, starts, spans, have, &before) catch have);
++}
++
++fn failed(before: *?u32, at: u32, err: anyerror, have: ?*pc.Entry) anyerror {
++    const retry = before.* == null;
++    before.* = at;
++    pc.note("disk restore of {d} tokens failed ({s}); {s}", .{ at, @errorName(err), if (retry) "trying one shorter kept state" else if (have != null) "using the in-memory kept state" else "prefilling from the start" });
++    return err;
++}
++
++fn attempt(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry, before: *?u32) !?*pc.Entry {
+     const r = s.disk orelse return have;
+     write.reap(r);
+-    const chosen = select.choose(s, prompt, starts, spans, have).restore orelse return have;
++    const choice = if (before.*) |at| select.shorter(s, prompt, starts, spans, have, at) else select.choose(s, prompt, starts, spans, have);
++    const chosen = choice.restore orelse return have;
+     const name = r.states.items[chosen].name;
+     const bytes = s.family.vtable.bytes(s.family.ptr, r.states.items[chosen].at);
+     if (bytes > s.budget or s.most == 0) return have;
+     const at = r.states.items[chosen].at;
+-    if (!ready(s, at, bytes)) present(r, chosen) catch return have; // nothing goes to make room for a state whose file is gone
++    if (!ready(s, at, bytes)) present(r, chosen) catch |err| return failed(before, at, err, have); // nothing goes to make room for a state whose file is gone
+     if (r.spill != .off) r.touch(chosen); // the newest: the spills that make room for it push older states off first
+     while (!ready(s, at, bytes)) {
+         if (s.family.vtable.trim) |trim| {
+@@ -135,7 +149,7 @@ pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32,
+     e.tokens = s.gpa.dupe(u32, st.tokens) catch return have;
+     e.decode_spans = s.gpa.dupe(modes.Span, st.spans) catch return have;
+     e.last = s.gpa.dupe(u32, prompt) catch return have;
+-    e.saved = read(r, i) catch return have;
++    e.saved = read(r, i) catch |err| return failed(before, at, err, have);
+     if (s.family.vtable.charged) |f| e.bytes = f(s.family.ptr, e.saved);
+     @import("prompt_cache_index.zig").add(s, e) catch {
+         s.family.vtable.drop(s.family.ptr, e.saved);
+diff --git a/zig/src/core/rows_recall_select_test.zig b/zig/src/core/rows_recall_select_test.zig
+index f5a6b29..09b3827 100644
+--- a/zig/src/core/rows_recall_select_test.zig
++++ b/zig/src/core/rows_recall_select_test.zig
+@@ -130,5 +130,5 @@ test "restore selection: a state whose directory another identity's cap removed
+     try t.expectEqual(@as(u64, 0), s.counts.evicted);
+     try t.expectEqual(@as(usize, 1), s.entries.items.len);
+     try t.expectEqual(@as(usize, 1), f.live);
+-    try t.expectEqual(@as(u64, 1), r.counts.failed);
++    try t.expectEqual(@as(u64, 2), r.counts.failed); // both the longest file and the one shorter retry are gone
+ }
+diff --git a/zig/src/core/rows_select.zig b/zig/src/core/rows_select.zig
+index a3f1529..e8d532b 100644
+--- a/zig/src/core/rows_select.zig
++++ b/zig/src/core/rows_select.zig
+@@ -11,16 +11,30 @@ pub const Choice = struct {
+ };
+ 
+ pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry) Choice {
++    return chooseAt(s, prompt, starts, spans, have, null);
++}
++
++/// A refused disk restore gets only the next-longest compatible, affordable state strictly below it.
++pub fn shorter(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry, before: u32) Choice {
++    return chooseAt(s, prompt, starts, spans, have, before);
++}
++
++fn chooseAt(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry, before: ?u32) Choice {
+     const r = s.disk orelse return .{};
+     const room = capacity(s, have) orelse return .{};
+     const from = if (have) |e| e.at else 0;
+     var out: Choice = .{};
+     var best_saved: f64 = 0;
+     for (r.states.items, 0..) |*state, i| {
++        if (before) |at| if (state.at >= at) continue;
+         if (s.family.vtable.bytes(s.family.ptr, state.at) > room) continue;
+         if (!r.matches(state, prompt, starts, spans)) continue;
+         if (out.disk == null or state.at > r.states.items[out.disk.?].at) out.disk = i;
+         if (state.at <= from) continue;
++        if (before != null) {
++            if (out.restore == null or state.at > r.states.items[out.restore.?].at) out.restore = i;
++            continue;
++        }
+         if (savedSeconds(r, i, from)) |saved| {
+             if (!(saved > 0)) continue;
+             if (out.restore != null and (saved < best_saved or
+@@ -30,7 +44,10 @@ pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, span
+         out.restore = i;
+         out.read_seconds = readSeconds(r, i) orelse 0;
+     }
+-    if (out.restore) |i| out.disk = i;
++    if (out.restore) |i| {
++        out.disk = i;
++        out.read_seconds = readSeconds(r, i) orelse 0;
++    }
+     return out;
+ }
+ 
+diff --git a/zig/src/core/rows_store.zig b/zig/src/core/rows_store.zig
+index 382ea4c..791813b 100644
+--- a/zig/src/core/rows_store.zig
++++ b/zig/src/core/rows_store.zig
+@@ -592,6 +592,7 @@ test {
+     _ = @import("rows_stage_test.zig");
+     _ = @import("rows_select_test.zig");
+     _ = @import("rows_recall_select_test.zig");
++    _ = @import("rows_fallback_test.zig");
+     _ = @import("rows_pool_select_test.zig");
+     _ = @import("rows_prefetch.zig");
+     _ = @import("rows_prefetch_stack_test.zig");
+-- 
+2.45.1.windows.1
+
