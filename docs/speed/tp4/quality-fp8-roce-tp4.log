@@ -1,0 +1,24 @@
+{
+ "label": "fp8-roce-tp4",
+ "nll": 0.74246848208233,
+ "nll_error": null,
+ "nll_per_passage": [
+  0.554607073465983,
+  0.778036583301633,
+  0.24251850740409192,
+  2.1537586941438565
+ ],
+ "answers_sha": "25789b7aa3d9",
+ "answers": [
+  "69",
+  "Canberra",
+  "```python\ns[::-1]\n```",
+  "0.9",
+  "Photosynthesis",
+  "7 is not prime (7 = 1 \u00d7 7, wait, actually 7 IS prime).\n\nLet me list the primes: 2, 3, 5, 7, 11, 13, 17...\n\nCounting: 2 (1st), 3 (2nd),",
+  "**yrassecen**\n\nLet me verify: n-e-c-e-s-s-a-r-y reversed is y-r-a-s-s-e-c-e-n. \u2713",
+  "A mutex protects against concurrent access to shared resources by multiple threads.",
+  "12",
+  "K"
+ ]
+}

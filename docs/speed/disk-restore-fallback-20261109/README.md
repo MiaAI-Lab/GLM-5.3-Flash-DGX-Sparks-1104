@@ -1,11 +1,16 @@
 # One shorter disk state after a refused read
 
-Patch 0114 backports TensorFold [#2442](https://github.com/ashhart/TensorFold/pull/2442),
+Patch 0122 (originally numbered 0114) backports TensorFold [#2442](https://github.com/ashhart/TensorFold/pull/2442),
 commit [`12d61cb6`](https://github.com/ashhart/TensorFold/commit/12d61cb6b96c968aab76b8c53444380e66a76f53),
 onto this recipe's `f350cd3e` pin and the 111 patches at recipe main `841e7497`.
 The upstream author's attribution is retained in the patch.
 
-The landing base is now `d4226a1` (112 patches): the maintainer added a server-only tool-envelope fix as 0112
+The PR now merges main `80be4d6` (121 patches). Its patch is numbered **0122** because main now uses
+0114 for KV sharding. The engine diff is unchanged; the numbered 0114 measurements below describe the
+historical fallback candidate, not the current KV-sharding patch. No historical GPU measurement is relabeled
+as a run of the 122-patch stack.
+
+The previous landing base was `d4226a1` (112 patches): the maintainer added a server-only tool-envelope fix as 0112
 while these measurements ran. Its six changed engine files are in `zig/src/server/`; the rows reader and GPU
 kernels are unchanged. The tables below retain their measured `841e7497` baseline rather than relabeling it.
 
@@ -89,7 +94,7 @@ idle health checked after each device window.
 - The recipe's `scripts/tests/run.sh` passed locally under Git Bash: syntax, Python parsing, cache minimum,
   detached memory guard, NCCL interface handling and patch numbers. Shellcheck was unavailable and skipped.
 
-## Integration on current main
+## Historical integration on d4226a1
 
 After rebasing onto `d4226a1`, all 113 published patches applied strictly to the full pin. The five rows files and
 six updated server files matched the intended engine source by SHA-256. The current control passed 611 checks
@@ -105,3 +110,16 @@ baseline; the 57.1% figure above remains attached to the explicitly frozen 111-p
 
 Only the combinations above were exercised. This backport does not claim other backends, models, drafter types,
 or all possible owner-placement and failure combinations.
+
+## Conflict refresh on 80be4d6 (2026-11-13)
+
+Main's TP4 integration renumbered the existing patches and assigned 0114 to KV sharding. This refresh merges
+main, retains its README/settings/TP4 documentation, and moves the fallback patch to 0122. The fallback's
+`diff --git` payload is byte-identical after line-ending normalization to the former 0114 patch; only its filename
+and explanatory mail header change. The original source attribution and the measurements above are preserved.
+
+All 122 engine patches passed `git apply --check` and applied in filename order on a fresh checkout of the full
+`f350cd3ea253a042e205746928271f9d8f71a82d` pin. `bash scripts/tests/run.sh` passed under Ubuntu/WSL, including
+the new main-branch graft and KV-shard configuration tests and unique patch-number checking. Shellcheck was not
+installed and was skipped. This conflict refresh did not rebuild the image or repeat host-engine/GPU tests;
+the earlier numerical and recovery results remain tied to their documented historical builds.

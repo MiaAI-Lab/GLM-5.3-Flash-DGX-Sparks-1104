@@ -1,0 +1,18 @@
+137c54a8ea13
+GLM-5.3-Flash-EXL3 is now LIVE! on port 8888 (four Sparks, TP=4)
+KV pool: 16392 pages = 8392704 tokens shared by 8 streams (one request up to 1048576).
+tensorfold-glm53-spark:137c54a8ea13
+[exl3-E1] 1-stream prose: tok/s 60.3/60.6 | tok/round 2.05 | ms/round 33.9 | accepted 56% | sha b6ae240144bc
+[exl3-E1] 1-stream code: tok/s 91.0/90.9 | tok/round 3.77 | ms/round 41.4 | accepted 74% | sha 9b68d8a77151
+[exl3-E1] 4-stream prose, rep 0: total 124.4 tok/s | per stream 32.1 31.0 30.2 31.2 | tok/round 2.08 | ms/round 67 | accepted 62%
+[exl3-E1] 4-stream prose, rep 1: total 123.5 tok/s | per stream 31.4 31.3 29.9 31.0 | tok/round 2.07 | ms/round 67 | accepted 62%
+  prefill 16K: {'prompt_tokens': 15733, 'ttft': 8.901016473770142, 'prefill_tps': 1767.5509360490018}
+  prefill 64K: {'prompt_tokens': 63145, 'ttft': 33.358169078826904, 'prefill_tps': 1892.9396229986553}
+  conc2: {'per_stream_tps': [46.5, 48.4], 'sum_tps': 94.9, 'ttft_max': 0.29180073738098145}
+  conc4: {'per_stream_tps': [30.3, 31.6, 35.5, 31.5], 'sum_tps': 128.9, 'ttft_max': 0.6194405555725098}
+  mixed1: {'long_prompt_tokens': 50192, 'long_ttft': 44.13, 'decoders': [{'before_tps': 59.8, 'during_tps': 18.9, 'gap_p50': 33, 'gap_p95': 49, 'gap_max': 2628, 'after_tps': 57.3}]}
+  prefill pair: {'alone_ttft': 16.29, 'alone_tokens': 30160, 'pair_ttft': [16.24, 33.19], 'pair_tokens': [30132, 30143]}
+ "nll": 0.7487241272787446,
+ "nll_error": null,
+ "answers_sha": "11ceddde19d4",
+LEG_DONE

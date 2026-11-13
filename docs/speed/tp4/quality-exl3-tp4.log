@@ -1,0 +1,24 @@
+{
+ "label": "exl3-tp4",
+ "nll": 0.7487241272787446,
+ "nll_error": null,
+ "nll_per_passage": [
+  0.5176790952682495,
+  0.7791046541790629,
+  0.27555934293770495,
+  2.1637284334968117
+ ],
+ "answers_sha": "11ceddde19d4",
+ "answers": [
+  "69",
+  "Canberra",
+  "```python\ns[::-1]\n```",
+  "0.9",
+  "Photosynthesis",
+  "17",
+  "**yrassecen**\n\nLet me verify: n-e-c-e-s-s-a-r-y reversed is y-r-a-s-s-e-c-e-n. \u2713",
+  "A mutex protects against concurrent access to shared resources by multiple threads.",
+  "12",
+  "K"
+ ]
+}

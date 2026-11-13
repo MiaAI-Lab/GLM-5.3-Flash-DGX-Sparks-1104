@@ -6,6 +6,8 @@ Subject: [PATCH] rows: try one shorter disk state after a refused read
 
 Backported from 12d61cb6b96c968aab76b8c53444380e66a76f53 to f350cd3e with recipe patches 0001-0112. Retains the two-tier GLM snapshot budget checks from 0109 and registers the original fallback tests through rows_store.zig on this pin.
 
+Integration note: now numbered 0122 after main renumbered 0107-0117 to 0111-0121. The two-tier checks originally in 0109 are now in 0113; the diff below is unchanged.
+
 The pinned recipe retains a valid RAM state when a disk restore fails. Preserve that behavior after both bounded disk attempts as well, with an additional regression covering two damaged disk states beside a valid shorter RAM state. Name the actual terminal fallback in the log.
 ---
  zig/src/core/rows_fallback_test.zig      | 163 +++++++++++++++++++++++

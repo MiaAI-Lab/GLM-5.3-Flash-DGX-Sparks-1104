@@ -31,7 +31,7 @@ A call to Hermes' offered "tool_call" bridge whose calls[0] lacks a name is that
  6 files changed, 278 insertions(+), 16 deletions(-)
 
 diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
-index 3798da4c..8884266f 100644
+index 3798da4c8..8884266f5 100644
 --- a/zig/src/server/late_system_test.zig
 +++ b/zig/src/server/late_system_test.zig
 @@ -550,6 +550,82 @@ test "tool visibility HTTP: streamed replies retain an unoffered call" {
@@ -118,7 +118,7 @@ index 3798da4c..8884266f 100644
      var text: DropLate = .{};
      var backend: Capture = .{ .reply = prose_reply, .warm_turns = true };
 diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
-index dfc1069c..2f4d1532 100644
+index dfc1069c7..2f4d1532c 100644
 --- a/zig/src/server/openai.zig
 +++ b/zig/src/server/openai.zig
 @@ -346,16 +346,28 @@ const Run = struct {
@@ -183,7 +183,7 @@ index dfc1069c..2f4d1532 100644
          const a = r.a;
          const kind_ok = cx.kind != .other and cx.kind != .server;
 diff --git a/zig/src/server/tool_guard.zig b/zig/src/server/tool_guard.zig
-index b73abdfa..a14383b8 100644
+index b73abdfa1..a14383b82 100644
 --- a/zig/src/server/tool_guard.zig
 +++ b/zig/src/server/tool_guard.zig
 @@ -1,8 +1,10 @@
@@ -326,7 +326,7 @@ index b73abdfa..a14383b8 100644
 +    try std.testing.expectEqualStrings("xxxxxxxx...(+92 bytes)", escaped(&buf, &long));
 +}
 diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
-index d612bbd1..bf261fee 100644
+index d612bbd15..bf261fee0 100644
 --- a/zig/src/server/tool_parse.zig
 +++ b/zig/src/server/tool_parse.zig
 @@ -20,7 +20,26 @@ const Error = tool_dsml.Error;
@@ -437,7 +437,7 @@ index d612bbd1..bf261fee 100644
  }
  
 diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
-index ee8d4916..f45f95fa 100644
+index ee8d4916e..f45f95faa 100644
 --- a/zig/src/server/tool_parse_test.zig
 +++ b/zig/src/server/tool_parse_test.zig
 @@ -574,6 +574,7 @@ test "GLM pairs from the cached key and value ends are the pairs each key's own
@@ -449,7 +449,7 @@ index ee8d4916..f45f95fa 100644
  
  test "prose that quotes the opener ahead of a call does not swallow the call" {
 diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
-index babd064f..2b4bfc5b 100644
+index babd064f0..2b4bfc5bb 100644
 --- a/zig/src/server/tool_stream.zig
 +++ b/zig/src/server/tool_stream.zig
 @@ -480,7 +480,7 @@ fn callTag(name: []const u8) bool {

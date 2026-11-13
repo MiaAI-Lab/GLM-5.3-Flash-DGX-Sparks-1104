@@ -1,0 +1,4 @@
+[fp8] 6-stream rep0: total 99.9 tok/s | per stream 16.8 17.3 16.3 17.3 16.4 15.8 | tok/round 2.11 | ms/round 126 | wall 20s
+[fp8] 6-stream rep1: total 98.3 tok/s | per stream 16.8 16.0 16.1 16.4 16.6 16.4 | tok/round 2.03 | ms/round 124 | wall 20s
+[fp8] 8-stream rep0: total 112.0 tok/s | per stream 15.7 14.6 14.1 13.8 14.3 13.2 12.8 13.4 | tok/round 2.02 | ms/round 144 | wall 24s
+[fp8] 8-stream rep1: total 113.6 tok/s | per stream 15.3 14.7 14.0 14.0 14.3 14.3 13.4 13.5 | tok/round 2.07 | ms/round 145 | wall 24s

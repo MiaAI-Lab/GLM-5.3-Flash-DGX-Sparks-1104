@@ -115,8 +115,14 @@ esac
 # set from reasoning_effort, which the engine passes with thinking on only (null with thinking off: prompt.zig), so a
 # thinking-off prompt no longer carries `<|system|>Reasoning Effort: Max`. Written to STATE_DIR every start; the base
 # line must be the one the checkpoint ships, else the start stops rather than serve a template it did not understand.
-if [[ "$CHAT_TEMPLATE" == auto && "$EFFORT_LINE" == thinking ]]; then
-  EFFORT_BASE=${TEMPLATE_FILE:-$MODEL_DIR/chat_template.jinja}
+# With VISION=0 the base is the checkpoint's own file, which the default MODEL_SOURCE=download fetches in step 3: until
+# that download is complete (weights_ready), step 3 writes the template after it (EFFORT_AFTER_DOWNLOAD). Every other
+# start checks and writes it here, before anything runs or a serving pair is stopped.
+effort_template() {
+  if [[ "$DRY_RUN" == 1 && "$EFFORT_AFTER_DOWNLOAD" == 1 && ! -f "$EFFORT_BASE" ]]; then
+    log "Then write $STATE_DIR/chat_template.jinja: the downloaded $EFFORT_BASE with its effort line taken from reasoning_effort (EFFORT_LINE=thinking)."
+    return 0
+  fi
   [[ -f "$EFFORT_BASE" ]] || fail E_CONFIG "Chat template not found: $EFFORT_BASE (EFFORT_LINE=thinking rewrites its effort line)."
   [[ "$DRY_RUN" == 1 ]] || mkdir -p "$STATE_DIR"
   python3 - "$EFFORT_BASE" "$STATE_DIR/chat_template.jinja" "$DRY_RUN" <<'PY' || fail E_CONFIG "EFFORT_LINE=thinking: $EFFORT_BASE has no effort line this recipe knows; set EFFORT_LINE=always or CHAT_TEMPLATE to a file."
@@ -129,6 +135,15 @@ if src.count(base) != 1:
 if sys.argv[3] != "1":  # DRY_RUN=1 checks the base and writes nothing
     open(sys.argv[2], "w", encoding="utf-8").write(src.replace(base, line))
 PY
+}
+EFFORT_AFTER_DOWNLOAD=0
+if [[ "$CHAT_TEMPLATE" == auto && "$EFFORT_LINE" == thinking ]]; then
+  EFFORT_BASE=${TEMPLATE_FILE:-$MODEL_DIR/chat_template.jinja}
+  if [[ -z "$TEMPLATE_FILE" && "$MODEL_SOURCE" == download ]] && ! weights_ready "$MODEL_DIR" "$MODEL_REVISION"; then
+    EFFORT_AFTER_DOWNLOAD=1
+  else
+    effort_template
+  fi
   TEMPLATE_FILE="$STATE_DIR/chat_template.jinja"
 fi
 WORKER_TEMPLATE="$WORKER_STATE_DIR/chat_template.jinja"
@@ -150,7 +165,7 @@ build_serve_args() {
     [[ -z "$MTP_CONFIDENCE" ]] || SERVE_ARGS+=(--mtp-confidence "$MTP_CONFIDENCE")
   fi
   [[ -z "$PROMPT_CACHE_GIB" ]] || SERVE_ARGS+=(--prompt-cache-gib "$PROMPT_CACHE_GIB")
-  # LEARN_GIB: engine patch 0109 keeps the prompt states on disk too (rank 0's CACHE_DIR/learn holds every rank's part)
+  # LEARN_GIB: engine patch 0113 keeps the prompt states on disk too (rank 0's CACHE_DIR/learn holds every rank's part)
   [[ "$LEARN_GIB" == 0 ]] || SERVE_ARGS+=(--learn-conversations --learn-dir /state/learn --learn-gib "$LEARN_GIB"
     --learn-min-free-gib "$LEARN_MIN_FREE_GIB")
   read -r -a extra <<< "$SERVE_EXTRA_ARGS"
@@ -163,7 +178,7 @@ declare -a PASS_ENV=()
 WORKER_ENV_FILE=''
 MANAGED_ENV=' HOME HF_HUB_OFFLINE CUDA_DEVICE_ORDER CUDA_VISIBLE_DEVICES TENSORFOLD_NO_UPDATE_CHECK TENSORFOLD_NO_LIVE
  TENSORFOLD_MEMORY_RESERVE_GIB TF_GLM_DENSE_BITS TF_GLM_HEAD_BITS TF_GLM_CLEAR_THINKING TF_GLM_RANK TF_GLM_WORLD TF_CUDA_DEVICE
- TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_PROMPT_CACHE_FIRST TF_GLM_KV_SHARD
+ TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_PROMPT_CACHE_FIRST TF_GLM_KV_SHARD TF_GLM_L2PF TF_EXTRA_EOS TF_THINK_OFF_SPLIT
  TF_ROCE TF_ROCE_MAX_KB TF_ROCE_HCA TF_BIN TF_REPO TF_REF
  NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS '
 # The flags both ranks share. Everything that places a rank is added per rank, so the two fingerprints agree on the rest.
@@ -178,10 +193,16 @@ build_env_args() {
     -e "TF_BIN=$TF_BIN" -e "TENSORFOLD_PREFILL_SHARE=$PREFILL_SHARE")
   [[ -z "$HOST_CACHE_GIB" ]] || ENV_ARGS+=(-e "TF_GLM_HOST_CACHE_GIB=$HOST_CACHE_GIB")
   [[ -z "$PREFILL_BUDGET" ]] || ENV_ARGS+=(-e "TENSORFOLD_PREFILL_BUDGET=$PREFILL_BUDGET")
-  # CACHE_FIRST=1: engine patch 0108 sets PROMPT_CACHE_GIB aside before the streams' windows (both ranks alike)
+  # CACHE_FIRST=1: engine patch 0112 sets PROMPT_CACHE_GIB aside before the streams' windows (both ranks alike)
   [[ "$CACHE_FIRST" != 1 ]] || ENV_ARGS+=(-e "TF_PROMPT_CACHE_FIRST=1")
-  # KV_SHARD=1: engine patch 0110 keeps each stream's latent rows on its owner rank (both ranks must agree)
+  # KV_SHARD=1: engine patch 0114 keeps each stream's latent rows on its owner rank (both ranks must agree)
   [[ "$KV_SHARD" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_KV_SHARD=1")
+  # L2PF=1: engine patch 0117 prefetches each decode window's next weights into L2 (both ranks must agree)
+  [[ "$L2PF" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_L2PF=1")
+  # EXTRA_EOS: engine patch 0120 ends a reply at these tokens too (both ranks alike)
+  [[ "$EXTRA_EOS" == none ]] || ENV_ARGS+=(-e "TF_EXTRA_EOS=$EXTRA_EOS")
+  # THINK_OFF_SPLIT: engine patch 0121 moves a thinking-off draft closed by </think> into reasoning_content
+  [[ "$THINK_OFF_SPLIT" == 0 ]] || ENV_ARGS+=(-e "TF_THINK_OFF_SPLIT=$THINK_OFF_SPLIT")
   # Variables you exported yourself. Rank 0 takes them by name, so no value is printed or put on a command line.
   # Rank 1 cannot: `docker run -e KEY` on the worker would read the worker's environment, where they are not set, and
   # the two ranks would then serve with different settings. Their values go to the worker in an env file instead
@@ -320,9 +341,14 @@ launch() {
   # can have different ids, and rank 1 writes to a state folder its own login owns. Root or another
   # UID:GID crosses as given.
   if [[ "$CONTAINER_USER" == "$(id -u):$(id -g)" ]]; then
-    worker_ug=$(wssh sh -c 'printf "%s:%s\n" "$(id -u)" "$(id -g)"') && [[ "$worker_ug" =~ ^[0-9]+:[0-9]+$ ]] \
-      || fail E_WORKER "Could not read the login's ids on $(worker_host)."
-    worker_user_args=(--user "$worker_ug")
+    if worker_ug=$(wssh sh -c 'printf "%s:%s\n" "$(id -u)" "$(id -g)"') && [[ "$worker_ug" =~ ^[0-9]+:[0-9]+$ ]]; then
+      worker_user_args=(--user "$worker_ug")
+    elif [[ "$DRY_RUN" == 1 ]]; then  # a placeholder, as step 4 shows for the link; only a real start reads worker_ug
+      warn W_WORKER "Cannot read the login's ids on $(worker_host), so the plan shows a placeholder for rank 1's --user."
+      worker_ug=''; worker_user_args=(--user '<worker uid:gid>')
+    else
+      fail E_WORKER "Could not read the login's ids on $(worker_host)."
+    fi
   fi
   RUN_LOG_DIR="$LOG_DIR/run-$(date -u +%Y%m%dT%H%M%SZ)-$$-$ATTEMPT"
   log "Ranks:"
@@ -429,17 +455,24 @@ show_failure() {
   done
 }
 
-# The device prompt cache a rank's startup line ("… N streams at once, …, a 9.7 GiB prompt cache; …") funds, in GiB:
+# The device prompt cache a rank's startup line ("… N streams at once, …, a 9.7 GiB prompt cache; …"; "1 stream" for one)
+# funds, in GiB:
 # 0 for "no prompt cache" or a cache in host memory, empty when the log has no startup line.
 funded_cache_gib() {
   local line
-  line=$(grep -h 'streams at once' "$1" 2>/dev/null | tail -1) || true
+  line=$(grep -hE ' streams? at once' "$1" 2>/dev/null | tail -1) || true
   [[ -n "$line" ]] || return 0
   if [[ "$line" != *"GiB prompt cache in host memory"* && "$line" =~ ,\ a\ ([0-9][0-9.]*)\ GiB\ prompt\ cache ]]; then
     printf '%s\n' "${BASH_REMATCH[1]}"
   else
     printf '0\n'
   fi
+}
+# The newest log archive stop.sh wrote (it removes the run directory once archived): the names carry a UTC stamp, so
+# the last in glob order is the newest.
+last_archive() {
+  local a=("$LOG_DIR"/glm53-spark-*.tar.gz)
+  if [[ -e "${a[-1]}" ]]; then printf '%s\n' "${a[-1]}"; else printf 'none written (see %s)\n' "$LOG_DIR"; fi
 }
 # PROMPT_CACHE_MIN_GIB: both ranks stop before LIVE when a startup line funds less (the cap is not a floor, issue 16).
 check_cache_min() {
@@ -452,14 +485,14 @@ check_cache_min() {
     if [[ -z "$got" ]]; then
       if (( r == 0 )); then
         stop_both
-        fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no startup line (\"streams at once\"), so the start cannot be checked; both ranks are stopped. See $f."
+        fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no startup line (\"N streams at once\"), so the start cannot be checked; both ranks are stopped. Logs: $(last_archive)."
       fi
       # Rank 1 follows rank 0's plan and prints no startup line on the pair: rank 0's line is the check.
       continue
     fi
     if ! at_least "$got" "$PROMPT_CACHE_MIN_GIB"; then
       stop_both
-      fail E_CACHE "Rank $r funds a $got GiB prompt cache, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; both ranks are stopped. The cache is what the room leaves, capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, or with CACHE_FIRST=1 try a larger PROMPT_CACHE_GIB (it can cost the streams a whole window). See $f."
+      fail E_CACHE "Rank $r funds a $got GiB prompt cache, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; both ranks are stopped. The cache is what the room leaves, capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, or with CACHE_FIRST=1 try a larger PROMPT_CACHE_GIB (it can cost the streams a whole window). Logs: $(last_archive)."
     fi
     log "Prompt cache: rank $r funds $got GiB (PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB)."
   done
@@ -578,6 +611,7 @@ ship_image
 step 3 'Download or check the checkpoint and the drafter weights on both Sparks'
 prepare_weights
 model_overlay
+[[ "$EFFORT_AFTER_DOWNLOAD" == 0 ]] || effort_template
 
 step 4 "Find the link between the Sparks and the RDMA devices it runs on"
 check_link
@@ -632,10 +666,11 @@ if [[ "$DRY_RUN" != 1 ]]; then
   if [[ "$CONTEXT" == auto ]]; then
     remember_context "$FIT_KEY" "$CTX"
     log "Context: $CTX tokens (kept for the next start with these settings; delete $FIT_FILE to probe again)."
-    pool=$(grep -ho 'taking [0-9]* pages of 512 rows' "$RUN_LOG_DIR/rank0.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1)
+    # Windows (KV_PAGES=off, or auto with KV=fp8) have no pages line, so no pool to report and no pipefail exit.
+    pool=$(grep -ho 'taking [0-9]* pages of 512 rows' "$RUN_LOG_DIR/rank0.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1) || true
     [[ -z "$pool" ]] || log "KV pool: $pool pages = $(( pool * 512 )) tokens shared by $PARALLEL streams (one request up to $CTX)."
-    # A few MiB more fixed memory can quietly drop a stream.
-    grep -q "$PARALLEL streams at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
+    # A few MiB more fixed memory can quietly drop a stream. One stream reads "1 stream at once"; auto names no count.
+    [[ "$PARALLEL" == auto ]] || grep -qE "(^|[^0-9])$PARALLEL streams? at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_STREAMS "The engine serves fewer than PARALLEL=$PARALLEL streams at once; see the startup line in $RUN_LOG_DIR/rank0.log."
   elif (( ATTEMPT == 2 )); then
     log "Context: $CTX tokens, not the $CONTEXT asked; set CONTEXT=$CTX in scripts/local.sh to skip the refused start."

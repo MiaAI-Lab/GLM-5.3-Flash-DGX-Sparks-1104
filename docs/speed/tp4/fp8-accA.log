@@ -1,0 +1,4 @@
+[fp8-runA] 1-stream prose: tok/s 44.6/44.8 | tok/round 2.17 | ms/round 48.4 | accepted 59% | sha b363136de28e
+[fp8-runA] 1-stream code: tok/s 65.1/65.1 | tok/round 4.17 | ms/round 63.9 | accepted 78% | sha d240a39d8c68
+[fp8-runA] 4-stream prose, rep 0: total 85.1 tok/s | per stream 21.7 21.7 21.1 20.6 | tok/round 2.17 | ms/round 101 | accepted 65%
+[fp8-runA] 4-stream prose, rep 1: total 86.8 tok/s | per stream 22.5 21.4 21.9 20.9 | tok/round 2.16 | ms/round 99 | accepted 68%

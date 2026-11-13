@@ -1,0 +1,57 @@
+== test-glm-tp3-host
+exit 0
+== test-glm-fp8-kv-host
+test-glm-fp8-kv-host
++- run test w
+GLM_KV_BYTES context=8192 capacity=8256 main_layers=11 bf16=339284480 fp8=288955904
+GLM_KV_BYTES context=65536 capacity=65600 main_layers=11 bf16=1087967744 fp8=688070144
+GLM_KV_BYTES context=199307 capacity=199360 main_layers=11 bf16=2834338304 fp8=1619039744
+GLM_KV_BYTES context=245760 capacity=245824 main_layers=11 bf16=3440972288 fp8=1942429184
+failed command: ./.zig-cache/o/fc071a3adae465dfa19d0e2360cbd37a/test --cache-dir=./.zig-cache --seed=0xf84206e9 --listen=-
+
+exit 0
+== test-glm-exl3-host
+exit 0
+== test-cuda-host
+failed command: ./.zig-cache/o/78dc8563b42ca88fda4b1806e62293ca/test --cache-dir=./.zig-cache --seed=0x924db9a4 --listen=-
+
+test-cuda-host
++- run test w
+PASS sums cuda exl3 grouped experts tf_exl3_grouped_0 (3inst), a tile ahead on sm_120 up: exact sums at k 4096, where fp16 sums would miss by infx and bf16 by 244x
+PASS sums cuda exl3 grouped experts tf_exl3_grouped_1 (mcg), a tile ahead on sm_120 up: exact sums at k 4096, where fp16 sums would miss by infx and bf16 by 247x
+PASS sums cuda exl3 grouped experts tf_exl3_grouped_2 (mul1), a tile ahead on sm_120 up: exact sums at k 4096, where fp16 sums would miss by infx and bf16 by 242x
+failed command: ./.zig-cache/o/8b6774bda7abf16514e780812e5ec256/test --cache-dir=./.zig-cache --seed=0x924db9a4 --listen=-
+
+test-cuda-host
++- run test w
+PROVENANCE_FIELDS fixtures=3 fields=14 plus decision labels
+PROVENANCE_TIMING mode=raw one=0 bytes=409600 added=1000 rounds=12 ns_per=5844126
+PROVENANCE_TIMING mode=masked one=0 bytes=409600 added=1000 rounds=12 ns_per=6286519
+PROVENANCE_MASK_WORK one=0 spans=3 matcher=3 output=409603
+PROVENANCE_TIMING mode=raw one=1 bytes=409600 added=1000 rounds=12 ns_per=6070512
+PROVENANCE_TIMING mode=masked one=1 bytes=409600 added=1000 rounds=12 ns_per=6255265
+PROVENANCE_MASK_WORK one=1 spans=3 matcher=3 output=409603
+[default] (warn): TENSORFOLD_REQUEST_LOG .zig-cache/tmp/1-qVjTrMGRlEBL6I/taken.jsonl gets no requests: it is not a regular file only its owner can read
+DEEPSEEK_CHAT_GOLDENS 178 committed encoding.py cases
+VISION_MARKERS all 8 fields refuse plain vocabulary; unflagged additions pass
+[default] (warn): libtfgrammar.so is required for structured output and required tool calls (HTTP 400 when missing); restore the matching release archive's lib/ directory or run zig build grammar -Dxgrammar=DIR; prepare DIR with git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar
+[default] (warn): libtfgrammar.so is required for structured output and required tool calls (HTTP 400 when missing); restore the matching release archive's lib/ directory or run zig build grammar -Dxgrammar=DIR; prepare DIR with git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar
+[default] (warn): libtfgrammar.so is required for structured output and required tool calls (HTTP 400 when missing); restore the matching release archive's lib/ directory or run zig build grammar -Dxgrammar=DIR; prepare DIR with git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar
+[default] (warn): libtfgrammar.so is required for structured output and required tool calls (HTTP 400 when missing); restore the matching release archive's lib/ directory or run zig build grammar -Dxgrammar=DIR; prepare DIR with git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar
+invalid output: first-write inflight=0
+Busy: first-write inflight=0
+Closed: first-write inflight=0
+InvalidRequest: first-write inflight=0
+Unsupported: first-write inflight=0
+completed stream: first-write inflight=0
+[default] (warn): libtfgrammar.so is required for structured output and required tool calls (HTTP 400 when missing); restore the matching release archive's lib/ directory or run zig build grammar -Dxgrammar=DIR; prepare DIR with git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar
+failed command: ./.zig-cache/o/9ed8294323e29b9723367dfe1ee27194/test --cache-dir=./.zig-cache --seed=0x924db9a4 --listen=-
+
+Build Summary: 270/274 steps succeeded (3 failed); 4010/4021 tests passed (9 skipped, 2 failed)
+test-cuda-host transitive failure
++- run test 111 pass, 1 fail (112 total)
++- run test 14 pass, 1 fail (15 total)
++- run test 185 pass (185 total); 1 error logs
+
+exit 0
+HOSTTESTS_DONE

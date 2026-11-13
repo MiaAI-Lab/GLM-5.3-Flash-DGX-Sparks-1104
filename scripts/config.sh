@@ -76,6 +76,37 @@ SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash}"
 ROCE="${ROCE:-on}"
 ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest shard the RDMA region holds
 
+# --- four Sparks (./start-tp4.sh, ./start-tp4-switchless.sh, ./stop-tp4.sh; README "4 Sparks") ----------------------
+# TP=4 over four Sparks: this Spark (rank 0, the API) and WORKER, WORKER2, WORKER3 (ranks 1-3). On a switch
+# (./start-tp4.sh) every Spark's ports share the switch's subnet and the workers may be in any order. Cabled as a ring
+# without a switch (./start-tp4-switchless.sh) they go in the ring's order, each cabled to the next and the last back to
+# this one, one subnet per cable; the two Sparks across the ring from each other reach each other only through a
+# neighbour (an address routed over the cables, or the LAN). start.sh never reads these; the TP=4 starts set TP=4.
+WORKER2="${WORKER2:-}"                           # rank 2's ssh target, the Spark across the ring (e.g. zurih@10.0.0.3)
+WORKER3="${WORKER3:-}"                           # rank 3's ssh target, cabled to this Spark (e.g. zurih@10.0.41.4)
+# NCCL_COMM_ID's address at TP=4 and the ranks' lines to rank 0: an address of this Spark every worker reaches (auto:
+# what this Spark's host name resolves to, else its first address). The Spark across the ring reaches it through a
+# neighbour. SOCKET_IFNAME: NCCL's bootstrap netdev on every rank (auto: each Spark's default-route netdev, the LAN).
+MASTER_ADDR="${MASTER_ADDR:-}"
+SOCKET_IFNAME="${SOCKET_IFNAME:-}"
+# TF_GLM_PREFILL_REDUCE at TP=4. The engine's default, split, sends every rank's prompt rows straight to every other
+# rank, which a ring cannot carry (the engine probes and refuses it). gather: the exchanges as all-gathers between
+# neighbours, no point-to-point sends (the qualified mode here); ring: split, its exchanges passed along the ring.
+PREFILL_REDUCE="${PREFILL_REDUCE:-gather}"
+RING_NCCL_ALGO="${RING_NCCL_ALGO:-Ring}"         # NCCL_ALGO on the ring: Ring sends only to the next rank
+# ROCE_RING=on: the decode and verify all-gathers up to ROCE_MAX_KB a rank as one-shot RDMA writes to both
+# neighbours, each relaying half of a shard to the rank across (engine patch 0108, TF_ROCE_RING=1, TF_ROCE_HCA naming
+# the device toward the previous rank then the one toward the next); every rank must bring it up or all four fall
+# back to NCCL together. off (the default until it is measured): NCCL carries every exchange.
+ROCE_RING="${ROCE_RING:-off}"
+# The checkpoint and drafter paths as the NFS server on this Spark exports them, when they differ from MODEL_DIR and
+# DFLASH2_DIR (an NFS server in a container exports its own view: /huggingface/... for /home/you/.cache/huggingface/...).
+NFS_MODEL_PATH="${NFS_MODEL_PATH:-}"
+NFS_DFLASH2_PATH="${NFS_DFLASH2_PATH:-}"
+# NFS_SERVER1 / NFS_SERVER2 / NFS_SERVER3: the address each worker mounts from (auto: this Spark's address on its route
+# to that worker; NFS_SERVER, when set, for all three).
+NFS_SERVER1="${NFS_SERVER1:-}"; NFS_SERVER2="${NFS_SERVER2:-}"; NFS_SERVER3="${NFS_SERVER3:-}"
+
 # --- weights ---------------------------------------------------------------------------------------------------------
 # Both Sparks read the whole checkpoint at load: each rank keeps its half, but every rank reads every shard, so the
 # worker needs the same bytes as this one. The ranks compare a fingerprint of the checkpoint before they load, so a
@@ -102,11 +133,19 @@ ABLIT="${ABLIT:-0}"
 ABLIT_ID="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit"
 _id="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold"; _dir=model
 if [[ "$ABLIT" == 1 ]]; then _id=$ABLIT_ID; _dir=model-ablit; fi
+# FP8=1 serves Z.AI's own release, zai-org/GLM-5.3-Flash, which is published in block FP8 (e4m3 codes, 128 x 128 scales;
+# ~306 GiB, engine patch 0107; README "Block FP8 weights"). It fits four Sparks only (./start-tp4.sh, ./start-tp4-switchless.sh): ~81 GiB of
+# weights a rank. unsloth/GLM-5.3-Flash-FP8 is a byte-identical mirror of it (every shard's sha256 the same).
+FP8="${FP8:-0}"
+FP8_ID="zai-org/GLM-5.3-Flash"
+if [[ "$FP8" == 1 ]]; then _id=$FP8_ID; _dir=model-fp8; fi
 MODEL_ID="${MODEL_ID:-$_id}"
 # The pins belong to the checkpoints above; another MODEL_ID needs its own MODEL_REVISION.
 case "$MODEL_ID" in
   Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) _rev=76c0b5173166d2795dd48860f45d8224817f894c ;;
   "$ABLIT_ID") _rev=57edefd2f5d9b371c8345883304d5af68b52fa24 ;;
+  "$FP8_ID") _rev=46a050bec13002ad29ee795c16e61cf4fa3c4a9c ;;
+  unsloth/GLM-5.3-Flash-FP8) _rev=a160e2291674d9e3e92e98fd82faa2544a2867a3 ;;   # the mirror, the same bytes
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION:-$_rev}"
@@ -166,15 +205,22 @@ HEAD="${HEAD:-bf16}"                             # TF_GLM_HEAD_BITS for the LM h
 # TENSORFOLD_MEMORY_RESERVE_GIB. GB10 is a unified-memory device: the engine budgets from /proc/meminfo's MemAvailable
 # (plus the pages parked on the kernel's per-CPU free lists, which MemAvailable leaves out), not from a card's free
 # memory, and everything the Spark runs besides the rank comes out of the same pool. The engine's own default here is
-# max(4 GiB, MemTotal/10), about 11.9 GiB on a 128 GB Spark; its floor is 2. Raise it when a long session pushes a
-# Spark toward its floor: rank 0 also carries the HTTP server and the vision tower.
-MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-12}"
-PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"         # --prompt-cache-gib of device pages (empty: the engine's default)
-# CACHE_FIRST=1 (engine patch 0108, TF_PROMPT_CACHE_FIRST): PROMPT_CACHE_GIB is set aside before the room is counted
+# max(4 GiB, MemTotal/10), about 11.9 GiB on a 128 GB Spark; its floor is 2. 6.5 everywhere since 2026-11-11 (it was 12;
+# the pair ran 9.5). Raise it when a long session pushes a Spark toward its floor: rank 0 also carries the HTTP server
+# and the vision tower.
+MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-6.5}"
+# CACHE_FIRST=1 (engine patch 0112, TF_PROMPT_CACHE_FIRST): PROMPT_CACHE_GIB is set aside before the room is counted
 # in whole CONTEXT windows, so the PARALLEL streams share the pages left (one window at least) instead of the cache
-# getting what whole windows leave. For long agent sessions: PARALLEL streams and a cache that keeps them. Needs
-# PROMPT_CACHE_GIB. 0 (default): windows first, as before.
-CACHE_FIRST="${CACHE_FIRST:-0}"
+# getting what whole windows leave. 0: windows first. On by default since 2026-11-11: at a 6.5 reserve windows-first
+# would let the pair's page pool take a third 1M window and leave no prompt cache (the cliff RESULTS.md 2026-11-04
+# records at 19.5 GiB of room); FP8 at four Sparks had none at 9.5.
+CACHE_FIRST="${CACHE_FIRST:-1}"
+# PROMPT_CACHE_GIB, device pages for kept prompt states: 5 on the pair (predicted to keep its two 1M windows, 4,096
+# pages, beside it), 8 with EXL3 at four Sparks (measured: all eight windows, 16,392 pages, and an 8.0 GiB cache), 4
+# with FP8=1 (measured: 6,147 pages and a 3.9 GiB cache).
+if [[ "${GLM_TP4:-0}" == 1 && "$FP8" == 1 ]]; then PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-4}"
+elif [[ "${GLM_TP4:-0}" == 1 ]]; then PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-8}"
+else PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-5}"; fi
 # PROMPT_CACHE_MIN_GIB: the smallest prompt cache a start may serve with, in GiB. The engine funds the cache from the
 # room each rank has at that start (it varies by a GiB or more between starts), and PROMPT_CACHE_GIB only caps it, even
 # with CACHE_FIRST=1. With a value here, start.sh reads each rank's startup line and stops both ranks (E_CACHE) before
@@ -185,17 +231,23 @@ PROMPT_CACHE_MIN_GIB="${PROMPT_CACHE_MIN_GIB:-}"
 # here and PROMPT_CACHE_GIB (device pages) is the one to raise. Unset or auto would pin a quarter of MemAvailable,
 # up to 16 GiB over the two ranks.
 HOST_CACHE_GIB="${HOST_CACHE_GIB:-0}"
-# LEARN_GIB (engine patch 0109, --learn-conversations): kept prompt states also go to disk under CACHE_DIR/learn,
+# LEARN_GIB (engine patch 0113, --learn-conversations): kept prompt states also go to disk under CACHE_DIR/learn,
 # every rank's part in rank 0's store, so a conversation resumes after its device copy is evicted or the pair
 # restarts. The GiB of disk the states may take; 0 (default): off, as before. LEARN_MIN_FREE_GIB: no state is
 # written while the disk has less free.
 LEARN_GIB="${LEARN_GIB:-0}"
 LEARN_MIN_FREE_GIB="${LEARN_MIN_FREE_GIB:-15}"
-# KV_SHARD=1 (engine patch 0110, TF_GLM_KV_SHARD): each stream's FP8 latent rows live on one Spark (its owner) instead
+# KV_SHARD=1 (engine patch 0114, TF_GLM_KV_SHARD): each stream's FP8 latent rows live on one Spark (its owner) instead
 # of both, so the same memory holds about twice the tokens; the other Spark's queries go to the owner for attention
 # (1-4% decode). Needs KV=fp8, KV pages, DFlash2 or no drafter, PARALLEL above 1. The pool then takes most of the
 # room: pair it with CACHE_FIRST=1 PROMPT_CACHE_GIB so long conversations stay kept. 0 (default): off, as before.
 KV_SHARD="${KV_SHARD:-0}"
+# L2PF=1 (engine patch 0117, TF_GLM_L2PF, ported from upstream): each decode window reads the next layer's mixer
+# weights, this layer's router and KDA's o_proj into L2 on a side stream while the gathers and chains run (not the
+# EXL3 routed experts). Upstream turns it on by default on GB10 at TP>=2; on this pair (2026-11-11) it gave +2% at one
+# stream and nothing measurable at four or eight, token hashes identical. Both ranks must agree (the fingerprint
+# carries it). 0 (default): off, as before.
+L2PF="${L2PF:-0}"
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"     # --vision-max-images: images per request (engine default 4, at most 64)
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media
@@ -209,6 +261,18 @@ CHAT_TEMPLATE="${CHAT_TEMPLATE:-auto}"
 # which the engine passes with thinking on only; always: the template as it is. CHAT_TEMPLATE=auto only; a template
 # of your own decides for itself.
 EFFORT_LINE="${EFFORT_LINE:-thinking}"
+# EXTRA_EOS (engine patch 0120, TF_EXTRA_EOS): tokens that end a reply besides the checkpoint's EOS ids
+# (<|endoftext|>, <|user|>, <|observation|>), comma-separated. GLM-5.3 can close a reply with <|assistant|>, which
+# its generation_config leaves out: the token then reaches the reply as text and the model writes a second turn of
+# its own until MAX_TOKENS. none: the checkpoint's list only.
+EXTRA_EOS="${EXTRA_EOS:-<|assistant|>}"
+# THINK_OFF_SPLIT (engine patch 0121, TF_THINK_OFF_SPLIT): with thinking off, GLM-5.3 sometimes drafts in its reasoning
+# voice anyway and writes </think> before its answer. A chat reply that writes that token within its first
+# THINK_OFF_SPLIT tokens gets the text before it as reasoning_content and the rest as content, as a thinking reply
+# does. While a reply streams, its content waits until the token, the end or THINK_OFF_SPLIT tokens (whichever comes
+# first), so a long thinking-off reply's first content arrives up to that many tokens later. 0 (default): off, since
+# that hold delays every streamed thinking-off reply; 1024 is the hold its author measured.
+THINK_OFF_SPLIT="${THINK_OFF_SPLIT:-0}"
 THINKING="${THINKING:-0}"                        # --thinking / --no-thinking default; requests override
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"    # --reasoning-effort low|medium|high|xhigh (empty: omit); xhigh renders the checkpoint's trained "Reasoning Effort: Max" line
 MAX_TOKENS="${MAX_TOKENS:-32768}"                # --max-tokens default reply limit

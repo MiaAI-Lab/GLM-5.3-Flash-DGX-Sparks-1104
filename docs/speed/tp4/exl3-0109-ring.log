@@ -1,0 +1,16 @@
+[exl3-0109-ring] 1-stream prose: tok/s 56.2/56.2 | tok/round 2.05 | ms/round 36.5 | accepted 57% | sha b6ae240144bc
+[exl3-0109-ring] 1-stream code: tok/s 85.0/85.1 | tok/round 3.77 | ms/round 44.3 | accepted 74% | sha 9b68d8a77151
+[exl3-0109-ring] 4-stream prose, rep 0: total 118.2 tok/s | per stream 30.8 29.0 28.5 29.9 | tok/round 2.06 | ms/round 70 | accepted 64%
+[exl3-0109-ring] 4-stream prose, rep 1: total 115.8 tok/s | per stream 31.6 28.7 28.1 27.4 | tok/round 2.06 | ms/round 71 | accepted 62%
+  prefill 16K: {'prompt_tokens': 15851, 'ttft': 13.167027950286865, 'prefill_tps': 1203.840385229429}
+  prefill 64K: {'prompt_tokens': 63997, 'ttft': 47.62072420120239, 'prefill_tps': 1343.8896840292932}
+  conc2: {'per_stream_tps': [44.0, 42.8], 'sum_tps': 86.8, 'ttft_max': 0.5453979969024658}
+  conc4: {'per_stream_tps': [31.0, 28.6, 29.3, 30.6], 'sum_tps': 119.4, 'ttft_max': 0.8803267478942871}
+  mixed1: {'long_prompt_tokens': 50570, 'long_ttft': 67.64, 'decoders': [{'before_tps': 57.8, 'during_tps': 17.6, 'gap_p50': 35, 'gap_p95': 50, 'gap_max': 3932, 'after_tps': 54.7}]}
+  prefill pair: {'alone_ttft': 23.36, 'alone_tokens': 30311, 'pair_ttft': [46.84, 23.42], 'pair_tokens': [30478, 30350]}
+ "nll": 0.7487241272787446,
+ "nll_error": null,
+ "answers_sha": "11ceddde19d4",
+LEG_DONE
+
+[exited with code 0]

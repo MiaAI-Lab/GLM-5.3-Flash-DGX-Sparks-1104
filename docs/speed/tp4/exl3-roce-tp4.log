@@ -1,0 +1,19 @@
+[exl3-roce] 1-stream prose: tok/s 57.1/57.4 | tok/round 2.05 | ms/round 35.9 | accepted 57% | sha b6ae240144bc
+[exl3-roce] 1-stream code: tok/s 86.7/86.9 | tok/round 3.77 | ms/round 43.4 | accepted 74% | sha 9b68d8a77151
+[exl3-roce] 4-stream prose, rep 0: total 120.5 tok/s | per stream 30.6 30.3 29.9 29.8 | tok/round 2.03 | ms/round 67 | accepted 60%
+[exl3-roce] 4-stream prose, rep 1: total 124.1 tok/s | per stream 33.9 30.3 29.9 30.0 | tok/round 2.07 | ms/round 67 | accepted 64%
+[exl3-roce] 6-stream rep0: total 142.4 tok/s | per stream 24.7 24.3 23.0 23.2 23.9 23.3 | tok/round 1.98 | ms/round 83 | wall 14s
+[exl3-roce] 6-stream rep1: total 143.9 tok/s | per stream 25.1 23.8 24.4 23.5 23.2 23.9 | tok/round 2.03 | ms/round 84 | wall 13s
+[exl3-roce] 8-stream rep0: total 159.6 tok/s | per stream 21.3 20.3 19.7 19.8 20.0 18.8 20.2 19.6 | tok/round 1.99 | ms/round 99 | wall 16s
+[exl3-roce] 8-stream rep1: total 162.6 tok/s | per stream 21.1 21.2 21.4 20.3 20.3 19.6 20.0 18.9 | tok/round 2.01 | ms/round 99 | wall 16s
+  single code: {'decode_tps': 86.73044475350818, 'ttft': 0.12881803512573242, 'sha': '9b68d8a77151', 'tokens': 600}
+  prefill 16K: {'prompt_tokens': 15839, 'ttft': 8.977692127227783, 'prefill_tps': 1764.2618810644062}
+  prefill 64K: {'prompt_tokens': 64085, 'ttft': 33.86518430709839, 'prefill_tps': 1892.3564513590236}
+  conc2: {'per_stream_tps': [43.1, 45.2], 'sum_tps': 88.3, 'ttft_max': 0.3010900020599365}
+  conc4: {'per_stream_tps': [30.2, 28.8, 32.1, 30.7], 'sum_tps': 121.8, 'ttft_max': 0.6176924705505371}
+  mixed1: {'long_prompt_tokens': 50676, 'long_ttft': 44.11, 'decoders': [{'before_tps': 57.1, 'during_tps': 17.7, 'gap_p50': 35, 'gap_p95': 53, 'gap_max': 2607, 'after_tps': 54.7}]}
+  mixed3: {'long_prompt_tokens': 50695, 'long_ttft': 44.26, 'decoders': [{'before_tps': 35.8, 'during_tps': 11.8, 'gap_p50': 58, 'gap_p95': 2460, 'gap_max': 2648, 'after_tps': 34.6}, {'before_tps': 34.3, 'during_tps': 10.7, 'gap_p50': 58, 'gap_p95': 2460, 'gap_max': 2648, 'after_tps': 32.1}, {'before_tps': 35.5, 'during_tps': 10.4, 'gap_p50': 58, 'gap_p95': 2459, 'gap_max': 2648, 'after_tps': 31.7}]}
+  prefill pair: {'alone_ttft': 16.39, 'alone_tokens': 30401, 'pair_ttft': [33.52, 16.39], 'pair_tokens': [30492, 30407]}
+[exl3-roce] done
+ "nll": 0.7487241272787446,
+ "answers_sha": "11ceddde19d4",
