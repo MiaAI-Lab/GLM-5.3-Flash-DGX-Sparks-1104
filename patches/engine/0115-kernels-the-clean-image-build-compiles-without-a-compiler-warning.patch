@@ -24,7 +24,7 @@ all six files' fatbins compile byte-identical to the unpatched build (nvcc 13.3,
  6 files changed, 4 insertions(+), 4 deletions(-)
 
 diff --git a/zig/kernels/cuda/drama3_fp8.cu b/zig/kernels/cuda/drama3_fp8.cu
-index 5b9ae65..4c4d3c3 100644
+index 5b9ae655a..4c4d3c322 100644
 --- a/zig/kernels/cuda/drama3_fp8.cu
 +++ b/zig/kernels/cuda/drama3_fp8.cu
 @@ -176,7 +176,6 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
@@ -36,7 +36,7 @@ index 5b9ae65..4c4d3c3 100644
    __shared__ uint4 sx[PSTAGES][64][4];
    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
 diff --git a/zig/kernels/cuda/flashnext_attn.cu b/zig/kernels/cuda/flashnext_attn.cu
-index ff4f7aa..27c11a1 100644
+index ff4f7aabb..27c11a13d 100644
 --- a/zig/kernels/cuda/flashnext_attn.cu
 +++ b/zig/kernels/cuda/flashnext_attn.cu
 @@ -443,6 +443,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
@@ -56,7 +56,7 @@ index ff4f7aa..27c11a1 100644
          __nv_bfloat16* OUT = reinterpret_cast<__nv_bfloat16*>(PO);
  #pragma unroll
 diff --git a/zig/kernels/cuda/flashnext_fact.cu b/zig/kernels/cuda/flashnext_fact.cu
-index efe02c1..3e96956 100644
+index efe02c1e6..3e969565e 100644
 --- a/zig/kernels/cuda/flashnext_fact.cu
 +++ b/zig/kernels/cuda/flashnext_fact.cu
 @@ -171,6 +171,7 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) fact_kernel(
@@ -76,7 +76,7 @@ index efe02c1..3e96956 100644
      }
      if constexpr (DBUF && !BLOCKED) {
 diff --git a/zig/kernels/cuda/fp8_experts.cu b/zig/kernels/cuda/fp8_experts.cu
-index 7c26739..046d6a9 100644
+index 7c26739e8..046d6a9fc 100644
 --- a/zig/kernels/cuda/fp8_experts.cu
 +++ b/zig/kernels/cuda/fp8_experts.cu
 @@ -146,7 +146,6 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
@@ -88,7 +88,7 @@ index 7c26739..046d6a9 100644
    __shared__ uint4 sx[PSTAGES][64][4];
    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
 diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
-index 52a3762..3ba5748 100644
+index 52a376258..3ba5748ce 100644
 --- a/zig/kernels/cuda/glm_mm.cu
 +++ b/zig/kernels/cuda/glm_mm.cu
 @@ -109,7 +109,6 @@ struct Tile {
@@ -100,7 +100,7 @@ index 52a3762..3ba5748 100644
  
  // ROWS_FIRST: row blocks fastest, so the blocks reading one weight tile run together and share it in L2 (prompts)
 diff --git a/zig/kernels/cuda/prefill_attention.cu b/zig/kernels/cuda/prefill_attention.cu
-index af5acbd..003f531 100644
+index af5acbd65..003f53197 100644
 --- a/zig/kernels/cuda/prefill_attention.cu
 +++ b/zig/kernels/cuda/prefill_attention.cu
 @@ -18,7 +18,6 @@ using qmm_frag::mma0;

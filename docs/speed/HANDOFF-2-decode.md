@@ -32,6 +32,32 @@ The calibration study bounds cut-tuning at ~84; Codex-checked arithmetic: 93 nee
 B's exact tpr on A's latency gives 89.2. KDA C1/C4 add +1-2 ms (82-84 ceiling). The campaign's stop rules fired
 on their pre-registered gates; this is a measured verdict, not a guess.
 
+## TP=4 (2026-11-04 evening): pair A is DOWN by the user's choice; spark1 serves all four Sparks
+
+`./start-tp4.sh` on spark1 (rank 0, port 8888; spark2/spark3/spark4 ranks 1-3 round the switchless ring; weights from
+spark1 over NFS) is LIVE on image `74e19a63a9a5` (106 patches: 0106 = the mode-aware peer warm-up; `daa6f2cde063` is the same code under the label before patch 0078's credit text changed). RESULTS.md
+"TP=4 on the four-Spark ring" has the whole story: the four boots, Codex's read, the NCCL eager-connect and the
+follower environ panic, the LAN bootstrap. Stop it with `./stop-tp4.sh` on spark1; pair A restarts with `./start.sh`
+on spark3 (its local.sh untouched) once the four ranks are down. Check rank 0's startup line after every TP=4 start:
+"16392 pages", "prompt cache: 3.6 GiB", no "cannot keep one state".
+
+Since 22:30 local the four Sparks serve **unsloth/GLM-5.3-Flash-FP8** instead (`FP8=1 ./start-tp4.sh` on spark1, image
+`cb33a3d5fc68` = 107 patches with 0107 block FP8, reserve 9.5): startup line "6147 pages", "prompt cache: 1.2 GiB".
+`./start-tp4.sh restart` without FP8=1 goes back to the EXL3 pack on the same image. RESULTS.md "Block FP8 on the
+ring" has the gates, the numbers, the decode profile, the DeepSeek-recipe levers and Codex's RoCE-ring design.
+
+Since 00:20 local (2026-11-05) the image is `5d37e5287d7b` (108 patches: 0108, the four-rank RoCE ring all-gather)
+on all four Sparks. **Live since 01:05 (2026-11-05): the EXL3 pack, the default (`./start-tp4.sh`), 16392 pages, 3.1 GiB
+prompt cache, loaded in 135 s, 56.2 / 85.6 tok/s, the known hashes; `FP8=1` stays the opt-in and `ROCE_RING=on` the
+opt-in gather path.** The FP8 serve with `ROCE_RING=on` (00:20-01:00) measured: same-image A/B +1-2% at one stream, +5-7% at four,
+prefill, hashes and NLL identical, no ring warning in any rank log. The knob's default stays off (the pre-registered
+one-stream line was 3%; RESULTS.md "The four-rank RoCE ring all-gather"). Boot time: every FP8 boot before 00:20 ran
+with `TF_GLM_LOAD_PREFETCH=0` and took 686-742 s, set by spark3 (two NFS hops, page-fault reads); the EXL3 boots with
+the default 8 readers loaded in ~2 min. With the knob left alone the FP8 boot loads in 245 s (RESULTS.md "The FP8
+boot: 742 s to 245 s"); never set it to 0 again. Next engine levers, in order (RESULTS.md "Baseten's ... read against this engine"): the FP8
+router and expert launches onto the PDL chain (1-2 ms a round), a fused router (up to 2.5 ms), then the 11 ms
+outside the GPU sections (measure its composition first).
+
 ## What shipped (all exact, on image `cd1de29726c3`, both Sparks; **superseded 2026-11-04 13:20 by image `1fdae27149cc` (104 patches: 0103 tool-parse fix, 0104 warm turns, both ported from the rtx recipe, plus MEMORY_RESERVE_GIB 9.5 in scripts/local.sh) and at 15:10 by `8c4ca7bd8c39` (105 patches: 0105, untyped tool parameters decode as the JSON object the model wrote - the sibling recipe's issue #180) - RESULTS.md 2026-11-04 12:00, 13:20 and 15:30 sections; A serves 8c4ca7bd8c39 now (an upstream lane fix tried as 0106 at 15:30 was killed: rounds 50% longer, a ghost stream; RESULTS.md). Pair B (spark1+2) was STOPPED by the user at 13:35 after the Python-engine comparison and is down.**)
 
 - **PARALLEL=8** in scripts/local.sh: the 8-stream arena. Free at every served shape; 6 streams 91-94, 8 streams
@@ -117,3 +143,10 @@ Session trail: RESULTS.md sections 2026-11-03 21:40Z onward; three Codex consult
 (docs/speed/codex-{decode-op-20261103,endgame,final}.md); 0102/0101 in patches/engine and candidates/;
 M1 harness docs/speed/m1/; B source refs docs/speed/s3-b-src/; scratch copies of everything in the rtx box's
 /tmp/tfwork (regenerate the harness from docs/speed/harness/ - /tmp dies on reboot).
+
+**2026-11-05 overnight (RESULTS "The overnight push"):** profiled TP=4 EXL3 (verify 28.0 ms of a 37.3 ms round;
+prompt chunks wait 25% on gathers, HC glue 17%); ROCE_RING=on measured on EXL3 (+2% / +3% / -1.5% at 1 / 4 / 8
+streams, exact: stays opt-in); candidate 0109 (per-cable link communicators for PREFILL_REDUCE=ring) built, made to
+work on the wire, and KILLED by its gate (prefill -25 to -30%). The serve is back on 5d37e5287d7b, EXL3, gather.
+Next prefill lever if anyone resumes: the exchange as an NCCL reduce-scatter on the world ring (pipelined like gather,
+a quarter of the bytes) with the glue reading one summed partial; gate on NLL (the sum order changes).

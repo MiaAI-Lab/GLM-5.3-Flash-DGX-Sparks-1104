@@ -557,18 +557,18 @@ index 280b16ef1..770aa36b8 100644
  pub const Engine = engine.Engine;
  pub const Config = config.Config;
 diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
-index 3bacc96ef..b483f8f6e 100644
+index a9e9ad5a6..4160c8065 100644
 --- a/zig/src/families/glm/cuda.zig
 +++ b/zig/src/families/glm/cuda.zig
-@@ -33,6 +33,7 @@ pub const prompt_logprobs = @import("cuda_prompt_logprobs.zig");
- pub const engine = @import("cuda_engine.zig");
+@@ -34,6 +34,7 @@ pub const engine = @import("cuda_engine.zig");
  pub const prompt_pair = @import("cuda_prompt_pair.zig");
+ pub const prompt_solo = @import("cuda_prompt_solo.zig");
  pub const pages = @import("cuda_pages.zig");
 +pub const kv_shard = @import("cuda_kv_shard.zig");
  pub const open_owner = @import("cuda_open_owner.zig");
  pub const images = @import("cuda_images.zig");
  pub const follow = @import("cuda_follow.zig");
-@@ -50,6 +51,13 @@ test {
+@@ -51,6 +52,13 @@ test {
      _ = @import("cuda_load_owner.zig");
      _ = @import("cuda_images_interleave_test.zig");
      _ = @import("cuda_pages_test.zig");
@@ -1732,7 +1732,7 @@ index 6f546fa66..2f9b87bf5 100644
      }
  }
 diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
-index d64e2a37b..1a1e23a27 100644
+index e6fdf1abf..e5337aa18 100644
 --- a/zig/src/families/glm/cuda_engine.zig
 +++ b/zig/src/families/glm/cuda_engine.zig
 @@ -19,6 +19,9 @@ const dflash = @import("dflash.zig");
@@ -1745,9 +1745,9 @@ index d64e2a37b..1a1e23a27 100644
  pub const Options = @import("cuda_engine_types.zig").Options;
  
  /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
-@@ -131,6 +134,9 @@ pub const Engine = struct {
-     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
-     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
+@@ -134,6 +137,9 @@ pub const Engine = struct {
+     chunk_busy: bool = false, // the next prompt step takes settings.chunk rows beside a decoding stream (cuda_prompt_solo): rank 0's choice, the chunk's flag 4
+     busy_steps: u64 = 0, // prompt steps that did (glm-solo-check counts them)
      a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
 +    kv_room: ?cuda.DeviceBuffer = null, // TF_GLM_KV_SHARD: owner-computed attention's peer queries and outputs
 +    kv_stage: ?cuda.DeviceBuffer = null, // ...and a resume's carry pieces (cuda_kv_shard_keep.piece_bytes)
@@ -1755,7 +1755,7 @@ index d64e2a37b..1a1e23a27 100644
  
      /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
      pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
-@@ -168,6 +174,8 @@ pub const Engine = struct {
+@@ -172,6 +178,8 @@ pub const Engine = struct {
          fp.mtp += @intFromBool(o.drafter);
          try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
          try ranks.probeStart(d, lib, comm, stream, o.settings, rank, world);
@@ -1764,7 +1764,7 @@ index d64e2a37b..1a1e23a27 100644
          const share = try shard.Share.of(&c, rank, world);
          const spans = try gpa.alloc(shard.Span, world);
          errdefer gpa.free(spans);
-@@ -212,6 +220,7 @@ pub const Engine = struct {
+@@ -216,6 +224,7 @@ pub const Engine = struct {
          e.m.tiled = o.settings.tiled;
          if (o.settings.tiled) e.m.packs = &e.packs;
          if (e.settings.pages and !pages_mod.pageable(e)) { // the same layers and heads on every rank: they all keep windows
@@ -1772,7 +1772,7 @@ index d64e2a37b..1a1e23a27 100644
              e.settings.pages = false;
              if (rank == 0) std.log.info("kv pages: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): each stream keeps its own window", .{});
          }
-@@ -232,6 +241,8 @@ pub const Engine = struct {
+@@ -237,6 +246,8 @@ pub const Engine = struct {
          errdefer if (e.bm) |*b| b.deinit();
          if (e.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
          errdefer if (e.bs) |*b| b.deinit();
@@ -1781,7 +1781,7 @@ index d64e2a37b..1a1e23a27 100644
          e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
          errdefer e.pairs.free();
          try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world * pick_rows), "cuMemsetD8"); // each pair's padding stays zero
-@@ -281,6 +292,7 @@ pub const Engine = struct {
+@@ -286,6 +297,7 @@ pub const Engine = struct {
          if (e.pair) |*p| p.deinit();
          e.bp.deinit();
          if (e.a8_buf) |*b| b.free();
@@ -1789,7 +1789,7 @@ index d64e2a37b..1a1e23a27 100644
          if (e.pages) |p| p.deinit();
          for (0..e.seqs.items.len) |i| e.free(i);
          e.seqs.deinit(e.gpa);
-@@ -325,6 +337,40 @@ pub const Engine = struct {
+@@ -330,6 +342,40 @@ pub const Engine = struct {
          });
      }
  
@@ -1830,7 +1830,7 @@ index d64e2a37b..1a1e23a27 100644
      pub fn exchange(e: *const Engine) fw.Exchange {
          return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group } };
      }
-@@ -333,7 +379,7 @@ pub const Engine = struct {
+@@ -338,7 +384,7 @@ pub const Engine = struct {
          out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
          const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
          const twin = if (e.pair) |*p| (if (b == &p.bp) &p.pieces else null) else null;
@@ -1839,7 +1839,7 @@ index d64e2a37b..1a1e23a27 100644
      }
  
      /// An on-by-default switch: off only when `name` is "0".
-@@ -458,6 +504,11 @@ pub const Engine = struct {
+@@ -470,6 +516,11 @@ pub const Engine = struct {
          var one: [1]fw.Rank = undefined;
          var f = e.view(&e.bp, &one);
          f.index_split = split;
@@ -1851,7 +1851,7 @@ index d64e2a37b..1a1e23a27 100644
          if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
          const as_i32: []const i32 = @ptrCast(part);
          if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
-@@ -594,6 +645,7 @@ pub const Engine = struct {
+@@ -599,6 +650,7 @@ pub const Engine = struct {
      /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
      pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
          if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
@@ -1859,7 +1859,7 @@ index d64e2a37b..1a1e23a27 100644
          var one: [1]fw.Rank = undefined;
          var f = e.view(&e.bd, &one);
          const at = e.cur.st.pos;
-@@ -620,12 +672,13 @@ pub const Engine = struct {
+@@ -625,12 +677,13 @@ pub const Engine = struct {
              if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
              for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
              try e.bind(p.slot);
@@ -1887,11 +1887,11 @@ index 6385ddfd6..1b9c19ab3 100644
  
  /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
 diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
-index dac7024e8..55bb9b44c 100644
+index 2a096f0a3..a4d7c9346 100644
 --- a/zig/src/families/glm/cuda_follow.zig
 +++ b/zig/src/families/glm/cuda_follow.zig
-@@ -12,13 +12,13 @@ const pages_mod = @import("cuda_pages.zig");
- const sparse = @import("cuda_sparse.zig");
+@@ -13,13 +13,13 @@ const sparse = @import("cuda_sparse.zig");
+ const prompt_solo = @import("cuda_prompt_solo.zig");
  const Engine = engine.Engine;
  
 -pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk };
@@ -1903,10 +1903,10 @@ index dac7024e8..55bb9b44c 100644
      n: u32 = 0, // ids that follow
 -    depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
 +    depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts; begin: its twin's ids (KV shard)
-     flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
+     flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2), a busy step of TF_GLM_CHUNK rows (4); verify, shared: whole rows
      a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
      seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
-@@ -211,6 +211,9 @@ pub const Leader = struct {
+@@ -212,6 +212,9 @@ pub const Leader = struct {
          try x.flush();
          const c = sampler.check(s);
          var h: Header = .{ .kind = @backingInt(Kind.begin) };
@@ -1916,8 +1916,8 @@ index dac7024e8..55bb9b44c 100644
          if (c) |v| {
              h.flags = 1;
              h.seed = v.seed;
-@@ -267,9 +270,22 @@ pub const Leader = struct {
-         return .{ .first = first, .rows = @min(ids.len - start, n * engine.prompt_rows) };
+@@ -271,9 +274,22 @@ pub const Leader = struct {
+         return .{ .first = first, .rows = @min(ids.len - start, n) };
      }
  
 +    /// TF_GLM_KV_SHARD_CHECK: every that many decode rounds, rank 0's page layout digest before the round's step;
@@ -1939,7 +1939,7 @@ index dac7024e8..55bb9b44c 100644
          try x.send(.{ .kind = @backingInt(Kind.verify), .flags = @intFromBool(x.e.structured) }, ids);
          try x.e.verify(ids, out, bits);
      }
-@@ -278,6 +294,7 @@ pub const Leader = struct {
+@@ -282,6 +298,7 @@ pub const Leader = struct {
      pub fn verifyShared(x: Leader, parts: []const engine.Part) !void {
          if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
          try x.flush();
@@ -1947,7 +1947,7 @@ index dac7024e8..55bb9b44c 100644
          var buf: [2 * engine.max_shared + engine.shared_rows]u32 = undefined;
          var n: usize = 2 * parts.len;
          for (parts, 0..) |p, i| {
-@@ -401,12 +418,12 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+@@ -411,12 +428,12 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
          try e.keep((h.flags >> 16) & 0xff);
          h.flags &= 0xffff;
      }
@@ -1962,7 +1962,7 @@ index dac7024e8..55bb9b44c 100644
              try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
          },
          .pool => {
-@@ -484,6 +501,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+@@ -495,6 +512,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
          },
          .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
          .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, ids_in),
@@ -1970,7 +1970,7 @@ index dac7024e8..55bb9b44c 100644
          .drop => for (ids_in) |id| e.dropState(id),
          .release => e.release(h.slot),
          .idle => cuda.tp_watch.sleep(e.io),
-@@ -492,6 +510,16 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+@@ -503,6 +521,16 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
      return true;
  }
  
@@ -3704,10 +3704,10 @@ index 000000000..1e9a1c6a1
 +    try expectEqual(@as(u8, 0), f.st(ln.lanes.get(&streams[1]).?.slot).hold.?.owner);
 +}
 diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
-index e1bc1bd2e..9772b14a3 100644
+index 445293a41..95c0dcd19 100644
 --- a/zig/src/families/glm/cuda_lanes.zig
 +++ b/zig/src/families/glm/cuda_lanes.zig
-@@ -336,17 +336,27 @@ pub const Lanes = struct {
+@@ -338,17 +338,27 @@ pub const Lanes = struct {
              if (self.x.e.pages) |p| p.close(l.slot);
              _ = self.lanes.remove(s);
          }
@@ -3739,7 +3739,7 @@ index e1bc1bd2e..9772b14a3 100644
      }
  
      /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
-@@ -382,10 +392,28 @@ pub const Lanes = struct {
+@@ -384,10 +394,28 @@ pub const Lanes = struct {
              s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or k.at % fw.prefill_rows != 0) error.SnapshotOutOfStep else error.SnapshotStale;
              return null;
          }
@@ -4123,7 +4123,7 @@ index f08d01cbf..dfcbe9353 100644
      };
  };
 diff --git a/zig/src/families/glm/cuda_prompt_pair.zig b/zig/src/families/glm/cuda_prompt_pair.zig
-index eb4a88d13..8917254b4 100644
+index f52ce4653..c7d46f508 100644
 --- a/zig/src/families/glm/cuda_prompt_pair.zig
 +++ b/zig/src/families/glm/cuda_prompt_pair.zig
 @@ -83,6 +83,8 @@ pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume
@@ -4155,7 +4155,7 @@ index eef2e895e..11ea85e9b 100644
      if (e.drafter) |dr| for (parts, segs[0..parts.len]) |p, g|
          try dr.promptSegment(e, p.slot, 0, g.rows, p.ids.len, g.row0);
 diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
-index 9da15db07..93faf5c77 100644
+index df7ce13fa..bce46c67b 100644
 --- a/zig/src/families/glm/cuda_ranks.zig
 +++ b/zig/src/families/glm/cuda_ranks.zig
 @@ -4,6 +4,7 @@ const std = @import("std");
@@ -4166,7 +4166,7 @@ index 9da15db07..93faf5c77 100644
  
  /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
  pub const Settings = struct {
-@@ -22,6 +23,7 @@ pub const Settings = struct {
+@@ -23,6 +24,7 @@ pub const Settings = struct {
      dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
      head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
      numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
@@ -4174,7 +4174,7 @@ index 9da15db07..93faf5c77 100644
  
      /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
      pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
-@@ -112,6 +114,10 @@ pub const Settings = struct {
+@@ -133,6 +135,10 @@ pub const Settings = struct {
              problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
              return error.BadSetting;
          };
@@ -4185,16 +4185,16 @@ index 9da15db07..93faf5c77 100644
          if (s.prompt_fixed_k and !s.tiled) {
              problem.* = "TF_GLM_PROMPT_K=shape requires TF_GLM_MM=1";
              return error.BadSetting;
-@@ -142,7 +148,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
+@@ -163,7 +169,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
  
  /// What every rank must agree on, as bytes the communicator carries.
  pub const Fingerprint = extern struct {
--    layout: u32 = 14, // this struct's version (13 was num3's numerics or prefill3's pair alone)
-+    layout: u32 = 15, // this struct's version (14 had no kv_shard words; 13 was num3's numerics or prefill3's pair alone)
+-    layout: u32 = 15, // this struct's version (14 was without chunk; 13 num3's numerics or prefill3's pair alone)
++    layout: u32 = 16, // this struct's version (15 had the chunk words or the kv_shard words alone; 14 was without chunk; 13 num3's numerics or prefill3's pair alone)
      world: u32,
      rank: u32,
      kv8: u32 = 0,
-@@ -162,6 +168,8 @@ pub const Fingerprint = extern struct {
+@@ -184,6 +190,8 @@ pub const Fingerprint = extern struct {
      max_frames: u32 = 0,
      bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
      numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
@@ -4203,7 +4203,7 @@ index 9da15db07..93faf5c77 100644
      capacity: u64, // tokens a sequence holds
      heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
      heat_low: f64,
-@@ -190,6 +198,8 @@ pub const Fingerprint = extern struct {
+@@ -213,6 +221,8 @@ pub const Fingerprint = extern struct {
          max_frames,
          bits,
          numerics,
@@ -4212,7 +4212,7 @@ index 9da15db07..93faf5c77 100644
          capacity,
          heat_high,
          heat_low,
-@@ -223,6 +233,8 @@ pub const Fingerprint = extern struct {
+@@ -247,6 +257,8 @@ pub const Fingerprint = extern struct {
              .mtp = @intFromBool(mtp),
              .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
              .numerics = s.numerics.bits(),
@@ -4221,7 +4221,7 @@ index 9da15db07..93faf5c77 100644
              .capacity = capacity,
              .heat_high = if (s.heat) |b| b.high_c else 0,
              .heat_low = if (s.heat) |b| b.low_c else 0,
-@@ -260,6 +272,8 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+@@ -285,6 +297,8 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
              "max_frames",
              "bits",
              "numerics",
@@ -4230,7 +4230,7 @@ index 9da15db07..93faf5c77 100644
              "capacity",
              "heat_high",
              "heat_low",
-@@ -370,6 +384,8 @@ fn explain(f: Fingerprint.Field) []const u8 {
+@@ -396,6 +410,8 @@ fn explain(f: Fingerprint.Field) []const u8 {
          .max_frames => "the frame limit",
          .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
          .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
@@ -4240,10 +4240,10 @@ index 9da15db07..93faf5c77 100644
          .heat_high => "TF_HEAT_HIGH",
          .heat_low => "TF_HEAT_LOW",
 diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
-index cb6113852..0f4aa0ecd 100644
+index c42cd6db3..069853040 100644
 --- a/zig/src/families/glm/cuda_ranks_test.zig
 +++ b/zig/src/families/glm/cuda_ranks_test.zig
-@@ -349,3 +349,48 @@ test "the opt-in prompt numerics: off by default, read by name, in the fingerpri
+@@ -387,3 +387,48 @@ test "the opt-in prompt numerics: off by default, read by name, in the fingerpri
  fn typo_free(_: [:0]const u8) ?[]const u8 {
      return null;
  }
@@ -5277,26 +5277,26 @@ index 000000000..6322dbc24
 +    check.pass("kv shard at TP=2: {d} prompt paths (twins, owner-computed, both parts, resumes at home and carried) and {d} window rows equal the unsharded twin's logits and tokens byte for byte; {d} owner layers ({d} MiB sent by rank 0), {d} twins, {d} carries ({d} MiB), {d} layout checks; both parts empty after", .{ cases.len, compared, counts.owner_layers, counts.owner_bytes >> 20, counts.twins_made, counts.carries, counts.carry_bytes >> 20, counts.checks });
 +}
 diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
-index 3b5920b8b..0860b1de9 100644
+index 489e36d3d..59782eff6 100644
 --- a/zig/tests/cuda/main.zig
 +++ b/zig/tests/cuda/main.zig
-@@ -67,6 +67,7 @@ const glm_lanes_tests = @import("glm_lanes_tests.zig");
- const glm_pair_tests = @import("glm_pair_tests.zig");
+@@ -69,6 +69,7 @@ const glm_pair_tests = @import("glm_pair_tests.zig");
  const glm_split_tests = @import("glm_split_tests.zig");
+ const glm_solo_tests = @import("glm_solo_tests.zig");
  const glm_paged_tests = @import("glm_paged_tests.zig");
 +const glm_kv_shard_check = @import("glm_kv_shard_check.zig");
  const glm_synth = @import("glm_synth.zig");
  const tree_round_tests = @import("tree_round_tests.zig");
  const tree_tests = @import("tree_tests.zig");
-@@ -251,6 +252,7 @@ const usage =
-     \\  glm-pair-check <ckpt> <dc.json> <rank> <world> <idfile>  paired prompt steps against twins a chunk a step, logits and states byte for byte
+@@ -255,6 +256,7 @@ const usage =
      \\  glm-split-check <ckpt> <dc.json> <rank> <world> <idfile>  prompt chunks with their indexer rows split across ranks against whole twins, byte for byte
+     \\  glm-solo-check <ckpt> <dc.json> <rank> <world> <idfile>  busy prompt steps (TF_GLM_CHUNK_SOLO=4096, TF_GLM_CHUNK rows) against twins a whole chunk a step, logits and states byte for byte
      \\  glm-paged-check <ckpt> <rank> <world> <idfile>  a paged stream (pages out of order, NaN first) against a whole-window twin
 +    \\  glm-kv-shard-check <ckpt> <rank> <world> <idfile>  TF_GLM_KV_SHARD: a sharded stream (twins, owner-computed, both parts, resumes and carries) against a whole-window twin
      \\  dory MODEL LOOPS N TEXT     Dory (NVFP4): N greedy tokens from TEXT, then verify windows of 2 to 16 rows bit-equal
      \\  dory-serve MODEL LOOPS TEXT N   Dory served: eager == graphs, copy drafts == plain, 2/4/8 streams == solo
      \\  dory-states MODEL LOOPS TEXT N  Dory kept prompt states at 8k and 32k resumed into wiped caches == fresh
-@@ -473,6 +475,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+@@ -478,6 +480,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
      if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
      if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
      if (std.mem.eql(u8, cmd, "glm-paged-check")) return glm_paged_tests.pagedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
@@ -5305,5 +5305,5 @@ index 3b5920b8b..0860b1de9 100644
      if (std.mem.eql(u8, cmd, "glm-pair-check")) return glm_pair_tests.pairCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
      if (std.mem.eql(u8, cmd, "glm-split-check")) return glm_split_tests.splitCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
 -- 
-2.54.0 (Apple Git-157)
+2.43.0
 

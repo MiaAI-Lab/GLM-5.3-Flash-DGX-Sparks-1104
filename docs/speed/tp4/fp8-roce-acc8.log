@@ -1,0 +1,5 @@
+[fp8-roce] 6-stream rep0: total 99.9 tok/s | per stream 16.7 17.1 17.6 15.9 16.3 16.3 | tok/round 2.02 | ms/round 121 | wall 20s
+[fp8-roce] 6-stream rep1: total 101.3 tok/s | per stream 17.1 17.8 16.4 16.8 17.2 16.1 | tok/round 2.02 | ms/round 119 | wall 19s
+[fp8-roce] 8-stream rep0: total 116.3 tok/s | per stream 16.7 15.8 14.1 14.7 14.2 13.7 13.3 13.8 | tok/round 2.07 | ms/round 142 | wall 23s
+[fp8-roce] 8-stream rep1: total 112.8 tok/s | per stream 15.0 14.2 14.5 13.5 14.0 13.5 13.8 14.3 | tok/round 2.04 | ms/round 144 | wall 23s
+HARNESS_DONE

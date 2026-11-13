@@ -54,6 +54,9 @@ validate_config() {
   for key in THINKING VISION CLEAR_THINKING; do [[ "${!key}" =~ ^[01]$ ]] || fail E_CONFIG "$key must be 0 or 1."; done
   [[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || fail E_CONFIG 'REASONING_EFFORT must be low, medium, high, xhigh or empty.'
   [[ "$EFFORT_LINE" =~ ^(thinking|always)$ ]] || fail E_CONFIG 'EFFORT_LINE must be thinking or always.'
+  [[ "$EXTRA_EOS" =~ ^[^[:space:],]+(,[^[:space:],]+)*$ ]] \
+    || fail E_CONFIG 'EXTRA_EOS must be none or a comma-separated list of tokens, e.g. <|assistant|>.'
+  [[ "$THINK_OFF_SPLIT" =~ ^[0-9]+$ ]] || fail E_CONFIG 'THINK_OFF_SPLIT must be 0 (off) or a token count, e.g. 1024.'
   [[ "$DRAFTER_BITS" =~ ^[04]$ ]] || fail E_CONFIG 'DRAFTER_BITS must be 4 or 0 (bf16).'
   [[ -z "$MTP_DRAFTS" || ( "$MTP_DRAFTS" =~ ^[0-9]+$ && MTP_DRAFTS -le 64 ) ]] || fail E_CONFIG 'MTP_DRAFTS must be empty or 0-64.'
   [[ -z "$MTP_CONFIDENCE" ]] || { is_number "$MTP_CONFIDENCE" && python3 -c 'import sys; sys.exit(0 if 0 <= float(sys.argv[1]) <= 1 else 1)' "$MTP_CONFIDENCE"; } \
@@ -76,15 +79,36 @@ validate_config() {
     || fail E_CONFIG 'CACHE_FIRST=1 sets PROMPT_CACHE_GIB aside first: set PROMPT_CACHE_GIB to the GiB to keep (1 or more).'
   is_number "$LEARN_GIB" || fail E_CONFIG 'LEARN_GIB must be a number of GiB (0: off).'
   [[ "$KV_SHARD" =~ ^[01]$ ]] || fail E_CONFIG 'KV_SHARD must be 0 or 1 (TF_GLM_KV_SHARD).'
-  [[ "$KV_SHARD" == 0 || ( "$KV" == fp8 && "$DRAFTER" != mtp ) ]] || fail E_CONFIG 'KV_SHARD=1 needs KV=fp8 and DRAFTER=dflash2 or none.'
+  [[ "$KV_SHARD" == 0 || ( "$KV" == fp8 && "$KV_PAGES" == on && "$DRAFTER" != mtp && "$PARALLEL" != 1 ) ]] \
+    || fail E_CONFIG 'KV_SHARD=1 needs KV=fp8, KV_PAGES=on, DRAFTER=dflash2 or none, and PARALLEL=auto or above 1.'
+  [[ "$L2PF" =~ ^[01]$ ]] || fail E_CONFIG 'L2PF must be 0 or 1 (TF_GLM_L2PF).'
   is_number "$LEARN_MIN_FREE_GIB" || fail E_CONFIG 'LEARN_MIN_FREE_GIB must be a number of GiB.'
   [[ -z "$PROMPT_CACHE_MIN_GIB" ]] || is_number "$PROMPT_CACHE_MIN_GIB" \
     || fail E_CONFIG 'PROMPT_CACHE_MIN_GIB must be empty (no check) or a number of GiB.'
   [[ "$WITH_VIDEO" =~ ^[01]$ ]] || fail E_CONFIG 'WITH_VIDEO must be 0 or 1.'
   [[ "$CONFIG_OVERLAY" =~ ^(auto|0)$ ]] || fail E_CONFIG 'CONFIG_OVERLAY must be auto or 0.'
-  [[ "$TP" == 2 ]] || fail E_CONFIG "TP=$TP: ./start.sh wires two Sparks."
-  [[ -n "$WORKER" ]] || fail E_CONFIG 'WORKER is empty: set it to the second Spark'"'"'s ssh target (e.g. WORKER=zurih@10.0.34.4) in scripts/local.sh.'
-  [[ "$WORKER" =~ ^[A-Za-z0-9_.@:-]+$ ]] || fail E_CONFIG 'WORKER must be an ssh target such as user@host, with no spaces.'
+  if [[ "${GLM_TP4:-0}" == 1 ]]; then
+    [[ "$TP" == 4 ]] || fail E_CONFIG "TP=$TP: ./start-tp4.sh (a switch) and ./start-tp4-switchless.sh (a ring) run four Sparks (TP=4); ./start.sh runs two."
+    for key in WORKER WORKER2 WORKER3; do
+      [[ -n "${!key}" ]] || fail E_CONFIG "$key is empty: set WORKER, WORKER2 and WORKER3 to the other three Sparks' ssh targets (on a ring, in its order from this Spark) in scripts/local.sh."
+      [[ "${!key}" =~ ^[A-Za-z0-9_.@:-]+$ ]] || fail E_CONFIG "$key must be an ssh target such as user@host, with no spaces."
+    done
+    [[ "$WORKER" != "$WORKER2" && "$WORKER" != "$WORKER3" && "$WORKER2" != "$WORKER3" ]] || fail E_CONFIG 'WORKER, WORKER2 and WORKER3 must name three different Sparks.'
+    [[ "$PREFILL_REDUCE" =~ ^(gather|ring)$ ]] || fail E_CONFIG 'PREFILL_REDUCE must be gather or ring (TF_GLM_PREFILL_REDUCE on a ring; split cannot run there).'
+    [[ "$RING_NCCL_ALGO" =~ ^[A-Za-z,^]+$ ]] || fail E_CONFIG 'RING_NCCL_ALGO must be an NCCL_ALGO value (Ring).'
+    [[ "$ROCE_RING" =~ ^(on|off)$ ]] || fail E_CONFIG 'ROCE_RING must be on or off (TF_ROCE_RING: the four-rank RoCE ring all-gather).'
+    for key in MASTER_ADDR SOCKET_IFNAME NFS_SERVER1 NFS_SERVER2 NFS_SERVER3; do
+      [[ -z "${!key}" || "${!key}" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail E_CONFIG "$key must be an address, host name or netdev."
+    done
+    for key in NFS_MODEL_PATH NFS_DFLASH2_PATH; do
+      [[ -z "${!key}" || ( "${!key}" == /* && "${!key}" != *:* && "${!key}" != *,* ) ]] || fail E_CONFIG "$key must be an absolute path without colons or commas."
+    done
+    [[ "$WORKER_WEIGHTS" =~ ^(nfs|check)$ ]] || fail E_CONFIG 'WORKER_WEIGHTS must be nfs or check at four Sparks (rsync is not offered there).'
+  else
+    [[ "$TP" == 2 ]] || fail E_CONFIG "TP=$TP: ./start.sh wires two Sparks; four start with ./start-tp4.sh on a switch or ./start-tp4-switchless.sh on a ring (README \"4 Sparks\")."
+    [[ -n "$WORKER" ]] || fail E_CONFIG 'WORKER is empty: set it to the second Spark'"'"'s ssh target (e.g. WORKER=zurih@10.0.34.4) in scripts/local.sh.'
+    [[ "$WORKER" =~ ^[A-Za-z0-9_.@:-]+$ ]] || fail E_CONFIG 'WORKER must be an ssh target such as user@host, with no spaces.'
+  fi
   for key in FABRIC_PEER FABRIC_SELF NFS_SERVER; do
     [[ -z "${!key}" || "${!key}" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail E_CONFIG "$key must be an address or host name."
   done
@@ -110,6 +134,9 @@ validate_config() {
     [[ "$path" == /* && "$path" != *:* && "$path" != *$'\n'* && "$path" != *,* ]] || fail E_CONFIG "$key must be an absolute path without colons, commas or newlines."
   done
   [[ "$ABLIT" =~ ^[01]$ ]] || fail E_CONFIG 'ABLIT must be 0 or 1.'
+  [[ "$FP8" =~ ^[01]$ ]] || fail E_CONFIG 'FP8 must be 0 or 1.'
+  [[ "$FP8" == 0 || "$ABLIT" == 0 ]] || fail E_CONFIG 'FP8=1 and ABLIT=1 name two checkpoints: set one.'
+  [[ "$FP8" == 0 || "${GLM_TP4:-0}" == 1 ]] || fail E_CONFIG 'FP8=1 (the ~306 GiB block FP8 release) fits four Sparks only: use ./start-tp4.sh (a switch) or ./start-tp4-switchless.sh (a ring).'
   [[ "$ABLIT" == 0 || "$MODEL_SOURCE" == download ]] || fail E_CONFIG 'ABLIT=1 fetches the Ablit weights, so it needs MODEL_SOURCE=download. To serve a copy you already have, set ABLIT=0, MODEL_SOURCE=local and MODEL_DIR.'
   [[ "$MODEL_SOURCE" != download || -n "$MODEL_REVISION" ]] || fail E_CONFIG "MODEL_ID=$MODEL_ID has no pinned revision: set MODEL_REVISION."
   # A download never overwrites another checkpoint or revision: their files share names, so the result would be a mix.
@@ -360,6 +387,10 @@ if not glob.glob(os.path.join(d, "*.safetensors")):
 if not os.path.exists(os.path.join(d, "tokenizer.json")):
     print("E_MODEL\tno tokenizer.json"); sys.exit()
 method = q.get("quant_method", "none")
+if method == "fp8":
+    bs = q.get("weight_block_size"); fmt = q.get("fmt", "e4m3")
+    vision = "vision" if c.get("vision_config") else "no vision tower"
+    print(f"OK\tblock FP8 ({fmt}, {bs[0]} x {bs[1]} scales) experts and linears, {vision}\t0" if isinstance(bs, list) and len(bs) == 2 else f"E_MODEL\tfp8 without a weight_block_size: the engine reads 128 x 128 block scales"); sys.exit()
 if method != "exl3":
     print(f"W_MODEL\t{method} checkpoint: the recipe is written for EXL3; served as stored\t0"); sys.exit()
 bits = q.get("bits"); avg = q.get("avg_bits")

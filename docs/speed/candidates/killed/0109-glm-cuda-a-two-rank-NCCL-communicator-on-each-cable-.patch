@@ -1,0 +1,341 @@
+From ce9c0f7aaa18063e4d18bc3b34e09151d0bf72c5 Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <mia.ailab1@gmail.com>
+Date: Thu, 5 Nov 2026 01:03:40 +0200
+Subject: [PATCH] glm cuda: a two-rank NCCL communicator on each cable of a
+ ring for TF_GLM_PREFILL_REDUCE=ring (TF_GLM_LINK_GRAPHS)
+
+---
+ zig/src/cuda/tp_group.zig                    |  13 ++-
+ zig/src/families/glm/cuda.zig                |   2 +
+ zig/src/families/glm/cuda_forward_pieces.zig |  11 +-
+ zig/src/families/glm/cuda_links.zig          | 117 +++++++++++++++++++
+ zig/src/families/glm/cuda_native.zig         |   7 ++
+ zig/src/families/glm/cuda_relay.zig          |  35 ++++--
+ 6 files changed, 174 insertions(+), 11 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_links.zig
+
+diff --git a/zig/src/cuda/tp_group.zig b/zig/src/cuda/tp_group.zig
+index 475303d90..4a7b01ae7 100644
+--- a/zig/src/cuda/tp_group.zig
++++ b/zig/src/cuda/tp_group.zig
+@@ -21,6 +21,9 @@ pub const Group = struct {
+     fast: ?*roce.Gather = null, // two ranks' small all-gathers by RoCE writes (openRoce), when both ranks brought it up
+     ring: ?*roce_ring.Gather = null, // four ranks on a switchless ring: the same, neighbours relaying (TF_ROCE_RING=1)
+     p2p: ?*p2p_gather.Gather = null, // two ranks on one host: one stream's small all-gathers by peer stores (openP2p)
++    /// A ring without a switch: a two-rank communicator for each cable, [0] toward the previous rank (this rank is its
++    /// rank 1), [1] toward the next (its rank 0); the split exchanges' sends and receives go over them (glm cuda_links).
++    links: [2]nccl.Comm = .{ null, null },
+ 
+     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
+     pub fn open(d: *const driver.Driver, rank: usize, world: usize) !Group {
+@@ -43,6 +46,9 @@ pub const Group = struct {
+         if (g.p2p) |p| p.deinit();
+         if (g.fast) |f| f.deinit();
+         if (g.ring) |r| r.deinit();
++        if (!g.aborted.load(.acquire)) for (g.links) |l| if (l != null) {
++            _ = g.lib.api.ncclCommDestroy(l);
++        };
+         g.destroyComm();
+         g.lib.close();
+         g.* = undefined;
+@@ -54,7 +60,12 @@ pub const Group = struct {
+ 
+     pub fn abort(g: *Group) void {
+         if (g.p2p) |p| p.abort(); // a peer-store gather still waiting gives up too
+-        if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
++        if (!g.aborted.swap(true, .acq_rel)) {
++            for (g.links) |l| if (l != null) { // a link's send or receive still waiting gives up too
++                _ = g.lib.api.ncclCommAbort(l);
++            };
++            _ = g.lib.api.ncclCommAbort(g.comm);
++        }
+     }
+ 
+     /// Two ranks on one host: gathers on `s` up to `cap` bytes a rank go by peer stores if both ranks want and map it.
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 5da590e68..57799f892 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -23,6 +23,7 @@ pub const weights = @import("cuda_weights.zig");
+ pub const forward = @import("cuda_forward.zig");
+ pub const state = @import("cuda_state.zig");
+ pub const relay = @import("cuda_relay.zig");
++pub const links = @import("cuda_links.zig");
+ pub const config = @import("config.zig");
+ pub const quant = @import("cuda_quant.zig");
+ pub const q4 = @import("cuda_q4.zig");
+@@ -73,6 +74,7 @@ test {
+     _ = weights;
+     _ = forward;
+     _ = relay;
++    _ = links;
+     _ = quant;
+     _ = q4;
+     _ = ranks;
+diff --git a/zig/src/families/glm/cuda_forward_pieces.zig b/zig/src/families/glm/cuda_forward_pieces.zig
+index 654172c22..19bfcf636 100644
+--- a/zig/src/families/glm/cuda_forward_pieces.zig
++++ b/zig/src/families/glm/cuda_forward_pieces.zig
+@@ -106,7 +106,7 @@ pub fn shareTaps(f: *const Forward, t: taps.Taps, cut: []const [2]usize) !void {
+         const n = piece[1] - piece[0];
+         if (!f.splits(n)) continue;
+         const plan: relay.Relay = .{ .world = r.w.share.world, .rank = r.w.share.rank, .n = n };
+-        if (f.ring) try relay.glued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims) else try relay.splitGlued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims);
++        if (f.ring) try relay.glued(x.lib, wire(x), f.stream, plan, t.out, piece[0], dims) else try relay.splitGlued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims);
+     }
+ }
+ 
+@@ -138,7 +138,7 @@ pub fn partials(f: *const Forward, p: *const Pieces, q: usize, lo: usize, n: usi
+             const mine = share(n, world, me);
+             const own = mine[1] - mine[0];
+             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+-            if (f.ce) |ce| try ce_x.partials(f, ce, p, q, lo, n) else if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
++            if (f.ce) |ce| try ce_x.partials(f, ce, p, q, lo, n) else if (f.ring) try relay.partials(x.lib, wire(x), p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
+             try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
+         },
+     }
+@@ -163,7 +163,12 @@ pub fn shareGlued(f: *const Forward, p: *const Pieces, q: usize, lo: usize, n: u
+             const me = r.w.share.rank;
+             const rows_of = if (last) r.b.hidden else r.b.normed;
+             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+-            if (f.ce) |ce| try ce_x.glued(f, ce, p, q, rows_of, lo, n) else if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
++            if (f.ce) |ce| try ce_x.glued(f, ce, p, q, rows_of, lo, n) else if (f.ring) try relay.glued(x.lib, wire(x), p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
+         },
+     }
+ }
++
++/// The exchange's communicators for cuda_relay's ring: the world's, and the cable links when the group opened them.
++fn wire(x: anytype) relay.Wire {
++    return .{ .comm = x.comm, .links = if (x.group) |g| g.links else .{ null, null } };
++}
+diff --git a/zig/src/families/glm/cuda_links.zig b/zig/src/families/glm/cuda_links.zig
+new file mode 100644
+index 000000000..2d9ff765c
+--- /dev/null
++++ b/zig/src/families/glm/cuda_links.zig
+@@ -0,0 +1,117 @@
++//! A ring without a switch: a two-rank NCCL communicator for each cable, so TF_GLM_PREFILL_REDUCE=ring's sends and
++//! receives (cuda_relay) leave on the device that reaches the neighbour. On the world communicator NCCL picks a device
++//! for a point-to-point send itself, and on a ring cabled port to like port it took one without that peer about half
++//! the time (ncclGroupEnd: unhandled system error, measured on the four Sparks 2026-11-04). Each link is made with its
++//! own NCCL graph file (TF_GLM_LINK_GRAPHS="<toward previous>,<toward next>"), whose channels name the cable's devices.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const env = @import("sys").env;
++
++/// TF_GLM_LINK_GRAPHS: the two graph files, the previous rank's link then the next rank's; null when unset.
++pub fn wanted() ?[]const u8 {
++    const v = std.c.getenv("TF_GLM_LINK_GRAPHS") orelse return null;
++    const s = std.mem.span(v);
++    return if (s.len == 0) null else s;
++}
++
++/// The two paths of a TF_GLM_LINK_GRAPHS value, or error.BadLinkGraphs.
++pub fn paths(spec: []const u8) ![2][]const u8 {
++    var it = std.mem.splitScalar(u8, spec, ',');
++    const prev = it.next() orelse return error.BadLinkGraphs;
++    const next = it.next() orelse return error.BadLinkGraphs;
++    if (it.next() != null or prev.len == 0 or next.len == 0) return error.BadLinkGraphs;
++    return .{ prev, next };
++}
++
++/// Which link a rank makes first: an even rank its next, an odd rank its previous, so each link's two ranks reach it
++/// together (on an even ring every link joins an even and an odd rank: rank r's next is rank r + 1's previous).
++pub fn order(rank: usize) [2]usize {
++    return if (rank % 2 == 0) .{ 1, 0 } else .{ 0, 1 };
++}
++
++/// Every rank's id for the link to its next rank, gathered over the world communicator; then both links made, each with
++/// its graph file in NCCL_GRAPH_FILE (restored after), and connected by one small exchange each (NCCL_RUNTIME_CONNECT).
++pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, g: *cuda.tp_group.Group, spec: []const u8) !void {
++    if (g.world < 4 or g.world % 2 != 0) return error.LinksNeedEvenRing;
++    const files = try paths(spec);
++    var z: [2][:0]u8 = undefined;
++    z[0] = try gpa.dupeSentinel(u8, files[0], 0);
++    defer gpa.free(z[0]);
++    z[1] = try gpa.dupeSentinel(u8, files[1], 0);
++    defer gpa.free(z[1]);
++    const nccl = cuda.nccl;
++    const lib = &g.lib;
++    const per = @sizeOf(nccl.UniqueId);
++    // NCCL_COMM_ID names rank 0's bootstrap root: with it set, an id from ncclGetUniqueId carries that address and a
++    // link's rank 0 tries to open its root there (on another Spark: ncclCommInitRank "unhandled system error"). While
++    // the links are made it names this rank's own address instead (TF_GLM_LINK_ADDR, "<address>:<port>"), restored after.
++    const comm_id: ?[:0]u8 = if (std.c.getenv("NCCL_COMM_ID")) |v| try gpa.dupeSentinel(u8, std.mem.span(v), 0) else null;
++    defer if (comm_id) |v| gpa.free(v);
++    if (comm_id != null) {
++        const addr = std.c.getenv("TF_GLM_LINK_ADDR") orelse {
++            std.log.err("glm links: NCCL_COMM_ID is set, so TF_GLM_LINK_ADDR must name this rank's own <address>:<port> for its links' bootstrap", .{});
++            return error.LinksNeedAddress;
++        };
++        _ = env.setenv("NCCL_COMM_ID", addr, 1);
++    }
++    defer if (comm_id) |v| {
++        _ = env.setenv("NCCL_COMM_ID", v.ptr, 1);
++    };
++    var mine: nccl.UniqueId = undefined;
++    try lib.check(lib.api.ncclGetUniqueId(&mine), "ncclGetUniqueId");
++    var s = try cuda.Stream.init(d, false);
++    defer s.deinit();
++    var dev = try cuda.DeviceBuffer.alloc(d, (g.world + 2) * per);
++    defer dev.free();
++    try dev.upload(g.rank * per, std.mem.asBytes(&mine));
++    try lib.check(lib.api.ncclAllGather(dev.ptr + g.rank * per, dev.ptr, per, .u8, g.comm, s.handle), "ncclAllGather");
++    try s.synchronize();
++    const ids = try gpa.alloc(nccl.UniqueId, g.world);
++    defer gpa.free(ids);
++    try dev.download(0, std.mem.sliceAsBytes(ids));
++    const prev = (g.rank + g.world - 1) % g.world;
++    const saved: ?[:0]u8 = if (std.c.getenv("NCCL_GRAPH_FILE")) |v| try gpa.dupeSentinel(u8, std.mem.span(v), 0) else null;
++    defer if (saved) |v| gpa.free(v);
++    defer if (saved) |v| {
++        _ = env.setenv("NCCL_GRAPH_FILE", v.ptr, 1);
++    };
++    errdefer for (&g.links) |*l| if (l.* != null) {
++        _ = lib.api.ncclCommDestroy(l.*);
++        l.* = null;
++    };
++    for (order(g.rank)) |which| {
++        _ = env.setenv("NCCL_GRAPH_FILE", z[which].ptr, 1);
++        // link 1 (toward the next rank) is this rank's id and this rank its rank 0; link 0 the previous rank's, rank 1
++        const id = if (which == 1) ids[g.rank] else ids[prev];
++        var comm: nccl.Comm = null;
++        try lib.check(lib.api.ncclCommInitRank(&comm, 2, id, @intCast(1 - which)), "ncclCommInitRank (link)");
++        g.links[which] = comm;
++        // connected now (NCCL_RUNTIME_CONNECT=1 connects at first use), in the same order, before the weights fill
++        // memory: one broadcast, the collective cuda_relay posts on a link (it keeps to the graph file's devices)
++        const buf = dev.ptr + g.world * per;
++        try lib.check(lib.api.ncclBroadcast(buf, buf, 1, .f32, 0, comm, s.handle), "ncclBroadcast (link)");
++        try s.synchronize();
++    }
++    std.log.info("glm links: rank {d} has a two-rank NCCL communicator on each cable ({s} toward rank {d}, {s} toward rank {d})", .{ g.rank, files[0], prev, files[1], (g.rank + 1) % g.world });
++}
++
++test "link graphs parse as two paths" {
++    const p = try paths("/a.xml,/b.xml");
++    try std.testing.expectEqualStrings("/a.xml", p[0]);
++    try std.testing.expectEqualStrings("/b.xml", p[1]);
++    try std.testing.expectError(error.BadLinkGraphs, paths("/a.xml"));
++    try std.testing.expectError(error.BadLinkGraphs, paths("/a.xml,/b.xml,/c.xml"));
++    try std.testing.expectError(error.BadLinkGraphs, paths(",/b.xml"));
++}
++
++test "each link's two ranks make it at the same step" {
++    for ([_]usize{ 4, 6, 8 }) |w| for (0..w) |r| {
++        const n = (r + 1) % w; // rank r's link 1 is rank n's link 0
++        const a = order(r);
++        const b = order(n);
++        const step_r = std.mem.indexOfScalar(usize, &a, 1).?;
++        const step_n = std.mem.indexOfScalar(usize, &b, 0).?;
++        try std.testing.expectEqual(step_r, step_n);
++    };
++}
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 4f1ab59d6..02caa5cd3 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -133,6 +133,7 @@ const Owned = struct {
+ };
+ 
+ const env = @import("sys").env;
++const links = @import("cuda_links.zig");
+ 
+ /// The send/recv the prompt exchange will use, connected now, before the weights fill memory (connected on first use,
+ /// ibv_reg_mr can fail): direct split (TF_GLM_PREFILL_REDUCE=split) reaches every peer; ring sends to the next rank
+@@ -140,6 +141,7 @@ const env = @import("sys").env;
+ /// some ranks reach only their neighbours (a ring of four without a switch) nothing is connected across it.
+ fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group, set: ranks.Settings) !void {
+     if (!set.split) return; // gather: all-gathers only, which NCCL's rings connect at the first collective
++    if (set.ring and g.links[0] != null and g.links[1] != null) return; // cuda_links connected both cables
+     const bytes = 4 << 20; // a prompt piece's exchange: every channel a large send/recv takes
+     var buf = try cuda.DeviceBuffer.alloc(d, 2 * bytes * g.world);
+     defer buf.free();
+@@ -228,6 +230,11 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
+     try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
+     own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
+     errdefer _ = own.group.lib.api.ncclCommDestroy(own.group.comm);
++    // TF_GLM_PREFILL_REDUCE=ring on a ring without a switch: a two-rank communicator on each cable (cuda_links)
++    if (p.world > 1 and set.ring) if (links.wanted()) |spec| try links.open(gpa, ctx.d, &own.group, spec);
++    errdefer for (own.group.links) |l| if (l != null) {
++        _ = own.group.lib.api.ncclCommDestroy(l);
++    };
+     if (p.world > 1) try warmPeers(ctx.d, &own.group, set);
+     cuda.p2p_report.afterInit(&diag, .{ .lib = &own.group.lib, .comm = comm, .d = ctx.d, .later = true });
+     const cap = capacity(o.context);
+diff --git a/zig/src/families/glm/cuda_relay.zig b/zig/src/families/glm/cuda_relay.zig
+index 34e681b08..b9bf65770 100644
+--- a/zig/src/families/glm/cuda_relay.zig
++++ b/zig/src/families/glm/cuda_relay.zig
+@@ -6,20 +6,35 @@ const cuda = @import("cuda");
+ /// The ring's plan, shared with every family's row-split exchange (cuda/relay_plan.zig).
+ pub const Relay = cuda.relay_plan.Relay;
+ 
++/// What an exchange posts on: the world communicator, and on a ring without a switch the two-rank link of each cable
++/// (cuda_links: [0] toward the previous rank, this rank its rank 1; [1] toward the next, this rank its rank 0). A ring
++/// step's send to the next rank and receive from the previous go over the links when both are open, as two-rank
++/// broadcasts rooted at the sender: NCCL picks a device of its own for a point-to-point send (on the world communicator
++/// or a link alike), and on a ring cabled port to like port it took one without that peer; a collective keeps to the
++/// link's graph file.
++pub const Wire = struct {
++    comm: cuda.nccl.Comm,
++    links: [2]cuda.nccl.Comm = .{ null, null },
++
++    fn linked(w: Wire) bool {
++        return w.links[0] != null and w.links[1] != null;
++    }
++};
++
+ /// A piece's partials (`part`: this rank's fp32 rows) into `room`'s slots on `side`; NCCL keeps a pair's posting order.
+-pub fn partials(lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, side: cuda.Stream, x: Relay, room: u64, part: u64, lo: usize, dims: usize) !void {
++pub fn partials(lib: *const cuda.nccl.Library, comm: Wire, side: cuda.Stream, x: Relay, room: u64, part: u64, lo: usize, dims: usize) !void {
+     for (1..x.world) |s| try lib.group(Step{ .lib = lib, .comm = comm, .side = side, .x = x, .s = s, .base = room, .part = part, .lo = lo, .dims = dims }, Step.partials);
+ }
+ 
+ /// A piece's glued rows (`rows_of`, bf16) to every rank, each step sending on what the last one brought in.
+-pub fn glued(lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, side: cuda.Stream, x: Relay, rows_of: u64, lo: usize, dims: usize) !void {
++pub fn glued(lib: *const cuda.nccl.Library, comm: Wire, side: cuda.Stream, x: Relay, rows_of: u64, lo: usize, dims: usize) !void {
+     for (1..x.world) |s| try lib.group(Step{ .lib = lib, .comm = comm, .side = side, .x = x, .s = s, .base = rows_of, .lo = lo, .dims = dims }, Step.glued);
+ }
+ 
+ /// Step `s` of an exchange: its postings, which `Library.group` puts in one group.
+ const Step = struct {
+     lib: *const cuda.nccl.Library,
+-    comm: cuda.nccl.Comm,
++    comm: Wire,
+     side: cuda.Stream,
+     x: Relay,
+     s: usize,
+@@ -29,10 +44,16 @@ const Step = struct {
+     dims: usize,
+ 
+     fn send(t: Step, src: u64, count: usize, ty: cuda.nccl.DataType) !void {
+-        try t.lib.check(t.lib.api.ncclSend(src, count, ty, @intCast(t.x.next()), t.comm, t.side.handle), "ncclSend");
++        // over the link: a broadcast from its rank 0 (this rank) to the next rank, in place. A collective runs on the
++        // link's graph file (its cable's devices); NCCL's point-to-point sends pick a device of their own, and on the
++        // Sparks' ring took the port toward the other neighbour (ibv_modify_qp: connection timed out)
++        if (t.comm.linked()) return t.lib.check(t.lib.api.ncclBroadcast(src, src, count, ty, 0, t.comm.links[1], t.side.handle), "ncclBroadcast (link)");
++        try t.lib.check(t.lib.api.ncclSend(src, count, ty, @intCast(t.x.next()), t.comm.comm, t.side.handle), "ncclSend");
+     }
+     fn recv(t: Step, dst: u64, count: usize, ty: cuda.nccl.DataType) !void {
+-        try t.lib.check(t.lib.api.ncclRecv(dst, count, ty, @intCast(t.x.prev()), t.comm, t.side.handle), "ncclRecv");
++        // over the link: the previous rank's broadcast (it is the link's rank 0), in the order it posts them
++        if (t.comm.linked()) return t.lib.check(t.lib.api.ncclBroadcast(dst, dst, count, ty, 0, t.comm.links[0], t.side.handle), "ncclBroadcast (link)");
++        try t.lib.check(t.lib.api.ncclRecv(dst, count, ty, @intCast(t.x.prev()), t.comm.comm, t.side.handle), "ncclRecv");
+     }
+     fn partials(t: Step) anyerror!void {
+         const x = t.x;
+@@ -141,8 +162,8 @@ const Fake = struct {
+     fn run(lib: *const cuda.nccl.Library, x: Relay, mode: Mode) !void {
+         const side: cuda.Stream = .{ .d = undefined, .handle = null };
+         switch (mode) {
+-            .ring_partials => try partials(lib, null, side, x, 0, 0, 0, 8),
+-            .ring_glued => try glued(lib, null, side, x, 0, 0, 8),
++            .ring_partials => try partials(lib, .{ .comm = null }, side, x, 0, 0, 0, 8),
++            .ring_glued => try glued(lib, .{ .comm = null }, side, x, 0, 0, 8),
+             .split_partials => try splitPartials(lib, null, side, x, 0, 0, 0, 8),
+             .split_glued => try splitGlued(lib, null, side, x, 0, 0, 8),
+         }
+-- 
+2.43.0
+

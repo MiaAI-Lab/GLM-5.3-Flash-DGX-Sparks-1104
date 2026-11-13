@@ -1,0 +1,12 @@
+info: p2p: rank 3 of 4: GPU 0 NVIDIA GB10 (0000000F:01:00.0); driver 580.178.04, CUDA driver API 13.3, NCCL 2.30.7
+info: p2p: peer access: TensorFold enables none itself (no cuCtxEnablePeerAccess); NCCL sets up its own peers
+info: p2p: set: NCCL_P2P_DISABLE=1, NCCL_SHM_DISABLE=1, NCCL_ALGO=Ring
+info: RoCE ring all-gather: rank 3 writes to ranks 2 and 0, relays to rank 1; shards up to 512 KiB by RDMA writes
+PASS roce-ring rank 3: shards of { 16, 48, 4096, 8192, 16384, 32768, 65536, 262144, 524288, 524304, 100 } bytes (seeds 1-3) equal NCCL's all-gather; 27 of 33 cases by the ring
+PASS roce-ring rank 3: a captured graph of 4 gathers of 8192 bytes replayed 64 times, each replay's rows its own
+PASS roce-ring rank 3: 4096 bytes a rank, 2000 calls: ring 14.4 us a call, NCCL 24.3 us
+PASS roce-ring rank 3: 8192 bytes a rank, 2000 calls: ring 16.0 us a call, NCCL 25.3 us
+PASS roce-ring rank 3: 16384 bytes a rank, 2000 calls: ring 20.3 us a call, NCCL 28.5 us
+PASS roce-ring rank 3: 32768 bytes a rank, 2000 calls: ring 25.8 us a call, NCCL 35.4 us
+PASS roce-ring rank 3: 65536 bytes a rank, 2000 calls: ring 36.4 us a call, NCCL 45.7 us
+info: p2p: NCCL transport (this rank's connections): rank 2 NET/IB (4 connections); rank 0 NET/IB (4 connections)

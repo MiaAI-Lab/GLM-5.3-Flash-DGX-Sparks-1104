@@ -1,0 +1,33 @@
+# gdb inside the follower's container (spark4, rank 1 of the spark3+spark4 pair, image daa6f2cde063, 2026-11-04 ~18:30 local)
+# after "thread 58 panic: attempt to use null value" under NCCL_RUNTIME_CONNECT=1 NCCL_CUMEM_ENABLE=1 NCCL_CUMEM_HOST_ENABLE=0
+# (TF_GLM_PREFILL_REDUCE=gather, TF_ROCE=0, local weights). Thread 1 is the main thread; the others wait or poll.
+Thread 1 (LWP 58 "tensorfold-nati"):
+#0  os.linux.aarch64.syscall4 (number=futex, ...) at /opt/zig/lib/std/os/linux/aarch64.zig:62
+#1  os.linux.futex_4arg (uaddr=0x3c23d74 <Io.Threaded.global_single_threaded_instance+1100>, val=2, timeout=0x0) at /opt/zig/lib/std/os/linux.zig:1193
+#2  Io.Threaded.Thread.futexWaitInner at /opt/zig/lib/std/Io/Threaded.zig:991
+#3  Io.Threaded.Thread.futexWaitUncancelable at /opt/zig/lib/std/Io/Threaded.zig:937
+#4  Io.Threaded.mutexLockUncancelable at /opt/zig/lib/std/Io/Threaded.zig:19800
+#5  Io.Threaded.scanEnviron at /opt/zig/lib/std/Io/Threaded.zig:15185
+#6  Io.Threaded.environString at /opt/zig/lib/std/Io/Threaded.zig:17873
+#7  debug.ElfFile.DebugInfoSearchPaths.native at /opt/zig/lib/std/debug/ElfFile.zig:73
+#8  debug.SelfInfo.Elf.Module.loadElf at /opt/zig/lib/std/debug/SelfInfo/Elf.zig:368
+#9  debug.SelfInfo.Elf.Module.getLoadedElf at /opt/zig/lib/std/debug/SelfInfo/Elf.zig:351
+#10 debug.SelfInfo.Elf.getSymbols at /opt/zig/lib/std/debug/SelfInfo/Elf.zig:48
+#11 debug.printSourceAtAddress at /opt/zig/lib/std/debug.zig:1253
+#12 debug.writeCurrentStackTrace at /opt/zig/lib/std/debug.zig:811
+#13 debug.defaultPanic at /opt/zig/lib/std/debug.zig:601
+#14 debug.FullPanic((function 'defaultPanic')).unwrapNull at /opt/zig/lib/std/debug.zig:140
+#15 Io.Threaded.Environ.scan at /opt/zig/lib/std/Io/Threaded.zig:317
+#16 Io.Threaded.scanEnviron at /opt/zig/lib/std/Io/Threaded.zig:15188
+#17 Io.Threaded.initLockedStderr at /opt/zig/lib/std/Io/Threaded.zig:14188
+#18 Io.Threaded.lockStderr at /opt/zig/lib/std/Io/Threaded.zig:14165
+#19 Io.lockStderr at /opt/zig/lib/std/Io.zig:2640
+#20 debug.lockStderr at /opt/zig/lib/std/debug.zig:302
+#21 log.defaultLog at /opt/zig/lib/std/log.zig:106
+#22 log.log at /opt/zig/lib/std/log.zig:72
+#23 log.scoped(.default).info at /opt/zig/lib/std/log.zig:166
+#24 p2p_report.logSink at /src/tensorfold/zig/src/cuda/p2p_report.zig:21
+# Reading: the first stderr lock scans the process environment (frame 15) and unwraps a null entry: the follower had
+# called unsetenv("NCCL_COMM_ID") (cuda_native.zig:210), which shortens libc's environ under the std library's
+# fixed-length view. The panic handler then deadlocks on the same mutex (frames 0-5) while printing the trace, so the
+# container logs show only the one line.

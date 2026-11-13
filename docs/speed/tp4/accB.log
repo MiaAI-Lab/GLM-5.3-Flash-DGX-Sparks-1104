@@ -1,0 +1,4 @@
+[tp4-runB] 1-stream prose: tok/s 56.2/56.0 | tok/round 2.05 | ms/round 36.6 | accepted 57% | sha b6ae240144bc
+[tp4-runB] 1-stream code: tok/s 85.3/84.5 | tok/round 3.77 | ms/round 44.4 | accepted 74% | sha 9b68d8a77151
+[tp4-runB] 4-stream prose, rep 0: total 115.2 tok/s | per stream 29.2 28.5 28.9 28.5 | tok/round 2.01 | ms/round 69 | accepted 62%
+[tp4-runB] 4-stream prose, rep 1: total 116.8 tok/s | per stream 29.9 29.4 29.3 28.2 | tok/round 2.07 | ms/round 71 | accepted 62%

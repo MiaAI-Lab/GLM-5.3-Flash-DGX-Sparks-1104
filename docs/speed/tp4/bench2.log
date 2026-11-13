@@ -1,0 +1,11 @@
+[tp4] http://192.168.1.143:8888 GLM-5.3-Flash
+  single prose: {'decode_tps': 56.055230683516726, 'ttft': 0.11717510223388672, 'sha': 'b6ae240144bc', 'tokens': 600}
+  single code: {'decode_tps': 84.87091415332569, 'ttft': 0.1299729347229004, 'sha': '9b68d8a77151', 'tokens': 600}
+  prefill 16K: {'prompt_tokens': 15884, 'ttft': 9.063924312591553, 'prefill_tps': 1752.4418179368552}
+  prefill 64K: {'prompt_tokens': 63931, 'ttft': 33.84982514381409, 'prefill_tps': 1888.6655906901522}
+  conc2: {'per_stream_tps': [43.9, 42.7], 'sum_tps': 86.6, 'ttft_max': 0.3049204349517822}
+  conc4: {'per_stream_tps': [30.3, 29.5, 29.1, 29.5], 'sum_tps': 118.4, 'ttft_max': 0.6120197772979736}
+  mixed1: {'long_prompt_tokens': 50495, 'long_ttft': 44.46, 'decoders': [{'before_tps': 63.6, 'during_tps': 19.8, 'gap_p50': 35, 'gap_p95': 53, 'gap_max': 2648, 'after_tps': 58.4}]}
+  mixed3: {'long_prompt_tokens': 50613, 'long_ttft': 44.74, 'decoders': [{'before_tps': 38.7, 'during_tps': 12.8, 'gap_p50': 60, 'gap_p95': 2482, 'gap_max': 2684, 'after_tps': 43.5}, {'before_tps': 38.8, 'during_tps': 12.1, 'gap_p50': 60, 'gap_p95': 2481, 'gap_max': 2684, 'after_tps': 41.8}, {'before_tps': 31.6, 'during_tps': 11.1, 'gap_p50': 60, 'gap_p95': 2481, 'gap_max': 2684, 'after_tps': 34.0}]}
+  prefill pair: {'alone_ttft': 16.46, 'alone_tokens': 30310, 'pair_ttft': [16.43, 33.77], 'pair_tokens': [30259, 30434]}
+[tp4] done

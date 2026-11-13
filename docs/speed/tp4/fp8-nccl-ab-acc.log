@@ -1,0 +1,4 @@
+[fp8-nccl-ab] 1-stream prose: tok/s 45.0/45.0 | tok/round 2.17 | ms/round 48.1 | accepted 59% | sha b363136de28e
+[fp8-nccl-ab] 1-stream code: tok/s 65.2/65.3 | tok/round 4.17 | ms/round 63.8 | accepted 78% | sha d240a39d8c68
+[fp8-nccl-ab] 4-stream prose, rep 0: total 80.7 tok/s | per stream 20.6 20.3 20.1 19.8 | tok/round 2.04 | ms/round 101 | accepted 60%
+[fp8-nccl-ab] 4-stream prose, rep 1: total 82.6 tok/s | per stream 21.2 20.8 20.0 20.5 | tok/round 2.13 | ms/round 103 | accepted 64%

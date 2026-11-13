@@ -1,0 +1,4 @@
+[tp4] 6-stream rep0: total 141.0 tok/s | per stream 24.3 23.5 24.1 22.7 22.8 23.7 | tok/round 2.03 | ms/round 86 | wall 14s
+[tp4] 6-stream rep1: total 139.0 tok/s | per stream 24.0 22.9 23.5 22.7 22.8 23.3 | tok/round 2.02 | ms/round 87 | wall 14s
+[tp4] 8-stream rep0: total 163.1 tok/s | per stream 21.4 21.7 20.5 20.7 19.8 19.6 20.3 19.1 | tok/round 2.00 | ms/round 98 | wall 16s
+[tp4] 8-stream rep1: total 166.4 tok/s | per stream 23.0 20.8 21.0 20.9 20.1 20.4 19.4 20.8 | tok/round 2.03 | ms/round 97 | wall 16s

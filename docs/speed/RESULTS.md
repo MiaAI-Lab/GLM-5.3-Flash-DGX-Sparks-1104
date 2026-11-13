@@ -1482,3 +1482,490 @@ lane upstream now releases deferred around its trace is left decoding on this st
 on streams that cannot start; 0104 added the fill-queue yield checks), so every round carries a ghost stream. Not
 pursued further: the leak it fixes needs a failed trace, which the pair has never logged. 0106 stays in candidates as
 a record; the recipe is back at 105 patches; spark1's build tree likewise.
+
+## TP=4 on the four-Spark ring: the launcher, the first two boots, Codex's read, 0106 pre-registered (2026-11-04, 16:00-19:30 local)
+
+**The ask.** Pair A stopped (16:17 local; stop.sh archived its logs), the recipe cloned to spark1 as
+`~/TF/GLM-5.3-Flash-EXL3-2x-DGX-Spark-TensorFold-Zig` (mia's login), and a `start-tp4.sh` that serves on
+spark1 (rank 0) with spark2, spark3, spark4 as ranks 1-3, every rank reading the weights from spark1. The kit is cabled as
+a ring without a switch (spark1-spark2 10.0.22.x, spark2-spark3 10.0.33.x, spark3-spark4 10.0.34.x, spark4-spark1
+10.0.41.x; a port and its PCIe twin at .N/.10N; 10.0.0.N aliases on lo routed over the cables; the LAN on enP7s7).
+The "ideas" source: the lab's own TensorFold recipe on spark1 (`~/newMod/GLM-5.3-Flash-EXL3-TensorFold`,
+start-tp4-switchless.sh + scripts/nodes.sh), which ran TP=4 on this ring with v1.0.7 and its own ring patches.
+
+**What was built** (commit e7ae4ef, then 349b9f7): `scripts/tp4.sh` (ring discovery from each Spark's ConnectX-7
+addresses, NCCL graph files per rank with channels on the devices toward the previous rank, NCCL_ALGO=Ring,
+NCCL_CROSS_NIC=1, NCCL_IB_SUBNET_AWARE_ROUTING=1, NCCL_IB_SUBNET_PREFIX_LEN=26, no NIC fusion / P2P / SHM, image shipping
+to the three workers, NFS volumes per worker from the head's address on that worker's route, a memory guard over four),
+`start-tp4.sh` (start.sh's flow for four ranks; TF_GLM_PREFILL_REDUCE=gather, TF_ROCE=0, NCCL_COMM_ID on what spark1's
+name resolves to, 10.0.0.1) and `stop-tp4.sh`. config.sh gains the four-Spark settings; prepare.sh validates them only
+under start-tp4.sh (TP=2 unchanged). Weights: spark1's Hub snapshot 078455ff is byte-identical to the pin 76c0b517 in
+every shard and config file (checked against spark3's served copy; the commits between them touch the model card and
+licenses), so a flat hard-linked dir `~/.cache/huggingface/glm53-1104/{model,dflash2}` inside the directory spark1's
+ablit-nfs container already exports as `/huggingface` serves rank 0 locally and the workers over NFS
+(NFS_MODEL_PATH=/huggingface/glm53-1104/model; spark3, across the ring, mounts 10.0.0.1 through spark2). Image
+d3acd712b31c shipped to spark2 (spark3/4 had it). DRY_RUN on spark1 found the ring in rank order, GID 3 on every device,
+prefix 26, and the right devices per direction.
+
+**Boot 1 (16:34 local, 105 patches):** all four ranks up to NCCL; rank 2 (spark3) `ncclCommInitRank: unhandled system
+error`, rank 0 `rank 2 stopped (ncclCommInitRank)`, 91 s in. **Boot 2 with NCCL_DEBUG=INFO:** the rings are right
+(`Ring 00 : 3 -> 0 -> 1`, `1 -> 2 -> 3`; subnet-aware routing moves each send onto the next rank's /26), but NCCL's
+tree for four ranks is `Tree 0 : -1 -> 0 -> 2`, and the engine sets NCCL_RUNTIME_CONNECT=0 (cuda_native.zig:205, so a
+full GB10 never registers a channel late), which connects every algorithm's channels at init regardless of
+NCCL_ALGO: `ibv_modify_qp failed with 110 Connection timed out ... local GID ::ffff:10.0.41.1, remote GID
+::ffff:10.0.33.3` (rank 0's port toward spark4 trying to reach spark3), 35 retries, then the error.
+
+**Codex (gpt-6.1, xhigh, read-only over the engine tree + the 105 patches; docs/speed/codex-tp4.md):** it named the
+same two blockers and one I had not: (1) `warmPeers` (cuda_native.zig:138) posts a 4 MiB send+recv to EVERY rank
+before the weights load, so even with the trees out of the way the two ranks across the ring would be connected; its
+least-risk shape is mode-aware (split: every peer; ring: send next / receive previous; gather: no p2p, the rings connect
+at the first collective), not "warm and ignore failures"; (2) the eager connect above - NCCL 2.30.7's eager branch
+connects rings, trees and PAT, so NCCL_RUNTIME_CONNECT=1 with NCCL_CUMEM_ENABLE=1 (host cuMem buffers still off) is the
+experiment; (3) the rest of the GLM family and the 105 patches hold no other all-pairs p2p at world 4 (0034's p2p and
+0035/0063's copy-engine exchange are guarded out; 0051's "pair" is two prompt chunks; "TP3" in 0033/0063/0065 are test
+fixtures covering worlds 1-8); DFlash2 splits its MLP only at world 2 (full MLP per rank at four, more replicated
+work); (4) broadcasts from non-zero roots are fine under Ring; subnet-aware routing applies to p2p too but "retains the
+default device" when no subnet matches, so it never repairs a cross-ring choice; (5) the lo alias 10.0.0.1 works as
+NCCL_COMM_ID (the explicit-COMM_ID matcher does not exclude lo), the LAN address would be the simpler choice;
+tp_watch wants a literal IPv4; (6) memory: 6,380 KV bytes a token a rank at any TP, one 1M window 2,049 pages = 6.23
+GiB, eight windows + seven fixed parts ~51.0 GiB of the limiting rank's room; with ~55 GiB more room than TP=2 expect
+eight windows and the full 16 GiB default prompt cache; there is no ninth-window cliff at --parallel 8; (7) TP=2's
+token_sha is not a TP=4 acceptance gate (different partitioning, different fp grouping) - use a TP=4 greedy, draft-off,
+cache-cold baseline and require repeatability, draft on/off equality, solo/concurrent equality.
+
+**Decision:** both of Codex's fixes, as it shaped them. Launcher (349b9f7): NCCL_RUNTIME_CONNECT=1,
+NCCL_CUMEM_ENABLE=1, NCCL_CUMEM_HOST_ENABLE=0 on every rank. Engine candidate **0106**
+(docs/speed/candidates/0106-glm-cuda-the-start-s-peer-warm-up-follows-the-prefil.patch; the killed lane fix that
+carried the number 0106 earlier today stays in candidates as a record and never entered the recipe): warmPeers takes
+the rank Settings; `!set.split` returns before any posting; ring posts send(next) and recv(prev) only; split is
+unchanged. Built on spark1 as image **daa6f2cde063** (106 patches, ~7 min); cold host tests on spark5
+(docs/speed/tp4/hosttest-0106.log).
+
+**Pre-registered gates for boot 3 (image daa6f2cde063, gather, reserve 12, PARALLEL=8, CONTEXT=auto):**
+- GO-1 (boot): all four ranks reach the API and the smoke passes; the four NCCL logs show no `ibv_modify_qp` retry
+  and no QP toward a GID off the rank's two cables; rank 0's startup line names 8 streams, the pages and a prompt
+  cache above 0 with no "cannot keep one state".
+- GO-2 (quality, from spark5's harness): acc.py greedy run twice gives the same token_sha each time; `draft: false`
+  on the same prompts gives the same tokens; the 4-stream contract hashes equal the 1-stream ones.
+- KILL: a rank that fails to start, any cross-ring QP, a smoke answer that is garbage, or a token_sha that differs
+  between two greedy runs. Speed is recorded, not gated (no TP=4 band exists yet; TP=2 is 38.4 / 56.6 at one stream).
+
+**Boots 3 and 4 (image daa6f2cde063, 17:00-18:15 local):** past NCCL init (no cross-ring QP: the trees are never
+connected under NCCL_RUNTIME_CONNECT=1), rank 0 hashed the checkpoint in 44.7 s, but all three workers stopped three
+seconds in with `thread N panic: attempt to use null value` and no trace (the panic handler hung). Bisected on the
+spark3+spark4 pair with the same image: NFS weights alone fine (spark4 read the 163.6 GiB from spark1 in 41.9 s),
+gather + TF_ROCE=0 fine, the ring/routing NCCL knobs fine, **NCCL_RUNTIME_CONNECT=1 + NCCL_CUMEM_ENABLE=1 reproduce
+it on the follower**. gdb inside that container (every thread's backtrace, docs/speed/tp4/gdb-follower.txt): the
+follower's main thread is in Zig's standard library, `Io.Threaded.Environ.scan` under `lockStderr` from the first
+`std.log` after NCCL init (`p2p_report.logSink`), unwrapping a null entry of the process environment. The engine's
+follower had just called `unsetenv("NCCL_COMM_ID")` (cuda_native.zig:210, when NCCL_SOCKET_IFNAME is set), which
+shortens libc's environ under the std library's fixed-length view of it; with eager connect the first stderr lock
+happened earlier and never saw it. Launcher fix (b9e87c2), no rebuild: NCCL_COMM_ID on spark1's LAN address
+(192.168.1.143, what the default route leaves with; Codex's choice too) and NCCL_SOCKET_IFNAME to rank 0 only, so a
+follower keeps NCCL_COMM_ID and NCCL picks its bootstrap interface by that subnet. The engine-side bug (an unsetenv
+after start is unsafe under Zig 0.17's std) is noted for upstream, not patched here. The lab's DeepSeek 4x recipe,
+checked on the user's pointer, runs the same ring design (graph files, Ring-only, /26, NFS from spark1) on a different
+engine family whose own rendezvous never unsets NCCL_COMM_ID.
+
+**Boot 5 (image 74e19a63a9a5 = the same 106 patches relabelled after patch 0078's credit text changed on main at 19:07; the launcher built it on spark1 and shipped it to the three workers itself; LAN bootstrap, 19:22 local): GO-1 met.** All four ranks up, loaded in
+125.6 s (the workers' digests over NFS 40-45 s each), smoke "ready". Every rank's NCCL report names exactly its two
+neighbours (`rank 0 NET/IB (4 connections); rank 2 NET/IB (4 connections)` on rank 1, and so round the ring): nothing
+crosses the ring. Rank 0's startup line: model 45.61 GiB a rank; 8 streams, 16,392 pages of 512 rows (49.87 GiB, eight
+1M windows, as Codex computed) of 55.8 GiB left after the 12 GiB reserve, 331 MiB fixed a stream, a **3.6 GiB prompt
+cache** a rank, no "cannot keep one state". KV pool 8,392,704 tokens shared by 8 streams, one request up to
+1,048,576. Available memory with the server idle: spark1 12.4 GiB, spark2 14.5, spark3 12.2, spark4 14.5 (the
+memguard floor is 2.5). Settings on spark1 (scripts/local.sh, untracked): PARALLEL=8, CONTEXT=auto (1,048,576 fit
+first try), KV=fp8, DENSE=q8, HEAD=q8, ABSORB_MMA=1, HOST_CACHE_GIB=0, MEMORY_RESERVE_GIB=12, WORKER_WEIGHTS=nfs,
+NFS_MODEL_PATH=/huggingface/glm53-1104/model, MODEL_REVISION=078455ff (byte-identical to the pin), PORT=8888.
+
+**GO-2 met (19:30-20:05 local, spark5's harness against spark1:8888; logs in docs/speed/tp4/):** two acc.py runs give
+the same token_sha each time (prose `b6ae240144bc`, code `9b68d8a77151`; not the pair's hashes, as pre-registered: a
+different partition); `draft: false` gives the same 600 prose tokens and hash as drafts on; the 4-stream contract
+runs returned whole. The TP=4 band, greedy, against pair A's on the same harness:
+
+| | pair A (TP=2, 105 patches) | four Sparks (TP=4, 106 patches) |
+|---|---|---|
+| 1 stream prose / code (tok/s) | 38.4 / 56.6 | 56.0-56.2 / 84.5-85.3 (ms/round 36.6 / 44.3, accepted 57% / 74%) |
+| 4 streams prose, total | 79-81 | 115-120 |
+| 6 / 8 streams prose, total | 94-95 / 105-106 | 139-141 / 163-166 |
+| prefill 16K / 64K (tok/s) | ~1,600-1,800 | 1,752 / 1,889 (TTFT 9.1 s / 33.8 s) |
+| conc2 / conc4 total | - / 79-81 | 86.6 / 118.4 |
+| mixed1: decoder before / during / after a 50K prefill | - | 63.6 / 19.8 / 58.4 tok/s (gap p95 53 ms, max 2.6 s) |
+| prefill pair (30K + 30K) | - | 16.4 s alone; 16.4 s and 33.8 s as a pair |
+
+Decode +46% at one stream, +48% at four, +55% at eight; prefill about the pair's (the ring's exchanges go round four
+hops). Available memory after the benches: spark1 12.2 GiB, spark2 14.0, spark3 11.9, spark4 14.2. Not measured yet:
+PREFILL_REDUCE=ring (the split prefill's rows passed along the ring; the engine's own neighbours-only mode) against
+gather, sampled decode at T=0.7, and a long soak. 0106 is in patches/engine; the served image is 74e19a63a9a5 on all four Sparks (daa6f2cde063 is the same code under the earlier label).
+
+## Block FP8 on the ring: unsloth/GLM-5.3-Flash-FP8 at TP=4, candidate 0107 pre-registered (2026-11-04, 20:10-21:00 local)
+
+**The ask:** serve `unsloth/GLM-5.3-Flash-FP8` (a160e229: quant_method fp8, e4m3, 128 x 128 block scales, 62 shards,
+305.8 GiB) at TP=4. The engine admitted only ModelOpt NVFP4, MIXED_PRECISION and EXL3; its generic expert layer
+already had a block-FP8 format (fp8g, fp8_experts.cu, decode and prompt kernels, used by other families), and GLM's
+lane already read block-FP8 projections (fp8_pb) for the shared expert and the DSA projections of ModelOpt mixed
+checkpoints. **Codex (docs/speed/codex-fp8.md, the brief beside it)** confirmed the plan and corrected three things:
+admission must come before config.parse (it does, cuda_engine.zig), the dense MLP needs its own FP8 arm (added), and
+patch 0014 keeps the target MTP layer out beside DFlash2 (so its FP8 experts load only in plain MTP mode). It also
+said: the fp8g kernels compute bf16 activations x widened e4m3 weights with fp32 accumulation and the block scale
+applied per 128-input block (no dynamic activation quantizer: storage support, not equivalence to vLLM's W8A8 math);
+the prompt kernel is complete; no sm_121 refusal; the checkpoint's router/bias and the shared slot need nothing;
+staging per layer could be leaner (left as the NVFP4 path has it); TF_GLM_LOAD_PREFETCH=0 for the first boot.
+
+**Candidate 0107** (docs/speed/candidates/0107-glm-cuda-block-FP8-checkpoints-...patch): cuda_fp8block.zig (admission:
+fp8, e4m3, [128, 128], else refused by name; tests), config.fp8, formats.Declared.fp8_block (bf16 or fp8_pb, never
+NVFP4/MXFP8; test), formats.scaleName (weight_scale or weight_scale_inv) used by both the format probe and the
+reader, cuda_weights.fp8Experts (the rank's 512 rows of gate/up, 512 inputs of down, Fp8Experts.packGateUp/packOne,
+scales [E][2][4][32] and [E][1][32][4]), Kernels.fp8 beside nvfp4 with Grouped dispatch by format, the dense MLP's
+fp8g arm, the tiler's exclusion, 128-row expert shards. Download of the checkpoint to spark1's exported cache
+(`~/.cache/huggingface/glm53-fp8/model`, pinned) ran at ~250 MB/s.
+
+**Pre-registered gates (FP8=1 ./start-tp4.sh on spark1, image with 0107, gather, reserve 12, PARALLEL=8, CONTEXT=auto):**
+- GO-1 (boot): all four ranks load (no UnreadableFormat / FormatNotLoaded / BadFp8Share / RankMismatch), rank 0's
+  startup line shows the weights at ~80 GiB a rank, 8 streams, 2 to 4 1M windows and a prompt cache above 0; the
+  smoke passes; `TF_CUDA_MEMORY_RECEIPTS=1` receipts kept.
+- GO-2 (quality): greedy acc.py twice gives the same hashes; drafts off equals drafts on; the paired per-token NLL on
+  the held passages (the harness used for the DENSE/HEAD/ABSORB gates) at most equal to the EXL3 TP=4 pack's within
+  noise, expected better (FP8 against 4 bpw); the ten greedy answers read as answers (the "spell necessary backwards"
+  check included).
+- KILL: a rank that refuses the checkpoint, garbage or repeated-character output, an NLL worse than EXL3's by more
+  than 0.02 nats a token, or a memory floor under 5 GiB on any Spark after a 100K prefill. Speed is recorded only.
+
+**0107 built and the FP8 checkpoint served on the first boot (image cb33a3d5fc68 = 107 patches; 21:35 local).**
+Cold host tests on spark5 (docs/speed/tp4/hosttest-fp8.log): the four targets compile and pass but for the three
+known cuda-host steps (and the FP8-KV runner flake: its binary passes 20/20 run directly). The download finished at
+306 GiB (62 shards, `.revision` a160e229), the workers see it over NFS. `FP8=1 TF_GLM_LOAD_PREFETCH=0
+TF_CUDA_MEMORY_RECEIPTS=1 ./start-tp4.sh` on spark1: admitted, every rank's digest (305.8 GiB; rank 2 over NFS through
+spark2 in 134.5 s), the FP8 experts packed and uploaded, loaded in 757.5 s, smoke "ready". Rank 0's startup line:
+**model 80.70 GiB a rank** (projected ~80), 8 streams, **5,871 pages = 3.0M tokens** (17.86 GiB) of 20.1 GiB left
+after the 12 GiB reserve, **no prompt cache** ("cannot keep one state": the minimum state is 0.17 GiB; to be fixed by
+the reserve, below). Each rank's NCCL connects only to its two neighbours; no refusal, no FormatNotLoaded. Idle
+memory: spark1 13.1 GiB available, spark2 14.9, spark3 12.4, spark4 14.9.
+
+**GO-2 quality (docs/speed/tp4/quality-fp8-tp4.log against quality-exl3-tp4.log, both at TP=4):** 4-passage NLL
+**0.7425 against EXL3's 0.7487 (-0.0063; three passages better, the mitochondrion one 0.518 -> 0.555)**; nine of the
+ten greedy answers byte-identical to EXL3's (which equal the pair's, sha 11ceddde19d4), the exception "What is the
+7th prime number? Number only." - EXL3 "17", FP8 a rambling enumeration ("7 is not prime (7 = 1 x 7, wait, actually
+7 IS prime). Let me list the primes ...") cut at the answer limit. Within the pre-registered gate (NLL not worse,
+no garbage), noted as the one visible behavioural difference of the FP8 math (bf16 activations x widened e4m3, per
+Codex) on these ten prompts. "necessary" backwards is right.
+
+**GO-2 speed and repeatability on FP8 (docs/speed/tp4/fp8-acc{A,B}.log, fp8-draft.log):** two acc.py runs give the
+same hashes (prose `b363136de28e`, code `d240a39d8c68`); drafts off equals drafts on. Greedy, against the EXL3 pack on
+the same four Sparks:
+
+| | EXL3 4bpw (TP=4) | FP8 (TP=4) |
+|---|---|---|
+| 1 stream prose / code | 56.0-56.2 / 84.5-85.3 tok/s | 44.6-44.8 / 65.1-65.2 (ms/round 48.4 / 63.9; accepted 59% / 78%) |
+| 4 streams prose, total | 115-120 | 83-87 |
+| weights a rank / KV pool | 45.6 GiB / 8.4M tokens | 80.7 GiB / 3.0M tokens |
+| 4-passage NLL | 0.7487 | 0.7425 |
+
+FP8 decodes ~20% slower than the 4-bit pack (twice the expert bytes a round, bf16 x widened e4m3 on the tensor
+cores) and scores better on the held passages; the pair at TP=2 (38.4 / 56.6) stays below both.
+
+**FP8 prefill and mixed (docs/speed/tp4/fp8-bench2.log; memory sampled every 5 s on all four Sparks, fp8-mem.log):**
+prefill 16K 1,746 tok/s (TTFT 9.1 s), 64K 1,787 (35.7 s) - the same as EXL3's 1,752 / 1,889 at TP=4: prefill is not
+bound by the expert bytes. conc2 64.5 total, conc4 83.5; mixed1 decoder 52.9 before / 17.3 during / 48.6 after a 50K
+prefill (gap p95 72 ms, max 2.8 s); a 30K pair 35.3 s and 22.1 s against 17.5 s alone. Lowest available memory during
+the bench: spark1 12.3 GiB, spark2 14.3, spark3 11.9, spark4 14.3 (the KILL floor was 5): the reserve goes to 9.5 on
+the next restart, as on the pair, for a prompt cache.
+
+**Restart at reserve 9.5 (22:20 local):** rank 0's line: model 80.70 GiB, 8 streams, **6,147 pages = 3.15M tokens**
+(three 1M windows, 18.70 GiB) and a **1.2 GiB prompt cache** a rank, no "cannot keep" warning: the projection held.
+
+**Where an FP8 decode round goes (TF_GLM_PROF=1 on this restart; rank 2's report, 64 verify calls of 2 draft rows
+each, greedy prose then code, docs/speed/tp4/fp8-prof.txt):** GPU 36.6 ms a call: routed experts **17.5 ms (48%)**,
+KDA 7.0, MLA 3.4, the two NCCL all-gathers a layer **gather_a 2.26 + gather_b 2.33 = 4.6 ms (12.5%)**, router 2.5,
+head 0.7, dense 0.65, shared 0.3; the harness's 48 ms a round leaves ~11 ms outside the GPU sections (host launches,
+the lane, the sampler's exchange). Reading: with two draft rows a layer touches up to 16 distinct experts, 96 MiB of
+e4m3 a rank a layer, 4 GiB a round, which at the GB10's bandwidth is ~20 ms: the routed section is byte-bound, and
+the FP8 pack pays twice EXL3's bytes there (EXL3's round is 37 ms). The DeepSeek 4x recipe's levers mapped onto this
+stack: its expert path is MXFP4 (4-bit, not FP8), so its decode numbers do not say FP8 can match a 4-bit pack; its
+RDMA ring relay for the decode gathers (RDMA=1, their patch 0001; the lab's older Python-engine 0099) would attack the
+4.6 ms of NCCL gathers (plus part of the host gap), ~5-10% of a round at one stream; its side stream, PDL and profiler
+we have (0006/0010, TF_GLM_PDL_CHAIN all, TF_GLM_PROF); its L2 prefetch of the next layer's weights during the
+exchanges (pair B's 0046) we do not; its quarter-HC / owner-gather and indexer sharding (WP4-WP6) are prefill levers
+of the same kind as pair B's 0102/0104 (own front, micro-batches: +9-13% prefill on this ring), which this engine's
+GLM family lacks; CUDA-graph replay of decode rounds (their GRAPHS=1) this GLM path does not do (PDL chain instead).
+Prefill at TP=4 (1,750-1,890) barely above TP=2 (1,600-1,800): exchange-bound, the engine's own PREFILL_REDUCE=ring
+is the first cheap test (running).
+
+**Codex on the four-rank RoCE ring gather (docs/speed/codex-roce-ring.md):** pre-register design (1), the engine's
+two-rank one-shot protocol (roce.zig) extended for an explicitly enabled ring of four in a sibling module: each rank
+writes its whole shard to both neighbours, each neighbour forwards one logical half to the rank across, six flags a
+gather (two from each of three sources), the same stage / doorbell / proxy / flags / rank-order copy / device epoch
+sequence. Expected 20-40 us a 16 KiB-a-rank gather against NCCL's ~109: with ~90 eligible calls a round, 6-8 ms of
+the 48 ms FP8 round (about a fifth). Effort 4-7 person-days plus 1-3 hardware days; design (3), two matched two-rank
+gathers in alternating pairs ((0,1),(2,3) then (0,3),(1,2); 30-50 us; 2-4 days) is the fallback; adapting
+fabric/tp's roce_multi (2) costs the most integration. The traps it lists (relay lifetime and retirement, per-hop
+ordering, immutable half ownership, poison and abort through tp_watch, u32 epoch rollover, one device a cable in
+TF_ROCE_HCA with a GID each) and the test plan (fake wire with planted controls, a four-rank tf-cuda-test roce-gather)
+are in the file. Not started: a decision for the user (days of engine work for ~15% of a decode round).
+
+**PREFILL_REDUCE=ring: KILLED on this fabric (22:40 local).** With the engine's ring mode the start stops at rank 3's
+first grouped send/receive to its neighbours: `ncclGroupEnd: unhandled system error`. The same failure the lab's older
+recipes met on this ring: a point-to-point send on the world communicator takes a device NCCL picks (subnet-aware
+routing cannot repair the receiver's choice), on a ring cabled port to like port half the time one without that peer.
+Both the DeepSeek 4x recipe (two-rank link communicators per cable, TF_DS_LINK_GRAPHS) and pair B's 0098 (TF_NCCL_RING)
+solved it with a communicator per cable carrying its own graph file; this engine's cuda_relay sends on the world
+communicator. So `gather` stays the TP=4 default and the prefill lever is engine work: either per-link communicators
+for cuda_relay's ring (the lab's design) or own-front / micro-batch style exchange cuts. The server is back on gather.
+
+**Back on gather (23:05 local): 6,147 pages, 1.3 GiB prompt cache. FP8 at 6 / 8 streams (docs/speed/tp4/fp8-acc8.log):
+98-100 / 112-114 tok/s total (per stream 16-17 / 13-16; ms/round 125 / 145) against EXL3's 139-141 / 163-166.**
+The FP8 serve is the live state; the EXL3 pack returns with `./start-tp4.sh restart` without FP8=1.
+
+## The four-rank RoCE ring all-gather: candidate 0108 pre-registered (2026-11-04, 23:30 local)
+
+**What (engine patch 0108, docs/speed/candidates/0108-*):** Codex's design (1) as a sibling of roce.zig: a new
+`zig/src/cuda/roce_ring.zig` + `roce_ring_gather.cu`, opt-in with `TF_ROCE_RING=1` at world 4 (`TF_ROCE=1` as well;
+`TF_ROCE_HCA` names the device cabled to the previous rank, then the one to the next). Each gather: the kernel
+stages the shard and rings the doorbell; the proxy writes the shard to both neighbours (data, then one flag line a
+logical half); on every loop turn it relays the left neighbour's half 0 on to the right and the right neighbour's
+half 1 on to the left (the original source's slot and flag address kept, so a flag lands after its data on the same
+queue pair); the kernel waits six flags (two halves from each of left, right and across) and copies the four shards
+out in rank order; the last block advances the epoch (graph replays as in roce.zig). Relay lifetime: a rank posts
+its own sequence s only after its relays of s-1 are posted and their completions reaped; a neighbour cannot start
+s+1 without this rank's s, so no slot is overwritten under a relay. The kernel's own dependency (every rank's shard of
+the same sequence) keeps a rank's kernel s finished before any s+2 lands. Flag timeouts poison the counters and the
+host's `check()` after a synchronize raises `ProxyFailed` (tp_watch's abort path, as the two-rank path). The launcher's
+knob `ROCE_RING=on` (default off) sets the three variables per rank from the fabric detection. roce.zig's verbs ABI,
+HCA naming and GID lookup become `pub` for the sibling; nothing else in the two-rank path changes.
+
+**Gates (fixed before the first run):**
+- GO-1 (bytes): `tf-cuda-test roce-ring <rank>` on the four Sparks: shards of 16, 48, 4096, 8192, 16384, 32768,
+  65536, 262144 and 524288 bytes a rank over 3 seeds equal NCCL's all-gather byte for byte (the odd pack counts take
+  the uneven split of halves); a captured graph of 4 gathers replayed 64 times, each replay's rows its own.
+- GO-2 (time): the warmed 16 KiB-a-rank gather under 40 us a call (NCCL's measured ~109 us); 4-64 KiB reported.
+- GO-3 (serve): FP8 at TP=4 with `ROCE_RING=on` boots, the quality tool's NLL and the greedy answers' hashes equal the
+  NCCL path's (b363136de28e / d240a39d8c68, NLL 0.7425); decode at 1 stream above 44.7 / 65.2 tok/s (prose / code)
+  by at least 5%, and 4 streams above 83-87 by at least 5%.
+- KILL: any byte mismatch, a hang or a poisoned gather in the device test, a boot that does not come up on all four
+  ranks, a quality or hash difference, or a decode gain under 3% at 1 stream (then NCCL keeps the gathers and the
+  patch stays a candidate with its numbers recorded).
+- Bounded failures: a rank that cannot bring the path up (no device, a refused queue pair) makes all four fall back to
+  NCCL together (the verdict all-gather), never a mixed world.
+
+**Built and tested (22:20-22:50 local).** Host unit tests on spark5: the cuda module's tests pass with the new module
+(the same three pre-existing failing steps as every run today); `tf-cuda-test` compiles with the ring kernel. Image
+5d37e5287d7b (108 patches) built on spark1 in 360 s of zig and shipped to spark2/3/4 (one image id on all four).
+`tf-cuda-test roce-ring <rank>` on the four Sparks in that image, with the serve's ring NCCL environment and
+`TF_ROCE_HCA` per rank (docs/speed/tp4/ring-devtest-rank{0..3}.log):
+
+| | result |
+|---|---|
+| GO-1 bytes | PASS on all four ranks: 11 sizes x 3 seeds equal NCCL's all-gather (27 of 33 cases by the ring, the rest NCCL by size); a graph of 4 gathers replayed 64 times, each replay's rows its own |
+| GO-2 time (us a call, 2000 back-to-back, warmed) | ring / NCCL: 4 KiB 14.4 / 24.3; 8 KiB 16.0 / 25.3; 16 KiB 20.3 / 28.5; 32 KiB 25.8 / 35.4; 64 KiB 36.4 / 45.7 |
+
+GO-2 met (20.3 us at 16 KiB, under 40). Note the NCCL side: back-to-back on an idle device NCCL takes 28.5 us a call
+here, not the ~109 us Codex took from the decode profile (that figure holds the engine's dependent launches and
+stream waits); the ring saves 8-10 us a call at decode sizes against this measurement, so the serve's gain will be set
+by the engine's gather sections (gather_a + gather_b 4.6 ms a round on FP8) rather than the device-test delta.
+
+**Serve (23:15 local):** `FP8=1 ROCE_RING=on ./start-tp4.sh` on image 5d37e5287d7b: all four ranks report
+"RoCE ring all-gather: rank r writes to ranks L and R, relays to rank F; shards up to 4096 KiB by RDMA writes";
+6,147 pages, 1.5 GiB prompt cache, smoke test passed. GO-3 measured below.
+
+**GO-3 measured (23:20-23:45 local, spark5's harness; docs/speed/tp4/fp8-roce-acc{A,B}.log, fp8-roce-bench2.log,
+fp8-roce-acc8.log, quality-fp8-roce-tp4.log) against the FP8 NCCL numbers of 21:00-23:05 on image cb33a3d5fc68:**
+
+| | FP8, NCCL gathers | FP8, ring gathers (0108) |
+|---|---|---|
+| 1 stream prose / code, tok/s | 44.6-44.8 / 65.1-65.2 | 45.5-45.7 / 66.0-66.3 (+2.0% / +1.6%) |
+| ms/round prose / code | 48.4 / 63.9 | 47.3-47.5 / 62.8-63.1 (about 1 ms a round) |
+| 4 streams prose, total | 83-87 | 85.2-88.5 |
+| 6 / 8 streams, total | 98-100 / 112-114 | 99.9-101.3 / 112.8-116.3 |
+| prefill 16K / 64K, tok/s | 1746 / 1787 | 1658 / 1770 |
+| hashes prose / code | b363136de28e / d240a39d8c68 | the same |
+| 4-passage NLL, answers_sha | 0.74246848208233, 25789b7aa3d9 | the same to every digit |
+| rank logs | | no ring failure, no poison, no fallback on any rank |
+
+**A/B on the same image (23:50-00:15 local; `./start-tp4.sh restart` with `ROCE_RING` off on 5d37e5287d7b;
+docs/speed/tp4/fp8-nccl-ab-acc.log, fp8-nccl-ab-bench2.log):**
+
+| | NCCL gathers (same image) | ring gathers | delta |
+|---|---|---|---|
+| 1 stream prose / code (acc.py) | 45.0 / 65.2-65.3 | 45.5-45.7 / 66.0-66.3 | +1.1-1.6% / +1.2-1.7% |
+| 1 stream prose / code (bench2) | 44.7 / 65.0 | 45.7 / 66.4 | +2.2% / +2.0% |
+| 4 streams prose (acc.py) | 80.7-82.6 | 85.2-88.5 | +5-7% |
+| conc4 (bench2) | 82.5 | 85.4 | +3.5% |
+| prefill 16K / 64K | 1651 / 1747 | 1658 / 1770 | the same (the earlier -5% was prompt-length noise) |
+| hashes | b363136de28e / d240a39d8c68 | the same | |
+
+The gather sections' saving landed where the device test put it: about 1 ms of a 48 ms round at one stream (roughly
+94 gathers a round at 8-10 us less each), not Codex's 6-8 ms, because NCCL's in-engine cost per gather was never
+109 us (the profile's gather sections hold the ranks' skew, which the ring does not remove). The gain grows with
+streams (the gathers are larger and more of the round waits on them): 5-7% at four. Verdict by the pre-registered
+line (a one-stream gain under 3%): the patch stays a candidate and `ROCE_RING` stays off by default; the image with
+it (5d37e5287d7b) is on all four Sparks, the knob works, bytes, hashes and NLL are exact and nothing measured is
+slower, so `ROCE_RING=on` is the user's free 1-7% whenever they want it (the serve runs with it on since 00:20).
+
+## Baseten's "How to make flash models even faster" (DeepSeek V4.1 Flash) read against this engine (2026-11-04, 23:20 local)
+
+The article's three levers (kernel fusion, PDL, host-loop minimization by CUDA graphs) against the FP8 TP=4 decode
+profile (docs/speed/tp4/fp8-prof.txt: 48 ms a round, 36.6 ms in GPU sections):
+- PDL: the engine has it (TF_GLM_PDL_CHAIN: glm_mm, the EXL3 expert kernels, hc glue, the grouped select), but on
+  FP8 the router section's kernels (router_part, slice_sum's neighbours, topk) and the FP8 expert kernel launch
+  without the attribute, and fp8_experts.cu has no griddepcontrol at all. Routed is the biggest section (17.5 ms).
+  About four bare launches a layer over 46 layers at the 5-9 us a dependent launch won on the EXL3 path: 1-2 ms,
+  2-4% of the round. Kernel-local, low risk, measured by the profiler. Candidate: FP8 launches on the chain.
+- Fusion: the router section is 2.47 ms for two rows (54 us a layer for a tiny gate matmul, a slice sum and a
+  top-k); Baseten's fused router saved them 2.7 ms. KDA fusion lost today (its floor is bytes) and the experts are
+  byte-bound, so a fused MoE buys little here; one kernel a layer for gate, sum and select is the fusion target
+  (up to 5%).
+- Host loop / graphs: the GLM path captures no graphs. The host is Zig (9.5 ms of enqueue wall a call, ahead of a
+  36.6 ms GPU chain), so launch cost is not what the GPU waits on; the 11 ms outside the sections is the drafter
+  pass, the sampling readback and commit, and rank skew at the gathers (the ring gather's target). Measure that gap's
+  composition before any graph work.
+
+## The FP8 boot: 742 s to 245 s by leaving the loader's read-ahead on (2026-11-04/05, 00:20-00:50 local)
+
+The user asked whether weight loading could be faster. Every FP8 boot today ran with `TF_GLM_LOAD_PREFETCH=0` (a
+first-boot caution carried from the 0107 notes), so the loader faulted each page in on its own; over NFS that is
+latency-bound, worst for spark3 (two hops). The ring boot of 20:31 (rank logs in the archive of 20:56Z):
+
+| rank | source | digest | load | note |
+|---|---|---|---|---|
+| 0 (spark1) | NVMe | cached | 315 s | |
+| 1, 3 | NFS, one cable | cached | 450 s | |
+| 2 (spark3) | NFS via spark2 | miss: 306 GiB rehashed, 85 s | 649 s | a one-off miss; cached again at the next boot |
+
+Every rank waits after the digests and again before NCCL, so rank 2 set the boot (742 s; the A/B boot 686 s).
+Raw reads are not the limit (a shard reads at 10 GB/s on spark1's NVMe, 2-6 GB/s over NFS with O_DIRECT). The EXL3
+boot of 17:22 ran with the default 8 readers: "8 readers read 156.4 GiB ahead of the loader", loaded in ~2 min.
+
+**Measured:** `FP8=1 ROCE_RING=on ./start-tp4.sh restart` without the knob: every rank "8 readers read 295.4 GiB
+ahead of the loader", **loaded in 245.1 s** (the API answered at ~250 s of the launcher's wait), host memory on the
+two-hop worker 111 GiB used, 10 GiB cached after the load, no pressure. Decode after it (docs/speed/tp4/
+fp8-roce-prefetch-acc.log): 45.6 / 66.0 at one stream, 91.3 at four, the same hashes. So: never set
+`TF_GLM_LOAD_PREFETCH=0` on an FP8 boot. The remaining floor is each rank reading 295 of the checkpoint's 306 GiB:
+a loader that reads only a rank's expert rows (about a quarter of the bytes) is the next load lever, engine work;
+a digest-cache miss costs 85-135 s on top for everyone.
+
+## The overnight push (2026-11-05, from 01:00 local): where a TP=4 round and a prompt chunk go, and 0109 pre-registered
+
+**Asked:** make decode and prefill faster, plan it with GLM (rtx:8888), run it unattended. GLM's plan is archived in
+docs/speed/glm-plan-20261105.md (brief: docs/speed/glm-brief-20261105.md).
+
+**Where an EXL3 decode round goes at TP=4 (TF_GLM_PROF=1, rank 0, 64 verify calls of 2 rows; acc.py under the
+profiler 55.0 / 83.5 tok/s, round 37.3 ms):** GPU 28.0 ms a verify call: routed experts 9.08, KDA 7.07, MLA 3.21,
+router 2.47, gather_a 2.30 + gather_b 2.13, head 0.74, dense 0.63, shared 0.38. About 9 ms of the round is outside
+the verify forward (the DFlash2 drafter's pass and exchange, the sampler, the host).
+
+**Where a 4,096-row prompt chunk goes (2.42 s a chunk, the engine's stage trace, rank 0, 63 chunks; stages nest, so
+they do not add up):** the main stream waits on the gathers 617 ms a chunk (25%); FFN 439 (experts 392, shared expert
+218, output projection 226); MLA 286; **HC glue 425** (212 at each site); mixer projections 192; KDA 133; router 34.
+The reading: with TF_GLM_PREFILL_REDUCE=gather every rank all-gathers every rank's full fp32 partials (3 x rows x
+hidden x 4 bytes received a rank an exchange) and glues all rows itself. ring (split along the ring) receives
+reduce-scatter partials plus bf16 glued rows, about 2.7x fewer bytes, and glues only its quarter of the rows. ring
+died on this fabric only because its sends and receives went over the world communicator, where NCCL picks the
+device (RESULTS 22:40 2026-11-04).
+
+**Candidate 0109 (engine) + recipe:** a two-rank NCCL communicator on each cable (TF_GLM_LINK_GRAPHS=<toward
+previous>,<toward next>; each made with its own graph file pinning its channels to the cable's devices, ids gathered
+over the world communicator, made even-rank-next-first so each link's two ranks meet, connected by one small
+exchange). cuda_relay's ring step sends to the next rank on link 1 (peer 1) and receives from the previous on link 0
+(peer 0); nothing else changes (gather mode, decode, the world communicator). The recipe writes
+nccl-graph-rank<r>-link-{prev,next}.xml next to each rank's ring graph and mounts them when PREFILL_REDUCE=ring. The
+same mechanism as the DeepSeek 4x recipe's TF_DS_LINK_GRAPHS, written for this engine's GLM family.
+
+**Gates (pre-registered before any 0109 serve):** same image, PREFILL_REDUCE=gather vs ring, bench2 from spark5.
+- **GO (default PREFILL_REDUCE=ring):** prefill 16K and 64K both >= +8% over gather; the start and every bench2 leg
+  (prefill pair, mixed1, 4 streams) without an NCCL error; quality.py NLL within 0.002 nats of gather (the split's
+  fp32 sums run in another order, so bit-exact prompt states are not expected; decode hashes may move for that reason
+  alone); 1-stream decode not more than 2% below gather.
+- **Candidate (opt-in only):** +3% to +8%, otherwise clean.
+- **KILL:** any NCCL error or hang at start or in a leg, NLL off by more than 0.002, or under +3%.
+
+**ROCE_RING=on on the EXL3 pack (image 5d37e5287d7b, no build; docs/speed/tp4/exl3-roce-tp4.log):** 1 stream
+57.1-57.4 / 86.7-86.9 tok/s (that day's EXL3 baseline 56.2 / 85.6; under the profiler 55.0 / 83.5), hashes
+b6ae240144bc / 9b68d8a77151; 4 streams 120.5-124.1 (115-120), 6 streams 142-144 (139-141), 8 streams 160-163
+(163-166); prefill 16K / 64K 1,764 / 1,892; quality NLL 0.7487241272787446, answers 11ceddde19d4, the same as without
+it. +2% at one stream, +3% at four, -1.5% at eight: under the 3% one-stream line, so ROCE_RING stays an opt-in on
+EXL3 as on FP8.
+
+**0109 built and served: KILLED by its gate (2026-11-05, ~08:00 local).** Three builds to get it on the wire:
+(1) `dupeZ` is gone from Zig 0.17 (`dupeSentinel`); (2) with NCCL_COMM_ID set every link's unique id named rank 0's
+bootstrap root, so a link's rank 0 on another Spark failed ncclCommInitRank ("unhandled system error"): fixed with
+TF_GLM_LINK_ADDR, the rank's own LAN address on NCCL_PORT+2, in NCCL_COMM_ID while the links are made; (3) NCCL's
+point-to-point send/recv ignores the graph file even on a two-rank link: spark4 took its port toward spark1 to reach
+spark3 (`ibv_modify_qp ... Connection timed out ... remote GID ::ffff:10.0.33.3`), so each ring hop became a two-rank
+ncclBroadcast rooted at the sender (same pairing order; a collective keeps to the graph file, which is how the
+DeepSeek 4x recipe's links work). Image 58f411527a0f then started cleanly with all four ranks' links up.
+
+| PREFILL_REDUCE (same code path otherwise) | gather (5d37e5287d7b, this night) | ring over the links (58f411527a0f) |
+| --- | --- | --- |
+| prefill 16K / 64K, tok/s | 1,646-1,764 / 1,672-1,892 | **1,204 / 1,344** |
+| prefill pair 30K alone / pair | 16.4-18.3 s / 33.5-36.6 s | 23.4 s / 46.8 s |
+| mixed1: 50K prompt TTFT, decoder during | 44.1 s, 17.7 tok/s | 67.6 s, 17.6 tok/s |
+| 1 stream prose / code | 56.2-57.4 / 85.6-86.9 | 56.2 / 85.0-85.1 (hashes the same) |
+| quality NLL / answers | 0.7487241272787446 / 11ceddde19d4 | the same (exact) |
+
+Prefill -25 to -30%: KILL (pre-registered: under +3%). The byte count was the wrong model: gather's all-gather
+streams the whole ring at once (NCCL pipelines 4 channels), while the split's ring runs three dependent steps an
+exchange, each a group of small broadcasts, twice a layer a piece. Fewer bytes, more serial latency. The ~25% of a
+chunk that waits on gathers is the exchange's cost as gather pays it; a cheaper exchange needs the gather's
+pipelining with fewer bytes (a reduce-scatter collective on the world ring, NCCL_ALGO=Ring, which a ring of four can
+carry), not point-to-point steps. The patch is kept in docs/speed/candidates/killed/ (it is correct and exact, only
+slow); the recipe's link-graph support was reverted, PREFILL_REDUCE=gather stays the only qualified TP=4 mode.
+
+## The switch PRs' engine patches on the ring: 0109 drafter MLP split, 0110 CHUNK_SOLO (pre-registered 2026-11-05)
+
+From shanedertrain's PRs #5/#6 (Cameron Basham; written for four Sparks on a switch; the PRs themselves edit the TP=4
+launcher, which is not in the published repo). Applied unchanged on our 108 (theirs were numbered 0108 / 0109):
+- **0109** the DFlash2 drafter MLP split across every rank (FF / world, partials summed in rank order; their switch
+  measurement: drafter block 5.5 -> 3.5 ms a round, round 36.4 -> 33.0 with their RoCE gathers, hashes unchanged).
+  Always on.
+- **0110** TF_GLM_CHUNK_SOLO=4096 with TF_GLM_CHUNK=1024|2048: a prompt step beside a decoding stream takes that many
+  rows (their: worst decode pause beside a cold ~200K prefill 1.96 -> 0.65 s, that prefill +4.8%, exact). Off unless set.
+
+**Plan:** one image (108 + 0109 + 0110). EXL3 legs: E0 old image 5d37e5287d7b, E1 new image, E2 new image with
+CHUNK_SOLO=4096 / CHUNK=1024; then FP8 legs F0 / F1 / F2 the same. Each leg: acc.py x2, bench2, quality.py.
+
+**Gates:**
+- **0109 GO (always on in the image):** greedy hashes and quality NLL / answers identical to the old image's; 1-stream
+  prose or code >= +2% over the old image, no 4-stream loss beyond 2%. KILL: any hash or NLL change, or a loss.
+- **0110 GO as an opt-in (CHUNK_SOLO stays off by default either way):** bench2 mixed1 worst decode gap and p95 lower
+  than E1/F1's, prefill alone within 5%, hashes unchanged. Default-on only if the gap falls by half and prefill alone
+  stays within 2%.
+
+**Measured (image 137c54a8ea13 = 108 + 0109 + 0110 on all four Sparks; old image 5d37e5287d7b; spark5 harness;
+docs/speed/tp4/pr-*.log):**
+
+| | EXL3 old (E0) | EXL3 + 0109 (E1) | E1 + CHUNK_SOLO 1024 (E2) | FP8 old (F0) | FP8 + 0109 (F1) | F1 + CHUNK_SOLO (F2) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 stream prose / code | 56.5 / 85.8 | **60.3-60.6 / 90.9-91.0** | 60.2 / 90.8-91.3 | 45.0 / 65.4-65.6 | **47.3-47.4 / 67.4-67.6** | 47.1-47.3 / 67.6 |
+| decode round, prose | 36.3 ms | 33.9 | 34.1 | 48.0 | 46.0 | 46.1 |
+| 4 streams (acc) | 117.5-121.1 | 123.5-124.4 | 121.3-124.4 | 83.1-84.9 | 85.6-88.7 | 87.2-88.7 |
+| conc4 (bench2) | 117.1 | 128.9 | 122.7 | 82.6 | 92.4 | 88.3 |
+| prefill 16K / 64K | 1770 / 1896 | 1768 / 1893 | 1764 / 1893 | 1655 / 1761 | 1632 / 1766 | 1660 / 1765 |
+| mixed1: 50K TTFT; gap p95 / max | 44.1 s; 56 / 2616 ms | 44.1 s; 49 / 2628 | **49.8 s; 721 / 845** | 46.6 s; 79 / 2765 | 46.2 s; 76 / 2799 | **59.8 s; 865 / 969** |
+| hashes; NLL; answers | b6ae/9b68; 0.7487241272787446; 11ceddde19d4 | same | same | b363/d240; 0.74246848208233; 25789b7aa3d9 | same | same |
+
+**0109 (drafter MLP split): GO.** Exact on both packs; EXL3 +7% / +6% at one stream (round -2.4 ms), FP8 +5% / +3%
+(round -2.0 ms), four streams +2-12%, prefill unchanged. Promoted to patches/engine (always on in the image).
+**0110 (CHUNK_SOLO): fails its gate as an improvement**, kept in the image off by default (a no-op unless
+TF_GLM_CHUNK_SOLO=4096 is exported): the worst pause beside a 50K prompt falls 2.6-2.8 s -> 0.85-0.97 s, but pauses
+of 0.7-0.9 s become the 95th percentile (49-79 ms before) and the long prompt's TTFT grows +13% (EXL3) / +29% (FP8).
+For agents where one multi-second freeze is worse than many short ones it is an opt-in; not the default.
+
+**Measured (image 137c54a8ea13 = 108 + 0109 + 0110 on all four Sparks; old image 5d37e5287d7b; spark5 harness;
+docs/speed/tp4/pr-*.log):**
+
+| | EXL3 old (E0) | EXL3 + 0109 (E1) | E1 + CHUNK_SOLO 1024 (E2) | FP8 old (F0) | FP8 + 0109 (F1) | F1 + CHUNK_SOLO (F2) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 stream prose / code | 56.5 / 85.8 | **60.3-60.6 / 90.9-91.0** | 60.2 / 90.8-91.3 | 45.0 / 65.4-65.6 | **47.3-47.4 / 67.4-67.6** | 47.1-47.3 / 67.6 |
+| decode round, prose | 36.3 ms | 33.9 | 34.1 | 48.0 | 46.0 | 46.1 |
+| 4 streams (acc) | 117.5-121.1 | 123.5-124.4 | 121.3-124.4 | 83.1-84.9 | 85.6-88.7 | 87.2-88.7 |
+| conc4 (bench2) | 117.1 | 128.9 | 122.7 | 82.6 | 92.4 | 88.3 |
+| prefill 16K / 64K | 1770 / 1896 | 1768 / 1893 | 1764 / 1893 | 1655 / 1761 | 1632 / 1766 | 1660 / 1765 |
+| mixed1: 50K TTFT; gap p95 / max | 44.1 s; 56 / 2616 ms | 44.1 s; 49 / 2628 | **49.8 s; 721 / 845** | 46.6 s; 79 / 2765 | 46.2 s; 76 / 2799 | **59.8 s; 865 / 969** |
+| hashes; NLL; answers | b6ae/9b68; 0.7487241272787446; 11ceddde19d4 | same | same | b363/d240; 0.74246848208233; 25789b7aa3d9 | same | same |
+
+**0109 (drafter MLP split): GO.** Exact on both packs; EXL3 +7% / +6% at one stream (round -2.4 ms), FP8 +5% / +3%
+(round -2.0 ms), four streams +2-12%, prefill unchanged. Promoted to patches/engine (always on in the image).
+**0110 (CHUNK_SOLO): fails its gate as an improvement**, kept in the image off by default (a no-op unless
+TF_GLM_CHUNK_SOLO=4096 is exported): the worst pause beside a 50K prompt falls 2.6-2.8 s -> 0.85-0.97 s, but pauses
+of 0.7-0.9 s become the 95th percentile (49-79 ms before) and the long prompt's TTFT grows +13% (EXL3) / +29% (FP8).
+For agents where one multi-second freeze is worse than many short ones it is an opt-in; not the default.
