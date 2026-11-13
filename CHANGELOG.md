@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-11-13** -- Patch 0122 adds opt-in `TF_GLM_SNAPSHOT_FORMAT=committed` for in-memory prompt snapshots on
+  unsharded TP2. It keeps the active FP32 KDA bank per layer and omits replay scratch at a committed mark. The ranks
+  agree on the setting; each saved state carries its format. Legacy remains the default. Disk learning and other
+  rank counts are refused. The recipe checks unsupported combinations before restart. See
+  [the receipt](docs/speed/compact-snapshots/README.md) for the limited cache-pressure result and validation scope.
+
 - **2026-11-11** -- `MEMORY_RESERVE_GIB=6.5` and `CACHE_FIRST=1` are the defaults everywhere, the pair included (the
   reserve was 12, and the pair ran 9.5 in its `local.sh`; cache-first was off), with `PROMPT_CACHE_GIB` 5 on the pair
   (8 and 4 at four Sparks, as below). Cache-first is part of it: at 6.5 and windows first the pair's page pool would

@@ -208,6 +208,7 @@ default 6.5.
 | `MEMORY_RESERVE_GIB`, `HOST_CACHE_GIB`, `PROMPT_CACHE_GIB` | `6.5`, `0`, `5` | `PROMPT_CACHE_GIB` is `8` with EXL3 and `4` with `FP8=1` at four Sparks. See [Memory](#memory-on-a-128-gb-unified-spark); the reserve was 12 (the pair ran 9.5) before 2026-11-11 |
 | `LEARN_GIB`, `LEARN_MIN_FREE_GIB` | `0`, `15` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0113); see [Memory](#memory-on-a-128-gb-unified-spark) |
 | `KV_SHARD` | `0` | `1` keeps each stream's latent rows on one Spark (`TF_GLM_KV_SHARD`, patch 0114): about twice the tokens, 1-4% decode; use with `CACHE_FIRST=1 PROMPT_CACHE_GIB=6`, see [Memory](#memory-on-a-128-gb-unified-spark). Needs `KV=fp8`, `KV_PAGES=on`, DFlash2 or no drafter, `PARALLEL` auto or above 1. TP=2 only: `./start-tp4.sh` refuses it |
+| `TF_GLM_SNAPSHOT_FORMAT` (exported) | `legacy` | Opt-in `committed` saves each layer's active FP32 KDA bank and omits replay scratch at committed prompt marks (patch 0122). Requires TP=2, `KV_SHARD=0`, `LEARN_GIB=0`. Export it so `start.sh` forwards it to both ranks. [Scope, measurements and validation](docs/speed/compact-snapshots/README.md) |
 | `L2PF` | `0` | `1` prefetches each decode window's next weights into L2 on a side stream (`TF_GLM_L2PF`, patch 0117, from upstream): the next layer's mixer input, this layer's router and KDA's `o_proj`, not the EXL3 routed experts. Upstream turns it on at TP>=2 on GB10; here it measured +2% at one stream and flat at four and eight (exact), so it stays opt-in. `TF_GLM_L2PF_MB`, `_CTAS`, `_PACE_GBPS` (12, 2, 150) pass through as exported `TF_*` variables |
 | `CACHE_FIRST` | `1` | `1` sets `PROMPT_CACHE_GIB` (required) aside before the streams' windows (`TF_PROMPT_CACHE_FIRST`, patch 0112), so the cap becomes the cache; `0` counts whole windows first and gives the cache what they leave. See [Memory](#memory-on-a-128-gb-unified-spark) |
 | `PROMPT_CACHE_MIN_GIB` | empty | The smallest prompt cache a start may serve with. `start.sh` reads each rank's startup line and stops both ranks before LIVE (`E_CACHE`) when one funds less; the cache is what that start's room leaves, so `PROMPT_CACHE_GIB` caps it but does not guarantee it, even with `CACHE_FIRST=1` (issue 16). Empty: no check. `./start-tp4.sh` does not check it |
@@ -314,9 +315,9 @@ and MMLU 88.4%, thinking-on categories unchanged.
 
 ## Engine patches
 
-`patches/engine/` holds 121 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
+`patches/engine/` holds 122 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0106 and 0111-0121 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. None is GB10-specific: the arch-gated kernels test
+0094-0106 and 0111-0122 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -345,6 +346,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0119 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (0039 had 16), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Fixes what the wider window exposes on this stack: shared-window scratch is said outright (a 32-row segment no longer shrinks the KDA projection buffer to 4 bytes or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. Not taken: load-timed pricing, 15-deep MTP chains, and #1779's shared reservation (upstream turned it off for DFlash2, cc2fa8d23). On the pair (2026-11-11, greedy, token hashes identical): a 1,195-token file rewrite at one stream 151 to 201-205 tok/s decode (14.9 to 26.6 tokens a round); prose at 1/4/8 streams and four-stream rewrites unchanged; 34 MiB more fixed memory a stream |
 | 0120 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids and leave the reply as they do. A name the tokenizer does not hold refuses the start; unset, the EOS list is the checkpoint's |
 | 0121 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default (`THINK_OFF_SPLIT=0`; 1024 is the hold the author measured)): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, whole and streamed alike (a stream holds its content until the token, the hold or the end). A close after the hold stays text; raw completions, the JSON channel and logprobs requests are never split. Tests: `zig build test-think-off-split-host` |
+| 0122 | `TF_GLM_SNAPSHOT_FORMAT=committed`: in-memory snapshots keep the saved active KDA bank per layer and omit committed-window replay scratch. Legacy is the default; format is recorded per snapshot and agreed between ranks. TP2, unsharded, with disk learning refused. Tests: `zig build test-glm-compact-snapshots-host`; [receipt and limitations](docs/speed/compact-snapshots/README.md) |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 
