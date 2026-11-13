@@ -1,0 +1,20 @@
+{
+  "ranks": [
+    0,
+    1
+  ],
+  "rows": [
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "cache_modes": [
+    "no_forced_scrub",
+    "scrub128MiB"
+  ],
+  "repeats": 6
+}
