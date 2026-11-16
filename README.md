@@ -98,7 +98,9 @@ branch leads at 4 streams (89-95 against 79-81).
 Prefill was tuned on 2026-11-02 (docs/speed/RESULTS.md): `ABSORB_MMA` is +8.0% with identical answers and is on; the
 4,096-row prompt chunk (0094/0095) is +7% with byte-identical replies; `W8A8` reaches +10.5% but rounds activations
 (one of ten answers wrong) and stays off; `q4` dense is rejected on quality; the cable is about 3% of a long prompt's
-time. At equal dense width the engine is at parity with the v1.0.7 build's prefill.
+time. At equal dense width the engine is at parity with the v1.0.7 build's prefill. With `DENSE=bf16` the 4,096-row
+chunk loses instead, so that image reads 2,048 rows a pass (`PROMPT_CHUNK`, patch 0122): 1,701 tok/s against 1,321
+at 35K, the same answers ([Prefill beside decoding](#prefill-beside-decoding)).
 
 ## Requirements
 
@@ -136,6 +138,23 @@ A long prompt is read in atomic 4,096-row chunks (about 2.5 s each); other strea
 `PREFILL_SHARE=p` makes each chunk owe the decoders `(1 - p) / p` of its own time in decode rounds first. At the
 default `0.68` a chat beside a long prefill keeps about 12-13 tok/s with a worst pause of one chunk, and the long
 prompt's first token comes about 47% later than at `1`. Replies are byte-identical at any value.
+
+**`PROMPT_CHUNK`** sets the chunk's rows in the image: `4096` (0094/0095) or `2048` (patch 0122, which sets them
+back); `auto` (default) builds 2,048 for `DENSE=bf16` on the pair and 4,096 everywhere else. A pass has a fixed
+cost of about 0.15 s (it decodes every expert's EXL3 weights), which a wider chunk spreads; with q8 dense the rest
+costs 0.6 ms a row at any width, while with bf16 dense a pass costs 0.54 ms a row to about 2,800 rows and 1.3 ms a
+row past about 3,000. Measured on the pair (2026-11-16, defaults, a cold 34.7K prompt beside a decoding chat):
+
+| | bf16, 4,096 | bf16, 2,048 | q8, 4,096 | q8, 2,048 |
+| --- | ---: | ---: | ---: | ---: |
+| Prefill alone | 1,321 tok/s | **1,701** | **1,791** | 1,712 |
+| The long prompt's first token beside the chat | 37.1 s | **29.7 s** | **28.2 s** | 29.6 s |
+| The chat's worst pause | 3.37 s | **1.46 s** | 2.60 s | **1.46 s** |
+
+The chat's rate during the prompt is the same at both widths (`PREFILL_SHARE` sets it), and greedy replies hash the
+same. `PROMPT_CHUNK=2048` with q8 trades 4.4% of prefill for half the worst pause; it is its own image (the tag
+follows the patches). With `LEARN_GIB`, a state on disk from the other width is not resumed: the turn prefills, with
+the same reply. At 2,048 a repeated prompt resumes to the nearer 2,048 boundary (10,240 of 11,678 tokens, not 8,192).
 
 ## Memory on a 128 GB unified Spark
 
@@ -202,6 +221,7 @@ default 6.5.
 | `DRAFTER`, `DRAFTER_BITS` | `dflash2`, `4` | `dflash2`, `mtp` (the checkpoint's own head) or `none` |
 | `PARALLEL` | `4` | `--parallel`; admitted only if it fits, `auto` serves up to 8. The pair runs 8: free at 1-4 streams, 94-95 tok/s at 6, 105-106 at 8 |
 | `PREFILL_SHARE`, `PREFILL_BUDGET` | `0.68`, empty | See [Prefill beside decoding](#prefill-beside-decoding) |
+| `PROMPT_CHUNK` | `auto` | Rows a prompt pass takes, built into the image: `2048` (patch 0122) or `4096`; `auto` is 2048 for `DENSE=bf16` on the pair, else 4096. See [Prefill beside decoding](#prefill-beside-decoding) |
 | `CONTEXT`, `CONTEXT_MAX` | `auto`, `1048576` | See [CONTEXT=auto](#contextauto) |
 | `KV`, `KV_PAGES` | `fp8`, `on` | `--kv-cache`, one shared pool of 512-row pages with `CONTEXT` as one request's cap |
 | `DENSE`, `HEAD` | `q8`, `bf16` | `bf16`, `q8`, `q6` or `q4` for the dense linears and the LM head; the pair's `local.sh` sets `HEAD=q8` |
@@ -316,7 +336,8 @@ and MMLU 88.4%, thinking-on categories unchanged.
 
 `patches/engine/` holds 121 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0106 and 0111-0121 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. None is GB10-specific: the arch-gated kernels test
+0094-0106 and 0111-0121 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches.
+0122, in `patches/engine/chunk2048/`, is applied after them only to a `PROMPT_CHUNK=2048` image. None is GB10-specific: the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -345,6 +366,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0119 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (0039 had 16), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Fixes what the wider window exposes on this stack: shared-window scratch is said outright (a 32-row segment no longer shrinks the KDA projection buffer to 4 bytes or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. Not taken: load-timed pricing, 15-deep MTP chains, and #1779's shared reservation (upstream turned it off for DFlash2, cc2fa8d23). On the pair (2026-11-11, greedy, token hashes identical): a 1,195-token file rewrite at one stream 151 to 201-205 tok/s decode (14.9 to 26.6 tokens a round); prose at 1/4/8 streams and four-stream rewrites unchanged; 34 MiB more fixed memory a stream |
 | 0120 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids and leave the reply as they do. A name the tokenizer does not hold refuses the start; unset, the EOS list is the checkpoint's |
 | 0121 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default (`THINK_OFF_SPLIT=0`; 1024 is the hold the author measured)): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, whole and streamed alike (a stream holds its content until the token, the hold or the end). A close after the hold stays text; raw completions, the JSON channel and logprobs requests are never split. Tests: `zig build test-think-off-split-host` |
+| 0122 | **This pair's** (`patches/engine/chunk2048/`, `PROMPT_CHUNK=2048`; `auto` with `DENSE=bf16`). A prompt chunk of 2,048 rows, with DFlash2's `MAX_CTX` to match: 0094/0095 set back. bf16 dense +29% prefill (1,321 -> 1,701 tok/s at 35K), q8 -4.4%; the worst pause beside a long prompt 1.46 s at either; byte-identical replies |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 

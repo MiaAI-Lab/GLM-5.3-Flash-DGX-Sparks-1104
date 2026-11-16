@@ -1,0 +1,60 @@
+From 342d690da3dffd41bf70a68ef31b0a7210db8b48 Mon Sep 17 00:00:00 2001
+From: wagzee <jurik17@gmail.com>
+Date: Mon, 16 Nov 2026 00:39:23 +0100
+Subject: [PATCH] glm-cuda: with bf16 dense weights, a prompt chunk takes 2,048
+ rows
+
+The recipe applies this patch to a PROMPT_CHUNK=2048 image (patches/engine/chunk2048/); PROMPT_CHUNK=auto picks it
+for DENSE=bf16 on the pair, and every other image keeps 0094/0095's 4,096-row chunk. It sets prefill_rows and
+DFlash2's MAX_CTX back to the 2,048 they were before 0094/0095, so it undoes exactly what they changed.
+
+Why the width depends on the dense weights: a prompt pass has a fixed cost (cuda_exl3.zig: each call to the common
+experts decodes every expert's weights, about 0.15 s a pass on the pair), which a wider chunk spreads over more rows.
+With q8 dense the rest of a pass costs the same per row at any width, so 4,096 wins (+7% in 0094; 2,048 measured
+4.4% slower on 2026-11-16). With bf16 dense, a pass costs 0.54 ms a row up to about 2,800 rows and 1.3 ms a row past
+about 3,000, so a 4,096-row chunk spends more in its last rows than it saves in fixed cost. The step was not profiled; the bf16 dense
+matmul path is the part that differs between the two settings.
+
+Measured on the pair (main 80be4d6 at its defaults, a cold 34.7K prompt): bf16 1,321 -> 1,701 tok/s (+29%), its first
+token beside a decoding chat 37.1 -> 29.7 s, the chat's worst pause 3.37 -> 1.46 s; q8 1,791 -> 1,712 tok/s (-4.4%),
+pause 2.60 -> 1.46 s. The chat's rate during the prompt does not change (PREFILL_SHARE sets it).
+
+Exact: as 0094 notes, a pair's sums do not depend on which chunk holds it, and greedy replies at 30, 2,987 and 8,859
+prompt tokens hash the same at both widths, with q8 and with bf16. Kept prompt states are cut at the chunk's step, so
+with LEARN_GIB a state written by one width is not resumed by the other: measured both ways, the turn prefills (or
+resumes the image's own state) with the same reply and no error. The finer grid resumes more of a repeated prompt:
+10,240 of 11,678 tokens against 8,192.
+---
+ zig/src/families/glm/cuda_state.zig | 2 +-
+ zig/src/families/glm/dflash.zig     | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 10d16cb..ddd8a2b 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -16,7 +16,7 @@ const mlp = @import("cuda_mlp.zig");
+ const kda_block = @import("cuda_kda_block.zig");
+ 
+ /// A prompt chunk's rows (decode.PREFILL_ROWS).
+-pub const prefill_rows = 4096;
++pub const prefill_rows = 2048;
+ /// A decode window's rows (Engine's max_rows): the pending token and up to 31 drafts or copied tokens (upstream #2257's
+ /// width; DFlash2 still drafts 7 a block, so the rows past 8 serve context copies).
+ pub const window_rows = 32;
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index d4b97cc..b2aaa7a 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -27,7 +27,7 @@ pub const CH: usize = 16; // key chunks of the chunked attention (df_attn_part)
+ pub const CW: usize = 2 * TOPK; // a row's gathered ints: 16 ids, then 16 values' bits
+ pub const MAX_S: usize = 16; // streams one block pass drafts for
+ pub const MAX_M: usize = MAX_S * BLOCK; // block rows at most
+-pub const MAX_CTX: usize = 4096; // context rows one ingest takes (a prompt chunk's)
++pub const MAX_CTX: usize = 2048; // context rows one ingest takes (a prompt chunk's)
+ pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' rows at most)
+ pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps
+ 
+-- 
+2.43.0
+

@@ -202,6 +202,11 @@ KV_PAGES="${KV_PAGES:-on}"
 # 288 routed experts), so narrowing them buys little and costs measurably.
 DENSE="${DENSE:-q8}"                             # TF_GLM_DENSE_BITS: bf16 (16) | q8 | q6 | q4 (symmetric int codes, groups of 64)
 HEAD="${HEAD:-bf16}"                             # TF_GLM_HEAD_BITS for the LM head, same choices
+# The rows a prompt pass takes, built into the image. 4096 (0094/0095): q8 prefill +4-7%. 2048 (patch 0122, from
+# patches/engine/chunk2048/): with DENSE=bf16 a pass costs 1.3 ms a row past ~3,000 rows against 0.54 below, so 2048
+# is +29% prefill there (1,321 -> 1,701 tok/s at 35K); with q8 it is -4.4% but cuts the worst pause beside a long
+# prompt from 2.6 to 1.46 s. Replies are the same at both. auto: 2048 for DENSE=bf16 on the pair, else 4096.
+PROMPT_CHUNK="${PROMPT_CHUNK:-auto}"
 # TENSORFOLD_MEMORY_RESERVE_GIB. GB10 is a unified-memory device: the engine budgets from /proc/meminfo's MemAvailable
 # (plus the pages parked on the kernel's per-CPU free lists, which MemAvailable leaves out), not from a card's free
 # memory, and everything the Spark runs besides the rank comes out of the same pool. The engine's own default here is

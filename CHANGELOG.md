@@ -1,5 +1,16 @@
 # Changelog
 
+- **2026-11-16** -- `PROMPT_CHUNK` (`auto`, `2048`, `4096`) and engine patch 0122 in `patches/engine/chunk2048/`:
+  with `DENSE=bf16` on the pair the image reads prompts in 2,048-row passes, as before 0094/0095, and every other
+  image keeps 4,096, with the tag it had (a 4,096-row image's inputs are unchanged). A bf16 pass costs 1.3 ms a row
+  past about 3,000 rows against 0.54 below, so the wide chunk lost there: a cold 34.7K prompt 1,321 -> 1,701 tok/s
+  (+29%), its first token beside a decoding chat 37.1 -> 29.7 s, the chat's worst pause 3.37 -> 1.46 s. With q8,
+  2,048 is 4.4% slower (1,791 -> 1,712) and halves the pause (2.60 -> 1.46 s), so it stays an opt-in there. Greedy
+  replies hash the same at both widths with either dense setting; with `LEARN_GIB` a state on disk from the other
+  width is not resumed and the turn prefills, with the same reply. A 2,048-row image builds from a staged copy of
+  `patches/engine/` (the Dockerfile is unchanged); `scripts/tests/prompt-chunk.sh` checks the choice and
+  `patch-numbers.sh` reads `chunk2048/` too. Measured on main 80be4d6 at its defaults by wagzee.
+
 - **2026-11-11** -- `MEMORY_RESERVE_GIB=6.5` and `CACHE_FIRST=1` are the defaults everywhere, the pair included (the
   reserve was 12, and the pair ran 9.5 in its `local.sh`; cache-first was off), with `PROMPT_CACHE_GIB` 5 on the pair
   (8 and 4 at four Sparks, as below). Cache-first is part of it: at 6.5 and windows first the pair's page pool would

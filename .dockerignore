@@ -4,3 +4,5 @@
 !patches/
 !patches/engine/
 !patches/engine/**
+# PROMPT_CHUNK=2048's patches reach the image from a staged context (prepare_image), never from here.
+patches/engine/chunk2048

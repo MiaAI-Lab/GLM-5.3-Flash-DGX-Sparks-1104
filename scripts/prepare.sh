@@ -38,6 +38,7 @@ validate_config() {
   for key in DENSE HEAD; do
     [[ "${!key}" =~ ^(bf16|q8|q6|q4)$ ]] || fail E_CONFIG "$key must be bf16, q8, q6 or q4 (TF_GLM_${key}_BITS 16, 8, 6 or 4)."
   done
+  [[ "$PROMPT_CHUNK" =~ ^(auto|2048|4096)$ ]] || fail E_CONFIG 'PROMPT_CHUNK must be auto, 2048 or 4096 (rows a prompt pass takes).'
   for key in MAX_TOKENS PORT NCCL_PORT LOG_KEEP WAIT_TIMEOUT SMOKE_TIMEOUT STOP_TIMEOUT \
              MIN_AVAIL_GIB IMAGE_FREE_GIB MODEL_FREE_GIB DFLASH2_FREE_GIB CONTEXT_MAX SM NCCL_CHANNELS ROCE_MAX_KB; do
     [[ "${!key}" =~ ^[1-9][0-9]*$ ]] || fail E_CONFIG "$key must be a positive integer."
@@ -153,11 +154,21 @@ validate_config() {
   fi
 }
 
+# PROMPT_CHUNK as built: 2048 adds patches/engine/chunk2048/ (patch 0122) to the image; auto picks it for DENSE=bf16
+# on the pair only, the one place it was measured to win (see config.sh).
+prompt_chunk() {
+  if [[ "$PROMPT_CHUNK" != auto ]]; then printf '%s\n' "$PROMPT_CHUNK"
+  elif [[ "$DENSE" == bf16 && "${GLM_TP4:-0}" != 1 && "$FP8" == 0 ]]; then printf '2048\n'
+  else printf '4096\n'; fi
+}
 # The image tag and its tf.patches label: docker/Dockerfile, the patches/engine/*.patch files (sorted by name; the
-# build context holds nothing else) and the pins. Editing scripts or docs never forces a rebuild.
+# build context holds nothing else), with PROMPT_CHUNK=2048 also patches/engine/chunk2048/*.patch, and the pins.
+# Editing scripts or docs never forces a rebuild, and a 4,096-row image's inputs are the same as before chunk2048/.
 image_inputs() {
   (cd "$REPO_ROOT" && { [[ ! -f docker/Dockerfile ]] || printf 'docker/Dockerfile\0'
-    find patches/engine -maxdepth 1 -type f -name '*.patch' -print0 2>/dev/null | LC_ALL=C sort -z; } | tr '\0' '\n')
+    find patches/engine -maxdepth 1 -type f -name '*.patch' -print0 2>/dev/null | LC_ALL=C sort -z
+    [[ "$(prompt_chunk)" != 2048 ]] \
+      || find patches/engine/chunk2048 -maxdepth 1 -type f -name '*.patch' -print0 2>/dev/null | LC_ALL=C sort -z; } | tr '\0' '\n')
 }
 set_image() {
   local f
@@ -349,12 +360,25 @@ prepare_image() {
   else
     log "Skipped when an image labelled tf.patches=$PATCHES_HASH exists (docker image inspect $IMAGE):"
   fi
-  log "Build $IMAGE: TensorFold ${TF_REF:0:12} with $PATCH_COUNT engine patches, Zig $ZIG_VERSION, sm_$SM."
+  # The build context is the repository, whose patches/engine/*.patch the image applies. A 2,048-row image builds from
+  # a staged copy of patches/engine/ that holds chunk2048/'s patches beside them, so the Dockerfile stays as it is.
+  local context=$REPO_ROOT p
+  if [[ "$(prompt_chunk)" == 2048 ]]; then
+    context=$(mktemp -d "${TMPDIR:-/tmp}/glm53-context.XXXXXX") || fail E_IMAGE 'Cannot create a build context directory.'
+    mkdir -p "$context/patches/engine"
+    for p in "${IMAGE_FILES[@]}"; do
+      [[ "$p" == patches/engine/* ]] || continue
+      cp -- "$REPO_ROOT/$p" "$context/patches/engine/" || fail E_IMAGE "Cannot stage $p for the build."
+    done
+  fi
+  log "Build $IMAGE: TensorFold ${TF_REF:0:12} with $PATCH_COUNT engine patches ($(prompt_chunk)-row prompt passes), Zig $ZIG_VERSION, sm_$SM."
   run docker build -f "$REPO_ROOT/docker/Dockerfile" -t "$IMAGE" --label "tf.patches=$PATCHES_HASH" \
     --build-arg "TF_REPO=$TF_REPO" --build-arg "TF_REF=$TF_REF" --build-arg "ZIG_VERSION=$ZIG_VERSION" \
     --build-arg "ZIG_SHA256=$ZIG_SHA256" --build-arg "SM=$SM" --build-arg "PATCHES_HASH=$PATCHES_HASH" \
     --build-arg "ZIG_CPU=$ZIG_CPU" ${NCCL_WHEEL:+--build-arg "NCCL_WHEEL=$NCCL_WHEEL"} --build-arg "WITH_VIDEO=$WITH_VIDEO" \
-    "${build_flags[@]}" "$REPO_ROOT" || fail E_IMAGE 'Image build failed. Check disk space, network access and the first build error.'
+    "${build_flags[@]}" "$context" || { [[ "$context" == "$REPO_ROOT" ]] || rm -rf -- "$context"
+    fail E_IMAGE 'Image build failed. Check disk space, network access and the first build error.'; }
+  [[ "$context" == "$REPO_ROOT" ]] || rm -rf -- "$context"
   run docker run --rm --network none --entrypoint "$TF_BIN" "$IMAGE" --version \
     || fail E_IMAGE "The built image has no working $TF_BIN."
 }
