@@ -79,6 +79,14 @@ validate_config() {
     || fail E_CONFIG 'CACHE_FIRST=1 sets PROMPT_CACHE_GIB aside first: set PROMPT_CACHE_GIB to the GiB to keep (1 or more).'
   is_number "$LEARN_GIB" || fail E_CONFIG 'LEARN_GIB must be a number of GiB (0: off).'
   [[ "$KV_SHARD" =~ ^[01]$ ]] || fail E_CONFIG 'KV_SHARD must be 0 or 1 (TF_GLM_KV_SHARD).'
+  case "${TF_GLM_SNAPSHOT_FORMAT:-legacy}" in
+    legacy) ;;
+    committed)
+      [[ "$TP" == 2 && "$KV_SHARD" == 0 ]] && at_least 0 "$LEARN_GIB" \
+        || fail E_CONFIG 'TF_GLM_SNAPSHOT_FORMAT=committed needs TP=2, KV_SHARD=0 and LEARN_GIB=0.'
+      ;;
+    *) fail E_CONFIG 'TF_GLM_SNAPSHOT_FORMAT must be legacy or committed.' ;;
+  esac
   [[ "$KV_SHARD" == 0 || ( "$KV" == fp8 && "$KV_PAGES" == on && "$DRAFTER" != mtp && "$PARALLEL" != 1 ) ]] \
     || fail E_CONFIG 'KV_SHARD=1 needs KV=fp8, KV_PAGES=on, DRAFTER=dflash2 or none, and PARALLEL=auto or above 1.'
   [[ "$L2PF" =~ ^[01]$ ]] || fail E_CONFIG 'L2PF must be 0 or 1 (TF_GLM_L2PF).'
