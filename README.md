@@ -100,6 +100,17 @@ Prefill was tuned on 2026-11-02 (docs/speed/RESULTS.md): `ABSORB_MMA` is +8.0% w
 (one of ten answers wrong) and stays off; `q4` dense is rejected on quality; the cable is about 3% of a long prompt's
 time. At equal dense width the engine is at parity with the v1.0.7 build's prefill.
 
+For long prompts with Q8 dense weights on a GB10 pair, set `TF_GLM_PROMPT_WIDE=1` when starting both ranks with
+`./start.sh`. A 256-row CUDA tile reuses the packed weights of the 12,576 × 4,096 projection across twice as many
+prompt rows. The engine selects it at 2,048 rows or more on SM121. The default is off.
+
+With three matched cold requests per length, median time to first token at 32,768 input tokens fell from 18.08 s to
+17.33 s. Input throughput rose 3.1%, 4.3%, and 4.2% at 4K, 32K, and 64K. Both runs used the same CUDA 13.0
+binary, EXL3 checkpoint, Q8 dense and head weights, `W8A8=0`, and one client. All ten sampled greedy answers
+and four passage likelihoods matched. To run the focused operator checks on a Spark with the tools image, use
+`docker run --rm --gpus all <image> tf-cuda-test glm-mm-wide-contract`.
+[Matched requests, CUDA checks and reproduction instructions](https://github.com/looskis/labski/tree/b4874b107855f9e56e41df923ccd9f3466aaa2e4/inference-recipes/results/glm53-tensorfold-wide-2026-11-18/)
+
 ## Requirements
 
 - **Two DGX Sparks** (GB10, 128 GB, CUDA 13 driver) cabled to each other on their ConnectX-7 ports, with IPv4
@@ -314,9 +325,9 @@ and MMLU 88.4%, thinking-on categories unchanged.
 
 ## Engine patches
 
-`patches/engine/` holds 121 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
+`patches/engine/` holds 122 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
 the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0106 and 0111-0121 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. None is GB10-specific: the arch-gated kernels test
+0094-0106 and 0111-0121 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. In patches 0001–0121 the arch-gated kernels test
 `__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
 
 | Patches | What they do |
@@ -345,6 +356,7 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0119 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (0039 had 16), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Fixes what the wider window exposes on this stack: shared-window scratch is said outright (a 32-row segment no longer shrinks the KDA projection buffer to 4 bytes or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. Not taken: load-timed pricing, 15-deep MTP chains, and #1779's shared reservation (upstream turned it off for DFlash2, cc2fa8d23). On the pair (2026-11-11, greedy, token hashes identical): a 1,195-token file rewrite at one stream 151 to 201-205 tok/s decode (14.9 to 26.6 tokens a round); prose at 1/4/8 streams and four-stream rewrites unchanged; 34 MiB more fixed memory a stream |
 | 0120 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids and leave the reply as they do. A name the tokenizer does not hold refuses the start; unset, the EOS list is the checkpoint's |
 | 0121 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default (`THINK_OFF_SPLIT=0`; 1024 is the hold the author measured)): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, whole and streamed alike (a stream holds its content until the token, the hold or the end). A close after the hold stays text; raw completions, the JSON channel and logprobs requests are never split. Tests: `zig build test-think-off-split-host` |
+| NNNN (GB10 Q8 prefill) | `TF_GLM_PROMPT_WIDE=1` enables the 256-row tile for long prompts on the GB10 pair. [Measurements](#performance) |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
 
