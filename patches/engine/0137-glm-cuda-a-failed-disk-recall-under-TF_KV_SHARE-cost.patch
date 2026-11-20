@@ -1,0 +1,777 @@
+From d350c077c90910e6dea5a8bfd697ad5c26d23720 Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] glm cuda: a failed disk recall under TF_KV_SHARE costs a cold
+ pass, not the lane
+
+Rank 0 gives the pages back, drops the blank state, marks the disk state unreadable for this process and counts disk_recalls_failed. A rank other than 0 no longer leaves its step loop on a failed disk op: it poisons the state being recalled, skips that state's later writes and answers the seal and each read with a status word. A failed read for a save leaves the kept state in place.
+---
+ zig/src/core/prompt_cache.zig                 |   2 +-
+ zig/src/core/prompt_radix.zig                 |  10 +-
+ zig/src/core/prompt_radix_disk_test.zig       | 111 +++++++++-
+ zig/src/core/rows_read.zig                    |   7 +-
+ zig/src/core/rows_refusal_test.zig            |   2 +-
+ zig/src/core/rows_select.zig                  |   1 +
+ zig/src/core/rows_store.zig                   |   9 +
+ zig/src/families/glm/cuda_disk_ranks.zig      | 192 +++++++++++++-----
+ zig/src/families/glm/cuda_disk_shard_test.zig |  87 ++++++++
+ zig/src/families/glm/cuda_engine.zig          |   3 +
+ 10 files changed, 366 insertions(+), 58 deletions(-)
+
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 7d679514..1c073f02 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -128,7 +128,7 @@ pub const Entry = struct {
+     own: []u32 = &.{}, // the kept prompt's one copy, which `tokens` and at first `last` slice (empty: they own theirs)
+ };
+ 
+-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
++pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, disk_recalls_failed: u64 = 0 };
+ 
+ pub const RestoreDetails = @import("prompt_cache_restore.zig").Details;
+ pub const RestoreLog = @import("prompt_cache_restore.zig").Log;
+diff --git a/zig/src/core/prompt_radix.zig b/zig/src/core/prompt_radix.zig
+index 035addbf..bd6675b1 100644
+--- a/zig/src/core/prompt_radix.zig
++++ b/zig/src/core/prompt_radix.zig
+@@ -381,8 +381,16 @@ pub const Store = struct {
+             t.evict(s.victim(prompt, found) orelse return found);
+         }
+         var pages: std.ArrayList(u32) = .empty;
++        const name = st.name;
++        const at = st.at;
+         // the new pages beside the prefix the tree holds: the state's home is then its adopted pages' part
+-        const got = rows.read.readPages(r, i, s.firstHeld(prompt), &pages) catch {
++        const got = rows.read.readPages(r, i, s.firstHeld(prompt), &pages) catch |err| {
++            // the recall failed: rank 0 stays consistent — the pages it held go back (pool or part), the blank state
++            // is dropped (rows_read's), the tree unchanged, the state not read again here, and the pass runs cold
++            r.markUnreadable(name);
++            t.counts.disk_recalls_failed += 1;
++            note("recalling {d} tokens from disk failed ({s}); the pass prefills from the start", .{ at, @errorName(err) });
++            for (pages.items) |id| t.pages.vtable.release(t.pages.ptr, id);
+             pages.deinit(t.gpa);
+             return found;
+         };
+diff --git a/zig/src/core/prompt_radix_disk_test.zig b/zig/src/core/prompt_radix_disk_test.zig
+index e7e254c3..aafed3e8 100644
+--- a/zig/src/core/prompt_radix_disk_test.zig
++++ b/zig/src/core/prompt_radix_disk_test.zig
+@@ -10,7 +10,7 @@ const t = std.testing;
+ 
+ const page_tokens = 4; // tokens a page holds (rules.page)
+ const page_bytes = 8; // bytes of row data a page holds: its 4 tokens, 2 bytes a row
+-const page_count = 16; // pages the pool has
++const page_count = 264; // pages the pool has (a 256-token state's block piece and its own file are two reads)
+ const words_bytes = 16; // the image's words: the position and the running sum
+ const fixed_bytes = 8; // the image's fixed part past the rows: the slot's own
+ 
+@@ -61,6 +61,9 @@ const Fake = struct {
+     mem: []u8, // the pages' bytes: a page's rows at [0, page_bytes), as the paged caches sit on a page
+     live: usize = 0,
+     blanks: usize = 0,
++    scatters: usize = 0, // the scatter calls so far (a recall's pieces: its block, then its own file)
++    fail_scatter_nth: usize = 0, // the Nth scatter call fails (1-based; the first carries the words, where GLM's seal runs)
++    fail_blank_pages: bool = false, // blank_pages holds its pages and fails, as a rank's recall blank that loses its state does
+ 
+     fn of(ptr: *anyopaque) *Fake {
+         return @ptrCast(@alignCast(ptr));
+@@ -186,22 +189,33 @@ const Fake = struct {
+ 
+     fn blankPagesFn(ptr: *anyopaque, at: u32, _: ?u32, out: *std.ArrayList(u32)) anyerror!pc.Saved {
+         const f = of(ptr);
++        if (f.fail_blank_pages) {
++            const held = try f.gpa.alloc(u32, at / page_tokens);
++            defer f.gpa.free(held);
++            if (f.pool.hold(held)) for (held) |id| f.pool.release(id); // its pages go back, as the image's cleanup does
++            return error.LaneMemory;
++        }
+         if (at % page_tokens != 0) return error.BadKeptRange;
+         const k = try f.gpa.create(Kept);
+         errdefer f.gpa.destroy(k);
+         const slot = try f.gpa.alloc(u8, words_bytes + fixed_bytes);
+         errdefer f.gpa.free(slot);
+         @memset(slot, 0);
+-        out.resize(f.gpa, at / page_tokens) catch return error.LaneMemory;
+-        if (!f.pool.hold(out.items)) return error.LaneMemory; // the pages held for the caller's tree
++        var ids: [page_count]u32 = undefined;
++        const n = at / page_tokens;
++        if (!f.pool.hold(ids[0..n])) return error.LaneMemory; // the pages held for the caller's tree
++        errdefer for (ids[0..n]) |id| f.pool.release(id); // the caller's list sees them once they are all held
+         k.* = .{ .at = at, .slot = slot };
+         f.live += 1;
+         f.blanks += 1;
++        try out.appendSlice(f.gpa, ids[0..n]);
+         return k;
+     }
+ 
+     fn scatterFn(ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
+         const f = of(ptr);
++        f.scatters += 1;
++        if (f.fail_scatter_nth == f.scatters) return error.ScatterFailed;
+         const k: *Kept = @ptrCast(@alignCast(saved));
+         var o: usize = 0;
+         for (ranges) |g| {
+@@ -274,7 +288,7 @@ const Rig = struct {
+         const np = prompt.len / page_tokens;
+         var mine: [page_count]u32 = undefined;
+         try t.expect(x.pool.hold(mine[0..np]));
+-        x.f.fill(mine[0..np], @intCast(prompt.len));
++        x.f.fill(mine[0..np], @intCast(np * page_tokens)); // the whole pages' rows (a pass's partial last page sits in its stream)
+         for (marks) |m| {
+             var path: [page_count]u32 = undefined;
+             const kept = x.s.keep(prompt, m, null, mine[0 .. m / page_tokens], path[0 .. m / page_tokens]);
+@@ -401,3 +415,92 @@ test "TF_KV_SHARE's disk tier: two identities over one root keep their own direc
+     try t.expectEqual(@as(usize, 1), x.r.states.items.len);
+     try t.expectEqual(@as(usize, 0), y.r.states.items.len); // the other identity's store holds none of it
+ }
++
++/// A restart whose first recall fails at the fake's injected point: the pass runs cold, rank 0's pieces back.
++fn failedRecall(gpa: Allocator, root: []const u8, identity: u64, inject: anytype) !void {
++    const build = struct {
++        fn prompt(comptime n: usize) [n]u32 {
++            var out: [n]u32 = undefined;
++            for (&out, 0..) |*x, i| x.* = @intCast(1 + i % 7);
++            return out;
++        }
++    }.prompt;
++    {
++        const w = try Rig.open(gpa, root, identity);
++        defer w.close();
++        const prompt = build(259); // a state at 256 has a block piece and its own file: two reads
++        try w.pass(&prompt, &.{256});
++        w.drain();
++        try t.expectEqual(@as(usize, 1), w.r.states.items.len);
++    }
++    const x = try Rig.open(gpa, root, identity);
++    defer x.close();
++    inject(x);
++    const longer = build(264);
++    x.f.prompt = &longer;
++    var adopt: std.ArrayList(u32) = .empty;
++    defer {
++        for (adopt.items) |id| x.pool.release(id);
++        adopt.deinit(gpa);
++    }
++    const plan = try x.s.begin(gpa, &longer, 12, &.{}, null, &adopt);
++    defer gpa.free(plan.marks);
++    try t.expectEqual(@as(u32, 0), plan.from); // the pass runs cold: nothing adopted
++    try t.expectEqual(@as(usize, 0), adopt.items.len);
++    try t.expectEqual(@as(usize, page_count), x.pool.available()); // the recall's pages given back
++    try t.expectEqual(@as(usize, 0), x.s.tree.snaps); // the tree unchanged
++    try t.expectEqual(@as(usize, 0), x.s.tree.held_pages);
++    try t.expectEqual(@as(usize, 0), x.f.live); // the blank state dropped (the existing drop path)
++    try t.expectEqual(@as(u64, 1), x.s.tree.counts.disk_recalls_failed); // counted beside the store's others
++    try t.expect(x.r.states.items[0].unreadable); // the state marked: not read again in this process
++    // a second begin for the same prompt does not read the disk again
++    const scatters = x.f.scatters;
++    const blanks = x.f.blanks;
++    const reads = x.r.counts.reads;
++    var adopt2: std.ArrayList(u32) = .empty;
++    defer adopt2.deinit(gpa);
++    const again = try x.s.begin(gpa, &longer, 12, &.{}, null, &adopt2);
++    defer gpa.free(again.marks);
++    try t.expectEqual(@as(u32, 0), again.from);
++    try t.expectEqual(@as(usize, 0), adopt2.items.len);
++    try t.expectEqual(scatters, x.f.scatters);
++    try t.expectEqual(blanks, x.f.blanks);
++    try t.expectEqual(reads, x.r.counts.reads);
++    try t.expectEqual(@as(u64, 1), x.s.tree.counts.disk_recalls_failed); // still the one failure
++}
++
++test "TF_KV_SHARE's disk tier: a recall whose scatter fails midway costs a cold pass, its pages and blank back" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
++    defer t.allocator.free(root);
++    try failedRecall(t.allocator, root, 14, struct {
++        fn go(x: *Rig) void {
++            x.f.fail_scatter_nth = 1; // the block piece fails midway through the read
++        }
++    }.go);
++}
++
++test "TF_KV_SHARE's disk tier: a recall whose seal fails costs a cold pass, its pages and blank back" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
++    defer t.allocator.free(root);
++    try failedRecall(t.allocator, root, 15, struct {
++        fn go(x: *Rig) void {
++            x.f.fail_scatter_nth = 2; // the state's own file fails: it carries the words, where GLM's seal runs
++        }
++    }.go);
++}
++
++test "TF_KV_SHARE's disk tier: a failing blank_pages costs a cold pass, its pages back" {
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
++    defer t.allocator.free(root);
++    try failedRecall(t.allocator, root, 16, struct {
++        fn go(x: *Rig) void {
++            x.f.fail_blank_pages = true;
++        }
++    }.go);
++}
+diff --git a/zig/src/core/rows_read.zig b/zig/src/core/rows_read.zig
+index 26789412..e6590f51 100644
+--- a/zig/src/core/rows_read.zig
++++ b/zig/src/core/rows_read.zig
+@@ -150,7 +150,12 @@ pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32,
+     e.tokens = s.gpa.dupe(u32, st.tokens) catch return have;
+     e.decode_spans = s.gpa.dupe(modes.Span, st.spans) catch return have;
+     e.last = s.gpa.dupe(u32, prompt) catch return have;
+-    e.saved = read(r, i) catch return have;
++    e.saved = read(r, i) catch |err| { // the read failed: the state is not read again in this process
++        r.markUnreadable(name);
++        s.counts.disk_recalls_failed += 1;
++        pc.note("imprint: reading {d} tokens back failed ({s}); the state is not read again here", .{ at, @errorName(err) });
++        return have;
++    };
+     if (s.family.vtable.charged) |f| e.bytes = f(s.family.ptr, e.saved);
+     @import("prompt_cache_index.zig").add(s, e) catch {
+         s.family.vtable.drop(s.family.ptr, e.saved);
+diff --git a/zig/src/core/rows_refusal_test.zig b/zig/src/core/rows_refusal_test.zig
+index 5b298996..7674461e 100644
+--- a/zig/src/core/rows_refusal_test.zig
++++ b/zig/src/core/rows_refusal_test.zig
+@@ -125,7 +125,7 @@ fn recalled(a: Allocator, tag: []const u8, c: Case, read_ahead: bool) !void {
+     try t.expectEqual(@as(u64, 0), x.r.counts.reads);
+     try t.expectEqual(@as(u64, if (c.mine) 0 else 1), x.r.counts.failed);
+     try t.expectEqual(@as(usize, @intFromBool(c.mine)) + @intFromBool(c.other), x.r.states.items.len);
+-    try t.expectEqual(c.mine, x.r.best(turns[0], &.{}, &.{}, 0) != null);
++    try t.expect(x.r.best(turns[0], &.{}, &.{}, 0) == null); // the read failed: refused ones are forgotten, the rest marked, not read again here
+     try t.expectEqual(c.mine, exists(x.r, own.name, ".st"));
+     try t.expectEqual(c.other, exists(x.r, other, ".st"));
+     try t.expectEqual(c.mine or c.other, exists(x.r, shared.name, ".blk"));
+diff --git a/zig/src/core/rows_select.zig b/zig/src/core/rows_select.zig
+index a3f1529e..d9cc3e48 100644
+--- a/zig/src/core/rows_select.zig
++++ b/zig/src/core/rows_select.zig
+@@ -17,6 +17,7 @@ pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, span
+     var out: Choice = .{};
+     var best_saved: f64 = 0;
+     for (r.states.items, 0..) |*state, i| {
++        if (state.unreadable) continue; // a recall of it failed here: not read again (rows_store.markUnreadable)
+         if (s.family.vtable.bytes(s.family.ptr, state.at) > room) continue;
+         if (!r.matches(state, prompt, starts, spans)) continue;
+         if (out.disk == null or state.at > r.states.items[out.disk.?].at) out.disk = i;
+diff --git a/zig/src/core/rows_store.zig b/zig/src/core/rows_store.zig
+index 20c5f1f7..1501c725 100644
+--- a/zig/src/core/rows_store.zig
++++ b/zig/src/core/rows_store.zig
+@@ -80,6 +80,8 @@ pub const State = struct {
+     rows: u64,
+     used: u64,
+     shared: bool,
++    /// A recall of it failed in this process: not read again (its files stay, for a process that can read it).
++    unreadable: bool = false,
+ };
+ 
+ /// A block file's bytes, and how many states name it.
+@@ -302,9 +304,11 @@ pub const Rows = struct {
+     }
+ 
+     /// The disk state reaching furthest into `prompt` past `longer_than`: its tokens a prefix, spans and starts equal.
++    /// A state a recall of already failed here is not read again (rows_read's mark): the next request prefills cold.
+     pub fn best(r: *const Rows, prompt: []const u32, starts: []const u32, spans: []const Span, longer_than: u32) ?usize {
+         var out: ?usize = null;
+         for (r.states.items, 0..) |*s, i| {
++            if (s.unreadable) continue;
+             if (s.at <= longer_than) continue;
+             if (out != null and s.at <= r.states.items[out.?].at) continue;
+             if (!r.matches(s, prompt, starts, spans)) continue;
+@@ -320,6 +324,11 @@ pub const Rows = struct {
+         return !r.keying.planned or sameBelow(starts, s.starts, s.at);
+     }
+ 
++    /// The state named `name` is not read again in this process (a recall of it failed; its files stay on disk).
++    pub fn markUnreadable(r: *Rows, name: Name) void {
++        if (r.find(name)) |i| r.states.items[i].unreadable = true;
++    }
++
+     /// State `i` was used now: the newest for eviction.
+     pub fn touch(r: *Rows, i: usize) void {
+         r.clock += 1;
+diff --git a/zig/src/families/glm/cuda_disk_ranks.zig b/zig/src/families/glm/cuda_disk_ranks.zig
+index 5410e00f..eea91069 100644
+--- a/zig/src/families/glm/cuda_disk_ranks.zig
++++ b/zig/src/families/glm/cuda_disk_ranks.zig
+@@ -17,6 +17,11 @@ const Engine = @import("cuda_engine.zig").Engine;
+ pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, key_put, lat_put, lat_take, slot_put, slot_take, page_put, page_take };
+ const kind = @backingInt(follow.Kind.disk); // each op crosses the follow link as a disk step, its bytes as the ids
+ 
++/// A take's answer crosses the link as its bytes and one status word past them (0 ok, else the op failed on the
++/// rank that answered): rank 0 fails the op here instead of gathering what a broken rank's copy sent. A seal's
++/// answer is the status word alone, rank order: a rank whose ops failed for the id fails rank 0's seal with it.
++const status_bytes: usize = @sizeOf(u32);
++
+ /// This rank's image shape (every sequence of the engine has the same).
+ pub fn shape(e: anytype) !image.Shape {
+     return image.Shape.of(&e.cur.st, &e.c, e.capacity, e.mtp);
+@@ -110,27 +115,43 @@ pub fn put(e: *Engine, rank: u32, id: u64, off: u64, bytes: []const u8) !void {
+     }
+ }
+ 
+-/// Rank 0: rank `rank`'s image bytes of `id` from `off` into `out`.
++/// Rank 0: rank `rank`'s image bytes of `id` from `off` into `out`; its answer carries this rank's status word past
++/// the bytes, a rank whose op failed failing the take here (its state poisoned, its half-made copy dropped there).
+ pub fn take(e: *Engine, rank: u32, id: u64, off: u64, out: []u8) !void {
+     if (rank == 0) return copy(e, id, off, out, true);
+     const x = leader(e) orelse return error.NoRank;
+-    const room = x.link.ids.len * 4;
++    const room = x.link.ids.len * 4 - status_bytes;
+     var done: usize = 0;
+     while (done < out.len) {
+         const n = @min(room, out.len - done);
+         try x.disk(.{ .kind = kind, .flags = @backingInt(Op.take), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+-        try x.link.from(rank, n);
++        try x.link.from(rank, n + status_bytes);
+         try x.link.buf.download(64, out[done..][0..n]);
++        if (try status(x.link, n) != 0) return error.DiskRankFailed;
+         done += n;
+     }
+ }
+ 
+-/// Rank 0: every rank's blank `id` sealed with `w` (its head's rows, ring bases and KDA copy bits).
++/// The status word a take or seal answered with, `past` bytes into the link's buffer after its header.
++fn status(l: *follow.Link, past: usize) !u32 {
++    var ok: u32 = 0;
++    try l.buf.download(64 + past, std.mem.asBytes(&ok));
++    return ok;
++}
++
++/// Rank 0: every rank's blank `id` sealed with `w` (its head's rows, ring bases and KDA copy bits). Each rank's seal
++/// answers with its step's status: a rank whose disk ops failed for this id (or whose seal refused the words) fails
++/// the seal here, so its broken copy costs rank 0's recall a cold pass, never the pair's step loops.
+ pub fn seal(e: *Engine, id: u64, w: image.Words) !void {
+     try e.sealState(id, w.mtp_len, .{ w.base, w.mtp_base }, w.cur);
+     if (leader(e)) |x| {
+         const words = w.encode();
+         try x.disk(.{ .kind = kind, .flags = @backingInt(Op.seal), .a = id }, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&words)));
++        var r: u32 = 1;
++        while (r < e.share.world) : (r += 1) {
++            try x.link.from(r, status_bytes);
++            if (try status(x.link, 0) != 0) return error.DiskRankFailed;
++        }
+     }
+ }
+ 
+@@ -147,14 +168,15 @@ pub fn keyPage(e: *Engine, rank: u32, id: u32, off: u64, host: []u8, out: bool)
+     const x0 = try shard(e);
+     if (rank == 0) return shardBytes(e, x0.keys orelse return error.NoPages, x0.g.keyPage(), id, off, host, out);
+     const x = leader(e) orelse return error.NoRank;
+-    const room = x.link.ids.len * 4;
++    const room = x.link.ids.len * 4 - status_bytes;
+     var done: usize = 0;
+     while (done < host.len) {
+         const n = @min(room, host.len - done);
+         if (out) {
+             try x.disk(.{ .kind = kind, .flags = @backingInt(Op.lat_take), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+-            try x.link.from(rank, n);
++            try x.link.from(rank, n + status_bytes);
+             try x.link.buf.download(64, host[done..][0..n]);
++            if (try status(x.link, n) != 0) return error.DiskRankFailed;
+         } else {
+             @memcpy(std.mem.sliceAsBytes(x.link.ids[0..words4(n)])[0..n], host[done..][0..n]);
+             try x.disk(.{ .kind = kind, .flags = @backingInt(Op.key_put), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, x.link.ids[0..words4(n)]);
+@@ -169,14 +191,15 @@ pub fn latPage(e: *Engine, rank: u32, id: u32, off: u64, host: []u8, out: bool)
+     const x0 = try shard(e);
+     if (rank == 0) return shardBytes(e, x0.lat orelse return error.NoPages, x0.g.latPage(), id, off, host, out);
+     const x = leader(e) orelse return error.NoRank;
+-    const room = x.link.ids.len * 4;
++    const room = x.link.ids.len * 4 - status_bytes;
+     var done: usize = 0;
+     while (done < host.len) {
+         const n = @min(room, host.len - done);
+         if (out) {
+             try x.disk(.{ .kind = kind, .flags = @backingInt(Op.lat_take), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+-            try x.link.from(rank, n);
++            try x.link.from(rank, n + status_bytes);
+             try x.link.buf.download(64, host[done..][0..n]);
++            if (try status(x.link, n) != 0) return error.DiskRankFailed;
+         } else {
+             @memcpy(std.mem.sliceAsBytes(x.link.ids[0..words4(n)])[0..n], host[done..][0..n]);
+             try x.disk(.{ .kind = kind, .flags = @backingInt(Op.lat_put), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, x.link.ids[0..words4(n)]);
+@@ -201,14 +224,15 @@ fn shardBytes(e: *Engine, buf: cuda.DeviceBuffer, stride: u64, id: u32, off: u64
+ pub fn slot(e: *Engine, rank: u32, id: u64, off: u64, host: []u8, out: bool) !void {
+     if (rank == 0) return snapshots.slotBytes(e, e.snaps.getPtr(id) orelse return error.NoKeptState, @intCast(off), host, out);
+     const x = leader(e) orelse return error.NoRank;
+-    const room = x.link.ids.len * 4;
++    const room = x.link.ids.len * 4 - status_bytes;
+     var done: usize = 0;
+     while (done < host.len) {
+         const n = @min(room, host.len - done);
+         if (out) {
+             try x.disk(.{ .kind = kind, .flags = @backingInt(Op.slot_take), .a = @intCast(id), .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+-            try x.link.from(rank, n);
++            try x.link.from(rank, n + status_bytes);
+             try x.link.buf.download(64, host[done..][0..n]);
++            if (try status(x.link, n) != 0) return error.DiskRankFailed;
+         } else {
+             @memcpy(std.mem.sliceAsBytes(x.link.ids[0..words4(n)])[0..n], host[done..][0..n]);
+             try x.disk(.{ .kind = kind, .flags = @backingInt(Op.slot_put), .a = @intCast(id), .seed = off + done, .depth = @intCast(n), .top_k = rank }, x.link.ids[0..words4(n)]);
+@@ -231,14 +255,15 @@ pub fn poolPage(e: *Engine, rank: u32, id: u32, off: u64, host: []u8, out: bool)
+         return;
+     }
+     const x = leader(e) orelse return error.NoRank;
+-    const room = x.link.ids.len * 4;
++    const room = x.link.ids.len * 4 - status_bytes;
+     var done: usize = 0;
+     while (done < host.len) {
+         const n = @min(room, host.len - done);
+         if (out) {
+             try x.disk(.{ .kind = kind, .flags = @backingInt(Op.page_take), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+-            try x.link.from(rank, n);
++            try x.link.from(rank, n + status_bytes);
+             try x.link.buf.download(64, host[done..][0..n]);
++            if (try status(x.link, n) != 0) return error.DiskRankFailed;
+         } else {
+             @memcpy(std.mem.sliceAsBytes(x.link.ids[0..words4(n)])[0..n], host[done..][0..n]);
+             try x.disk(.{ .kind = kind, .flags = @backingInt(Op.page_put), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, x.link.ids[0..words4(n)]);
+@@ -357,63 +382,130 @@ fn mut(comptime m: Mutant) bool {
+     return @import("builtin").is_test and mutant == m;
+ }
+ 
+-/// A rank other than 0: rank 0's disk step on this rank's copy of its state.
++/// A disk op that failed on this rank: the id poisoned (its later writes skipped, its seal and takes answer with
++/// the failure) and its half-made state dropped — rank 0's own drop covers the pair when its recall gives up. The
++/// error stays here: out of the step loop it would end this rank and with it the lane (a failed disk recall or
++/// save costs rank 0 a cold pass or a skipped save, never the ranks).
++fn poison(e: *Engine, id: u64, err: anyerror) void {
++    std.log.warn("rank {d}: a disk step for state {d} failed ({s}); the state is dropped here and rank 0 gives its recall or save up", .{ e.share.rank, id, @errorName(err) });
++    e.disk_failed.put(e.gpa, id, {}) catch {};
++    e.dropState(id);
++}
++
++/// A take's answer on this rank: its bytes into the link's ids with this rank's status word past them (a poisoned
++/// id's bytes are stale and its status says so; a failing op poisons the id and answers with its failure), then the
++/// link's broadcast the op's answer crosses by. The step loop runs on either way.
++fn answered(e: *Engine, l: *follow.Link, h: follow.Header, rank: u32, state: ?u64, body: *const fn (*Engine, follow.Header, []u8) anyerror!void) !void {
++    if (h.depth > l.ids.len * 4 - status_bytes) return error.BadStep;
++    var ok: u32 = 0;
++    if (h.top_k == rank) {
++        const bytes = std.mem.sliceAsBytes(l.ids);
++        const host = bytes[0..h.depth];
++        // a failed read answers with its failure and nothing more: the state it read stays (rank 0 still holds its
++        // copy and may resume from it; a save of it is what is skipped). A state a failed recall dropped here fails
++        // its reads by being gone.
++        if (state != null and e.disk_failed.contains(state.?)) ok = 1 else if (body(e, h, host)) |_| {} else |err| {
++            std.log.warn("rank {d}: a disk read for {d} failed ({s}); rank 0's save of it is skipped", .{ e.share.rank, h.a, @errorName(err) });
++            ok = 1;
++        }
++        std.mem.writeInt(u32, bytes[h.depth..][0..status_bytes], ok, .little);
++        l.buf.uploadAsync(64, bytes[0 .. h.depth + status_bytes], l.stream.handle) catch {};
++    }
++    try l.from(h.top_k, h.depth + status_bytes);
++}
++
++fn takeBody(e: *Engine, h: follow.Header, host: []u8) anyerror!void {
++    return copy(e, h.a, h.seed, host, true);
++}
++
++fn latTakeBody(e: *Engine, h: follow.Header, host: []u8) anyerror!void {
++    return shardBytes(e, (try shard(e)).lat orelse return error.NoPages, (try shard(e)).g.latPage(), @intCast(h.a), h.seed, host, true);
++}
++
++fn slotTakeBody(e: *Engine, h: follow.Header, host: []u8) anyerror!void {
++    return snapshots.slotBytes(e, e.snaps.getPtr(h.a) orelse return error.NoKeptState, @intCast(h.seed), host, true);
++}
++
++fn pageTakeBody(e: *Engine, h: follow.Header, host: []u8) anyerror!void {
++    return poolPage(e, 0, @intCast(h.a), h.seed, host, true);
++}
++
++fn putBody(e: *Engine, h: follow.Header, host: []u8) anyerror!void {
++    return copy(e, h.a, h.seed, host, false);
++}
++
++/// One of rank 0's page and slot writes on this rank's copy (the op's body, unchanged).
++fn pagePutBody(e: *Engine, op: Op, h: follow.Header, host: []u8) anyerror!void {
++    switch (op) {
++        .key_put => try shardBytes(e, (try shard(e)).keys orelse return error.NoPages, (try shard(e)).g.keyPage(), @intCast(h.a), h.seed, host, false),
++        .lat_put => try shardBytes(e, (try shard(e)).lat orelse return error.NoPages, (try shard(e)).g.latPage(), @intCast(h.a), h.seed, host, false),
++        .slot_put => try snapshots.slotBytes(e, e.snaps.getPtr(h.a) orelse return error.NoKeptState, @intCast(h.seed), host, false),
++        .page_put => try poolPage(e, 0, @intCast(h.a), h.seed, host, false),
++        else => unreachable,
++    }
++}
++
++/// The seal's words decoded and sealed on this rank's copy of `id` (the op's body, unchanged).
++fn sealBody(e: *Engine, id: u64, ids: []const u32) !void {
++    var x: [image.Words.count]u64 = undefined;
++    @memcpy(std.mem.sliceAsBytes(&x), std.mem.sliceAsBytes(ids));
++    const w = try image.Words.decode(x, @intCast((e.snaps.get(id) orelse return error.NoKeptState).pos));
++    try e.sealState(id, w.mtp_len, .{ w.base, w.mtp_base }, w.cur);
++}
++
++/// A rank other than 0: rank 0's disk step on this rank's copy of its state. An op that fails here poisons its id
++/// (poison) and the step loop runs on; only a step that breaks the protocol itself ends this rank.
+ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !void {
+     if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.page_take)) return error.BadStep;
+     const op: Op = @fromBackingInt(h.flags);
+     const rank: u32 = @intCast(e.share.rank);
++    const write_op = switch (op) {
++        .blank, .put, .key_put, .lat_put, .slot_put, .page_put => true,
++        else => false,
++    };
++    // a page op's `a` is a pool page id, not a state's: its state is the one this rank last blanked (rank 0 recalls
++    // one state at a time: blank, its pieces, seal)
++    const state: u64 = switch (op) {
++        .key_put, .lat_put, .page_put => e.disk_cur,
++        else => h.a,
++    };
++    if (op == .blank) e.disk_cur = h.a;
++    if (write_op and e.disk_failed.contains(state)) return; // a poisoned id's writes are skipped: its seal says so
+     switch (op) {
+         .blank => {
+             if (h.depth > image.Words.kv_parts or (h.depth != 0 and !e.settings.kv_shard.on)) return error.BadStep;
+-            try e.blankAs(h.a, @intCast(h.seed), if (h.depth == 0) null else @intCast(h.depth - 1), h.top_k);
++            if (e.blankAs(h.a, @intCast(h.seed), if (h.depth == 0) null else @intCast(h.depth - 1), h.top_k)) |_| {} else |err| poison(e, h.a, err);
+         },
+         .seal => {
+             if (ids.len != 2 * image.Words.count) return error.BadStep;
+-            var x: [image.Words.count]u64 = undefined;
+-            @memcpy(std.mem.sliceAsBytes(&x), std.mem.sliceAsBytes(ids));
+-            const w = try image.Words.decode(x, @intCast((e.snaps.get(h.a) orelse return error.NoKeptState).pos));
+-            try e.sealState(h.a, w.mtp_len, .{ w.base, w.mtp_base }, w.cur);
++            var ok: u32 = if (e.disk_failed.contains(h.a)) 1 else 0; // a poisoned id's seal answers with its failure
++            if (ok == 0) if (sealBody(e, h.a, ids)) |_| {} else |err| {
++                poison(e, h.a, err);
++                ok = 1;
++            };
++            // the seal's answer crosses the link, rank order: each rank's status word (0 its seal stood, 1 it failed)
++            const bytes = std.mem.sliceAsBytes(l.ids);
++            std.mem.writeInt(u32, bytes[0..status_bytes], ok, .little);
++            var r: u32 = 1;
++            while (r < e.share.world) : (r += 1) {
++                if (r == rank) l.buf.uploadAsync(64, bytes[0..status_bytes], l.stream.handle) catch {};
++                try l.from(r, status_bytes);
++            }
+         },
+         .put => if (h.top_k == rank) {
+             if (h.depth > ids.len * 4) return error.BadStep;
+-            try copy(e, h.a, h.seed, @constCast(std.mem.sliceAsBytes(ids))[0..h.depth], false);
+-        },
+-        .take => {
+-            if (h.depth > l.ids.len * 4) return error.BadStep;
+-            if (h.top_k == rank) {
+-                const host = std.mem.sliceAsBytes(l.ids)[0..h.depth];
+-                try copy(e, h.a, h.seed, host, true);
+-                try l.buf.uploadAsync(64, host, l.stream.handle);
+-            }
+-            try l.from(h.top_k, h.depth);
++            if (putBody(e, h, @constCast(std.mem.sliceAsBytes(ids))[0..h.depth])) |_| {} else |err| poison(e, h.a, err);
+         },
++        .take => try answered(e, l, h, rank, h.a, takeBody),
+         // rank 0's pool-page and slot writes and reads (a pages layout's rows and fixed parts, beside the shard its
+         // keys and its home's latent rows): the bytes ride the ids there and the link's buffer back
+         .key_put, .lat_put, .slot_put, .page_put => if (h.top_k == rank) {
+             if (h.depth > ids.len * 4) return error.BadStep;
+-            const host = @constCast(std.mem.sliceAsBytes(ids))[0..h.depth];
+-            switch (op) {
+-                .key_put => try shardBytes(e, (try shard(e)).keys orelse return error.NoPages, (try shard(e)).g.keyPage(), @intCast(h.a), h.seed, host, false),
+-                .lat_put => try shardBytes(e, (try shard(e)).lat orelse return error.NoPages, (try shard(e)).g.latPage(), @intCast(h.a), h.seed, host, false),
+-                .slot_put => try snapshots.slotBytes(e, e.snaps.getPtr(h.a) orelse return error.NoKeptState, @intCast(h.seed), host, false),
+-                .page_put => try poolPage(e, 0, @intCast(h.a), h.seed, host, false),
+-                else => unreachable,
+-            }
+-        },
+-        .lat_take, .slot_take, .page_take => {
+-            if (h.depth > l.ids.len * 4) return error.BadStep;
+-            if (h.top_k == rank) {
+-                const host = std.mem.sliceAsBytes(l.ids)[0..h.depth];
+-                switch (op) {
+-                    .lat_take => try shardBytes(e, (try shard(e)).lat orelse return error.NoPages, (try shard(e)).g.latPage(), @intCast(h.a), h.seed, host, true),
+-                    .slot_take => try snapshots.slotBytes(e, e.snaps.getPtr(h.a) orelse return error.NoKeptState, @intCast(h.seed), host, true),
+-                    .page_take => try poolPage(e, 0, @intCast(h.a), h.seed, host, true),
+-                    else => unreachable,
+-                }
+-                try l.buf.uploadAsync(64, host, l.stream.handle);
+-            }
+-            try l.from(h.top_k, h.depth);
++            if (pagePutBody(e, op, h, @constCast(std.mem.sliceAsBytes(ids))[0..h.depth])) |_| {} else |err| poison(e, state, err);
+         },
++        .lat_take => try answered(e, l, h, rank, null, latTakeBody),
++        .slot_take => try answered(e, l, h, rank, h.a, slotTakeBody),
++        .page_take => try answered(e, l, h, rank, null, pageTakeBody),
+         .prefixes => {
+             var out: [64]u64 = undefined;
+             if (e.share.world > out.len) return error.BadStep;
+diff --git a/zig/src/families/glm/cuda_disk_shard_test.zig b/zig/src/families/glm/cuda_disk_shard_test.zig
+index 72b2f4fa..15bf48af 100644
+--- a/zig/src/families/glm/cuda_disk_shard_test.zig
++++ b/zig/src/families/glm/cuda_disk_shard_test.zig
+@@ -13,6 +13,7 @@ const snap_pages = @import("cuda_snapshot_pages.zig");
+ const layout = @import("cuda_snapshot_layout.zig");
+ const image = @import("cuda_disk_image.zig");
+ const ranks = @import("cuda_disk_ranks.zig");
++const follow = @import("cuda_follow.zig");
+ const kvs = @import("cuda_kv_shard.zig");
+ const kv_keep = @import("cuda_kv_shard_keep.zig");
+ const Engine = @import("cuda_engine.zig").Engine;
+@@ -71,6 +72,19 @@ const H = struct {
+     fn wait(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+         return 0;
+     }
++    fn eventCreate(out: *cuda.abi.Event, _: c_uint) callconv(.c) cuda.abi.Result {
++        out.* = @ptrFromInt(8);
++        return 0;
++    }
++    fn eventDestroy(_: cuda.abi.Event) callconv(.c) cuda.abi.Result {
++        return 0;
++    }
++    fn eventRecord(_: cuda.abi.Event, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        return 0;
++    }
++    fn eventQuery(_: cuda.abi.Event) callconv(.c) cuda.abi.Result {
++        return 0;
++    }
+     fn hostAlloc(out: *?*anyopaque, n: usize, _: c_uint) callconv(.c) cuda.abi.Result {
+         var p: u64 = 0;
+         const r = alloc(&p, n);
+@@ -89,6 +103,16 @@ const H = struct {
+     fn rankOf(comm: cuda.nccl.Comm) usize {
+         return @intFromPtr(comm) - 1;
+     }
++    var link: [2]u64 = .{ 0, 0 }; // each rank's link buffer (the test notes it after Link.init)
++    fn bcast(buf: u64, _: u64, n: usize, _: cuda.nccl.DataType, root: c_int, comm: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
++        const r = rankOf(comm);
++        if (root < 0 or root >= link.len) return 3;
++        const g: usize = @intCast(root);
++        if (link[r] == 0 or link[g] == 0 or buf < link[r] or buf - link[r] + n > (64 + 256 * 4)) return 3;
++        const off = buf - link[r];
++        @memmove(bytes(link[r] + off, n), bytes(link[g] + off, n));
++        return 0;
++    }
+     fn send(buf: u64, n: usize, _: cuda.nccl.DataType, peer: c_int, comm: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+         const r = rankOf(comm);
+         if (@as(usize, @intCast(peer)) != 1 - r) return 3;
+@@ -108,6 +132,7 @@ const H = struct {
+     fn reset() void {
+         for (&queue) |*q| q.clearAndFree(std.heap.page_allocator);
+         taken = .{ 0, 0 };
++        link = .{ 0, 0 };
+     }
+ };
+ 
+@@ -135,11 +160,16 @@ const Rank = struct {
+         r.d.api.cuMemcpyDtoH_v2 = H.dtoh;
+         r.d.api.cuMemcpyDtoDAsync_v2 = H.dtod;
+         r.d.api.cuStreamSynchronize = H.wait;
++        r.d.api.cuEventCreate = H.eventCreate;
++        r.d.api.cuEventDestroy_v2 = H.eventDestroy;
++        r.d.api.cuEventRecord = H.eventRecord;
++        r.d.api.cuEventQuery = H.eventQuery;
+         r.d.api.cuMemHostAlloc = H.hostAlloc;
+         r.d.api.cuMemFreeHost = H.hostFree;
+         r.d.api.cuMemcpyDtoHAsync_v2 = H.toHost;
+         r.d.api.cuMemcpyHtoDAsync_v2 = H.fromHost;
+         r.lib = undefined;
++        r.lib.api.ncclBroadcast = H.bcast;
+         r.lib.api.ncclSend = H.send;
+         r.lib.api.ncclRecv = H.recv;
+         for (&r.layers, [_]bool{ false, true, false }) |*l, mla| l.mixer = if (mla) .{ .mla = undefined } else .{ .kda = undefined };
+@@ -166,6 +196,7 @@ const Rank = struct {
+         e.next_snap = 1;
+         e.announce = 0;
+         e.dropped = .empty;
++        e.disk_failed = .empty;
+         e.link = null;
+         e.lib = &r.lib;
+         e.comm = @ptrFromInt(rank + 1);
+@@ -185,6 +216,7 @@ const Rank = struct {
+         var it = e.snaps.valueIterator();
+         while (it.next()) |s| snapshots.free(e, s);
+         e.snaps.deinit(e.gpa);
++        e.disk_failed.deinit(e.gpa);
+         r.p.deinit();
+         for (e.seqs.items) |q| if (q) |s| {
+             s.st.deinit();
+@@ -320,6 +352,61 @@ fn prefixesOf(p: *Pair) ![2]u64 {
+     return .{ (try ranks.shape(&p.r[0].e)).prefix, (try ranks.shape(&p.r[1].e)).prefix };
+ }
+ 
++// Rank 1's disk steps with rank 0's link beside it: an op that fails here poisons its id, answers rank 0's takes
++// and seal with the failure, and the step loop runs on — a failed recall costs rank 0 a cold pass, not the rank.
++test "GLM disk steps: a follower's failed op poisons the id, answers the seal with a failure and the loop runs on" {
++    const a = std.testing.allocator;
++    var p: Pair = undefined;
++    try p.init(false, false);
++    defer p.deinit();
++    try p.open(1, prompt, null); // the bound stream the blanks' states stand beside
++    defer p.close(1);
++    try p.bind(1);
++    var link: [2]follow.Link = undefined;
++    for (&p.r, 0..) |*r, i| {
++        link[i] = try follow.Link.init(a, &r.d, &r.lib, r.e.comm, r.e.stream, 256);
++        H.link[i] = link[i].buf.ptr;
++    }
++    defer for (&link) |*l| l.deinit();
++    const e = &p.r[1].e;
++    const disk: u32 = @backingInt(follow.Kind.disk);
++    // its blank for id 3 stands
++    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.blank), .a = 3, .seed = at, .depth = 0, .top_k = 0 }, &.{});
++    try expect(e.snaps.contains(3));
++    // a write into it past the blank's front fails on this rank: the id poisoned, its half-made state dropped,
++    // and no error out of the step
++    var bytes: [2]u32 = undefined; // the op's 8 bytes of ids
++    const sh = try ranks.shape(e);
++    const put: follow.Header = .{ .kind = disk, .flags = @backingInt(ranks.Op.put), .a = 3, .seed = image.Words.bytes + image.front(sh, at) + 8, .depth = 8, .top_k = 1 };
++    try ranks.step(e, &link[1], put, &bytes);
++    try expect(!e.snaps.contains(3)); // the half-made state dropped
++    try expect(e.disk_failed.contains(3));
++    try ranks.step(e, &link[1], put, &bytes); // skipped, not an error
++    // a take for the poisoned id still crosses the link and answers with its status
++    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.take), .a = 3, .seed = 0, .depth = 8, .top_k = 1 }, &.{});
++    try link[0].from(1, 8 + @sizeOf(u32));
++    var answer: [8 + @sizeOf(u32)]u8 = undefined;
++    try link[0].buf.download(64, &answer);
++    try expectEqual(@as(u32, 1), std.mem.readInt(u32, answer[8..12], .little));
++    // its seal answers the failure too
++    var seal_ids: [2 * image.Words.count]u32 = undefined;
++    @memset(&seal_ids, 0);
++    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.seal), .a = 3 }, &seal_ids);
++    try link[0].from(1, @sizeOf(u32));
++    var ok: u32 = 0;
++    try link[0].buf.download(64, std.mem.asBytes(&ok));
++    try expectEqual(@as(u32, 1), ok);
++    // a healthy blank's seal answers 0 and stands sealed
++    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.blank), .a = 8, .seed = at, .depth = 0, .top_k = 0 }, &.{});
++    const words = (image.Words{ .at = at, .mtp_len = 0, .base = 0, .mtp_base = 0, .cur = 0 }).encode();
++    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.seal), .a = 8 }, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&words)));
++    try link[0].from(1, @sizeOf(u32));
++    try link[0].buf.download(64, std.mem.asBytes(&ok));
++    try expectEqual(@as(u32, 0), ok);
++    try expect(e.snaps.get(8).?.len != 0);
++    try expect(!e.disk_failed.contains(8));
++}
++
+ /// The store image of kept state `id` (rank 0's image, then rank 1's prefix), gathered in ranges across the seams.
+ fn write(p: *Pair, id: u64) ![]u8 {
+     const pre = try prefixesOf(p);
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index a6117bbe..d7521567 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -127,6 +127,8 @@ pub const Engine = struct {
+     next_snap: u64 = 1, // rank 0: the next id
+     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
+     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
++    disk_cur: u64 = 0, // a rank other than 0: the state rank 0 last blanked here, which its page writes belong to (cuda_disk_ranks)
++    disk_failed: std.AutoHashMapUnmanaged(u64, void) = .empty, // ids whose disk op failed on this rank (cuda_disk_ranks): their later writes are skipped and their seal answers with the failure
+     prompt_logprobs: ?prompt_lp.Want = null, // a prompt pass's rows asked for (every rank runs the head on them)
+     prompt_bufs: ?prompt_lp.Buffers = null, // their head passes' buffers, made at the first pass that asks
+     prompt_tried: bool = false, // that pass came: without buffers after it, the passes take the window's
+@@ -290,6 +292,7 @@ pub const Engine = struct {
+         e.snaps.deinit(e.gpa);
+         if (e.snap_pages) |*p| p.deinit();
+         e.dropped.deinit(e.gpa);
++        e.disk_failed.deinit(e.gpa);
+         e.shared_buf.free();
+         e.freeProfs();
+         if (e.prompt_bufs) |*b| b.free();
+-- 
+2.56.0
+

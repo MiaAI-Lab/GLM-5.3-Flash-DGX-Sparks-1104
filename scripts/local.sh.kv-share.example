@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Recommended settings for shared KV pages on two DGX Sparks over one CX7 cable: TF_KV_SHARE (patches 0122-0131)
+# and the SSD tier under it (0132-0136).
+# Copy to scripts/local.sh (gitignored) and set the places marked CHANGE. Measured on such a pair 2026-11-11 with
+# 0122-0140 (32-row decode windows, 0119); the numbers in the comments are from that pair. README "Recommended
+# settings for shared KV pages and the SSD tier" has the checks to run after the first start.
+
+# --- the pair --------------------------------------------------------------------------------------------------------
+WORKER=zurih@10.0.34.4             # CHANGE: the second Spark's ssh target on the direct link (key-based, no prompt)
+HOST=127.0.0.1                     # CHANGE if clients reach the API from another machine (0.0.0.0, with TENSORFOLD_API_KEY)
+PORT=8888
+
+# --- weights ---------------------------------------------------------------------------------------------------------
+# First start: the pinned 4 bpw checkpoint (164 GiB) is downloaded here and sent to the worker.
+WORKER_WEIGHTS=rsync
+# Both Sparks already hold the checkpoint and the drafter: serve them in place, no download and no copy.
+# MODEL_SOURCE=local               # CHANGE (optional), with the paths below
+# WORKER_WEIGHTS=check
+# MODEL_DIR=/path/to/GLM-5.3-Flash-EXL3-checkpoint
+# DFLASH2_DIR=/path/to/GLM-5.3-Flash-DFlash2
+# WORKER_MODEL_DIR=/path/on/worker/model          # needed when the worker's user or paths differ from this Spark's
+# WORKER_DFLASH2_DIR=/path/on/worker/dflash2
+# WORKER_CACHE_DIR=/path/on/worker/zig-home
+DRAFTER=dflash2                    # CC BY-NC-ND 4.0 weights; mtp serves without them
+
+# --- serving ---------------------------------------------------------------------------------------------------------
+PARALLEL=8
+CONTEXT=1048576                    # a per-request cap, not a reservation: the 8 streams share one pool
+KV=fp8
+DENSE=q8
+HEAD=q8
+ABSORB_MMA=1
+HOST_CACHE_GIB=0
+THINKING=1                         # the model card: a thinking model, evaluated with thinking on
+WITH_VIDEO=1                       # video_url parts; drop it for a smaller image
+
+# --- the KV pool and the kept sessions ---------------------------------------------------------------------------------
+KV_SHARD=1                         # each stream's latent rows on one Spark: about 1.8x the pool tokens
+CACHE_FIRST=1                      # the default: the kept sessions' slots are set aside before the streams' pages
+PROMPT_CACHE_GIB=7                 # with TF_KV_SHARE: 24 kept sessions' slots (6.8 GiB, about 290 MiB each); the engine
+                                   # puts all 32 at 10 (its startup line)
+export TF_KV_SHARE=32              # kept sessions are the pool's own pages, no second copy (must be exported: both
+                                   # ranks must agree, the rank fingerprint compares it)
+MEMORY_RESERVE_GIB=5               # 8,704 pool pages (4.46M tokens) measured; MemAvailable at idle 5.7 GiB on rank 0,
+                                   # 8.5 GiB on rank 1. The recipe's default is 6.5: fewer pages, more headroom
+
+# --- the SSD tier ------------------------------------------------------------------------------------------------------
+LEARN_GIB=200                      # kept sessions also on this Spark's NVMe: resume after eviction or a restart
+SERVE_EXTRA_ARGS='--top-k 20 --learn-daily-gib 200'   # each kept turn writes about 389 MiB of its own; the engine's
+                                   # default daily budget (32 GiB) runs out in a night of agent traffic, after
+                                   # which nothing is saved until the next day
+
+# export TF_TOOL_CALL_GUARD=1      # patch 0111, for agents that send tool history without offering tools
+# Not with LEARN_GIB: TF_GLM_KV_LIVE_HALF=1 (refused at startup beside it, 0131).

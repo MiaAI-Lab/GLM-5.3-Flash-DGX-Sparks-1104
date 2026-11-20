@@ -1,0 +1,284 @@
+From 1714d837ba5af273d082d6a48d85e392bda93d71 Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:27:07 +0100
+Subject: [PATCH] glm cuda: a disk recall's home is the part of the prefix the
+ tree holds; a kept state whose home is not its pages' part is not resumed
+
+A recall filed its state under the part with fewer live streams while its resume adopted the tree's pages of the
+prefix, in the other part. The resume then carried latent rows between the ranks, and for a state past the shared
+store's pages the two sides cut that carry apart: the sender had nothing to send, the receiver waited for every row,
+and a two-Spark pair running this stack hung (2026-11-11, 7 h).
+
+- Image.blank_pages takes `near`, a page the tree holds of the prompt; Store.recall passes firstHeld(prompt) and
+  GLM's blankPages takes its part as the home when it has the room.
+- cuda_share.begin: a pending state whose home is not its adopted pages' part is evicted and the pass runs cold.
+- cuda_snapshots.restore: a carry for a state with shared pages is error.KvShardNotHome on every rank, before any
+  NCCL call.
+- Host tests: begin with a state at home in its pages' part resumes, with the other home it does not.
+---
+ zig/src/core/prompt_radix.zig                 |  3 +-
+ zig/src/core/prompt_radix_disk_parts_test.zig |  7 ++-
+ zig/src/core/prompt_radix_disk_test.zig       |  2 +-
+ zig/src/core/rows_read.zig                    | 10 ++--
+ zig/src/core/rows_store.zig                   |  6 ++-
+ .../families/glm/cuda_kv_shard_pages_test.zig | 54 +++++++++++++++++++
+ zig/src/families/glm/cuda_share.zig           | 14 +++++
+ zig/src/families/glm/cuda_snapshots.zig       |  3 ++
+ zig/src/native/cuda_glm_disk.zig              |  9 ++--
+ 9 files changed, 93 insertions(+), 15 deletions(-)
+
+diff --git a/zig/src/core/prompt_radix.zig b/zig/src/core/prompt_radix.zig
+index b79b35d3..035addbf 100644
+--- a/zig/src/core/prompt_radix.zig
++++ b/zig/src/core/prompt_radix.zig
+@@ -381,7 +381,8 @@ pub const Store = struct {
+             t.evict(s.victim(prompt, found) orelse return found);
+         }
+         var pages: std.ArrayList(u32) = .empty;
+-        const got = rows.read.readPages(r, i, &pages) catch {
++        // the new pages beside the prefix the tree holds: the state's home is then its adopted pages' part
++        const got = rows.read.readPages(r, i, s.firstHeld(prompt), &pages) catch {
+             pages.deinit(t.gpa);
+             return found;
+         };
+diff --git a/zig/src/core/prompt_radix_disk_parts_test.zig b/zig/src/core/prompt_radix_disk_parts_test.zig
+index 5a5d936a..dcbf30e9 100644
+--- a/zig/src/core/prompt_radix_disk_parts_test.zig
++++ b/zig/src/core/prompt_radix_disk_parts_test.zig
+@@ -135,6 +135,7 @@ const Fake = struct {
+     gathers: usize = 0,
+     stream_home: u8 = 0, // the part the live stream's pages lie in (a keep's home, as ranks.readHome's)
+     recall_home: ?u8 = null, // the part a recall's pages are held in (null: `choose`'s)
++    near: ?u32 = null, // the page of the prompt the tree held at the last recall's blank
+ 
+     fn of(ptr: *anyopaque) *Fake {
+         return @ptrCast(@alignCast(ptr));
+@@ -294,7 +295,7 @@ const Fake = struct {
+         return error.NoSlot; // the paged store recalls into pages, never into a copy alone
+     }
+ 
+-    fn blankPagesFn(ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!pc.Saved {
++    fn blankPagesFn(ptr: *anyopaque, at: u32, near: ?u32, out: *std.ArrayList(u32)) anyerror!pc.Saved {
+         const f = of(ptr);
+         if (at % page_tokens != 0) return error.BadKeptRange;
+         const k = try f.gpa.create(Kept);
+@@ -303,7 +304,8 @@ const Fake = struct {
+         errdefer f.gpa.free(slot);
+         @memset(slot, 0);
+         out.resize(f.gpa, at / page_tokens) catch return error.LaneMemory;
+-        const home: ?u8 = if (f.recall_home) |part| part else f.pts.choose(out.items.len, null);
++        f.near = near;
++        const home: ?u8 = if (f.recall_home) |part| part else f.pts.choose(out.items.len, if (near) |id| @intCast(id / h) else null);
+         const part = home orelse return error.LaneMemory;
+         if (!f.pts.pools[part].hold(out.items)) return error.LaneMemory; // the pages held for the caller's tree
+         for (out.items) |*id| id.* += @as(u32, part) * h;
+@@ -595,6 +597,7 @@ test "the sharded pool's disk tier: a restart recalls a state into one part, its
+     try t.expectEqual(@as(usize, at_state / page_tokens), adopt.items.len);
+     try t.expectEqual(@as(usize, 1), x.f.blanks);
+     try t.expect(x.pts.onePart(adopt.items)); // the recalled path is one part's: T05d's invariant holds
++    try t.expect(x.f.near == null); // an empty tree holds no page of the prompt: the parts choose
+     for (adopt.items) |id| try t.expectEqual(@as(u32, 2), x.pts.holders(id)); // the tree's and the caller's
+     try x.rowsOk(adopt.items, at_state, 0); // the rows came back, a fresh pass's bytes, the latent rows on rank 0
+     try t.expectEqual(@as(usize, 1), x.f.live);
+diff --git a/zig/src/core/prompt_radix_disk_test.zig b/zig/src/core/prompt_radix_disk_test.zig
+index 412ce943..e7e254c3 100644
+--- a/zig/src/core/prompt_radix_disk_test.zig
++++ b/zig/src/core/prompt_radix_disk_test.zig
+@@ -184,7 +184,7 @@ const Fake = struct {
+         return error.NoSlot; // the paged store recalls into pages, never into a copy alone
+     }
+ 
+-    fn blankPagesFn(ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!pc.Saved {
++    fn blankPagesFn(ptr: *anyopaque, at: u32, _: ?u32, out: *std.ArrayList(u32)) anyerror!pc.Saved {
+         const f = of(ptr);
+         if (at % page_tokens != 0) return error.BadKeptRange;
+         const k = try f.gpa.create(Kept);
+diff --git a/zig/src/core/rows_read.zig b/zig/src/core/rows_read.zig
+index 93e7f6e9..26789412 100644
+--- a/zig/src/core/rows_read.zig
++++ b/zig/src/core/rows_read.zig
+@@ -14,16 +14,16 @@ const Name = chain.Name;
+ 
+ /// Disk state `i` read into a new kept state of its family; a file that fails a check goes, with every state naming it.
+ pub fn read(r: *Rows, i: usize) !pc.Saved {
+-    return readInto(r, i, null);
++    return readInto(r, i, null, null);
+ }
+ 
+ /// `read`, the state's leading rows taken into pool pages the store holds (their ids appended to `out`, each held for
+ /// the caller; the family's `blank_pages`). Null when the family cannot: `read` alone.
+-pub fn readPages(r: *Rows, i: usize, out: *std.ArrayList(u32)) !pc.Saved {
+-    return readInto(r, i, out);
++pub fn readPages(r: *Rows, i: usize, near: ?u32, out: *std.ArrayList(u32)) !pc.Saved {
++    return readInto(r, i, near, out);
+ }
+ 
+-fn readInto(r: *Rows, i: usize, pages: ?*std.ArrayList(u32)) !pc.Saved {
++fn readInto(r: *Rows, i: usize, near: ?u32, pages: ?*std.ArrayList(u32)) !pc.Saved {
+     const f = r.family.vtable;
+     const s = r.states.items[i];
+     const t0 = write.nowNs();
+@@ -32,7 +32,7 @@ fn readInto(r: *Rows, i: usize, pages: ?*std.ArrayList(u32)) !pc.Saved {
+     const ahead = if (r.fetch) |p| p.take(s.name, &plan) else null; // read on the I/O thread, its files checked there
+     var ids: []const u32 = &.{};
+     const saved = if (pages) |out| blk: {
+-        const got = try r.img.blank_pages.?(r.family.ptr, s.at, out);
++        const got = try r.img.blank_pages.?(r.family.ptr, s.at, near, out);
+         ids = out.items;
+         break :blk got;
+     } else try r.img.blank(r.family.ptr, s.at);
+diff --git a/zig/src/core/rows_store.zig b/zig/src/core/rows_store.zig
+index b409f7f4..20c5f1f7 100644
+--- a/zig/src/core/rows_store.zig
++++ b/zig/src/core/rows_store.zig
+@@ -33,8 +33,10 @@ pub const Image = struct {
+     whole: ?*const fn (ptr: *anyopaque, saved: pc.Saved) bool = null,
+     /// A new kept state of `at` tokens whose leading rows go into pool pages the store holds (their ids appended to
+     /// `out`, each held once more for the caller; the store's tree releases them when it takes the state), its slot
+-    /// past them; null: `blank` alone (null with a paged store's recall: it cannot recall into pages).
+-    blank_pages: ?*const fn (ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!pc.Saved = null,
++    /// past them; null: `blank` alone (null with a paged store's recall: it cannot recall into pages). `near`: a page
++    /// the tree already holds of the state's prompt (null: none); a pool in parts takes the new pages beside it, so
++    /// the state's home is the part of the pages its resume adopts.
++    blank_pages: ?*const fn (ptr: *anyopaque, at: u32, near: ?u32, out: *std.ArrayList(u32)) anyerror!pc.Saved = null,
+ };
+ 
+ /// A kept state as the disk store takes it, both stores': the flat cache's Entry (a copy holds every row), or a
+diff --git a/zig/src/families/glm/cuda_kv_shard_pages_test.zig b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+index 38940ef9..63283efc 100644
+--- a/zig/src/families/glm/cuda_kv_shard_pages_test.zig
++++ b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+@@ -1120,3 +1120,57 @@ test "kv shard pages: a hand-built cross-part kept state is not adopted by begin
+     try expectEqual(@as(usize, 0), adopt2.items.len);
+     try expect(owner2.pending == null);
+ }
++
++test "kv shard pages: a kept state whose home is not its adopted pages' part is not resumed by begin, it is evicted" {
++    const gpa = std.testing.allocator;
++    const lanes = @import("lanes");
++    const kv = @import("core").kv_pool;
++    for ([_]u8{ 1, 0 }) |home| { // its pages lie in part 1: home 1 resumes, home 0 (a recall filed apart) does not
++        var f: Fake = undefined;
++        Fake.reset();
++        try f.init(gpa, 0, true);
++        f.e.snaps = .empty;
++        defer f.e.snaps.deinit(gpa);
++        const p = try f.pool(4, 20, true); // two parts of 8
++        defer f.deinit(p);
++        const x = p.shard.?;
++        var st: Stored = undefined;
++        try st.open(gpa, &f.e, 8);
++        defer st.close(&f.e);
++        const prompt = try gpa.alloc(u32, 4097);
++        defer gpa.free(prompt);
++        for (prompt, 1..) |*t, i| t.* = @intCast(i);
++
++        var b: kv.Lease = .{};
++        try x.parts.pools[1].promise(&b, 8);
++        try x.parts.pools[1].cover(&b, 8, null);
++        var mine: [8]u32 = undefined;
++        for (b.ids.items, 0..) |id, i| mine[i] = id + 8; // part 1's
++        var path: [8]u32 = undefined;
++        var owner: share_mod.Owner = .{};
++        try expect(st.store.keep(prompt, 4096, &owner, &mine, &path).held);
++        x.parts.pools[1].finish(&b);
++        try f.e.snaps.put(gpa, st.next - 1, .{ .lease = .{}, .len = 0, .pos = 4096, .mtp_len = 0, .cur = &.{}, .bases = .{ 0, 0 }, .home = home });
++
++        var s: lanes.Stream = undefined;
++        s.reuse = .{};
++        s.key = prompt;
++        s.prompt_len = prompt.len;
++        s.history_len = 0;
++        s.shared_prefixes = &.{};
++        var adopt: std.ArrayList(u32) = .empty;
++        defer adopt.deinit(gpa);
++        const plan = try share_mod.begin(&f.e, &s, &owner, &adopt);
++        defer f.e.gpa.free(plan.marks);
++        if (home == 1) {
++            try expectEqual(@as(usize, 8), adopt.items.len);
++            try expect(owner.pending != null);
++            for (adopt.items) |id| x.parts.release(id); // the begin's holds go back
++        } else {
++            try expectEqual(@as(usize, 0), adopt.items.len);
++            try expect(owner.pending == null);
++            for (mine) |id| try expectEqual(@as(u32, 0), x.parts.holders(id)); // evicted: the tree's holds went
++            try expectEqual(@as(usize, 0), st.live);
++        }
++    }
++}
+diff --git a/zig/src/families/glm/cuda_share.zig b/zig/src/families/glm/cuda_share.zig
+index 73ea03d7..c316f157 100644
+--- a/zig/src/families/glm/cuda_share.zig
++++ b/zig/src/families/glm/cuda_share.zig
+@@ -66,6 +66,15 @@ pub fn begin(e: *engine.Engine, s: *const Stream, owner: *Owner, adopt: *std.Arr
+         prompts.forget(key, plan.from); // the mixed state goes: a later pass runs cold
+         std.log.warn("kv shard: a kept state at {d} tokens holds {d} pages in both parts (TF_GLM_KV_SHARD); it is evicted, the pass runs cold", .{ plan.from, n });
+     };
++    // a state whose home is not its adopted pages' part (a disk recall filed apart from the prefix the tree held):
++    // its resume would carry latent rows the pages already hold, and the ranks cut that carry apart
++    if (e.pages) |p| if (p.shard) |x| if (adopt.items.len > 0) if (owner.pending) |k| if (homeOf(e, k.id)) |home| if (home != p.partOf(adopt.items[0])) {
++        for (adopt.items) |id| x.parts.release(id);
++        adopt.clearRetainingCapacity();
++        owner.pending = null;
++        prompts.forget(key, plan.from);
++        std.log.warn("kv shard: a kept state at {d} tokens has its home in part {d} and its pages in the other (TF_GLM_KV_SHARD); it is evicted, the pass runs cold", .{ plan.from, home });
++    };
+     const mine = e.gpa.dupe(u32, plan.marks) catch |err| { // the lane's own marks, freed by its allocator
+         e.pages.?.give(adopt.items);
+         adopt.clearRetainingCapacity();
+@@ -74,6 +83,11 @@ pub fn begin(e: *engine.Engine, s: *const Stream, owner: *Owner, adopt: *std.Arr
+     return .{ .from = plan.from, .marks = mine };
+ }
+ 
++/// A kept state's home part (null: unsharded, or the engine holds no such state).
++fn homeOf(e: *const engine.Engine, id: u64) ?u8 {
++    return (e.snaps.get(id) orelse return null).home;
++}
++
+ /// TF_GLM_KV_SHARE_UNTWINNED_PCT's default: an untwinned prefill's rate as a percentage of the twinned rate.
+ pub const untwinned_pct_default: u32 = 75;
+ 
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 84cd29e6..3dd0e4e9 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -212,6 +212,9 @@ pub fn restore(e: anytype, id: u64) !void {
+     var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, own, s.cur);
+     if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), dflash.ring_bytes);
+     if (plan.len != s.len) return error.SnapshotSize;
++    // a state past the shared store's pages is never carried: its sides would cut their pieces apart (the sender
++    // past the pages, the receiver whole), and a rank waiting on rows never sent hangs the pair. Every rank refuses.
++    if (s.shared > 0 and kv_keep.carry(home, hold, e.share.rank) != .none) return error.KvShardNotHome;
+     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
+     const t0 = now();
+     try pool.moveParts(e.stream, &s.lease, &plan, false, !own or kv_keep.restoresLatent(home, hold, e.share.rank));
+diff --git a/zig/src/native/cuda_glm_disk.zig b/zig/src/native/cuda_glm_disk.zig
+index 88417178..f9213a86 100644
+--- a/zig/src/native/cuda_glm_disk.zig
++++ b/zig/src/native/cuda_glm_disk.zig
+@@ -215,9 +215,10 @@ fn blank(ptr: *anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
+ 
+ /// A new kept state of `at` tokens whose leading rows go into pool pages the store holds (`out` their ids, each held
+ /// for the caller's tree), its slot past them: a recall's blank under TF_KV_SHARE. The pages lie in one part under
+-/// TF_GLM_KV_SHARD (the part with room, as a fresh stream's `Parts.choose`), a recall's home part — the blank's home,
+-/// whose rank alone holds its latent rows on the write and the read.
+-fn blankPages(ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!api.prompt_cache.Saved {
++/// TF_GLM_KV_SHARD (the part of `near`, a page the tree holds of the prompt, when it has the room: the resume adopts
++/// the tree's pages and is seated there; else the part with room, as a fresh stream's `Parts.choose`), a recall's
++/// home part — the blank's home, whose rank alone holds its latent rows on the write and the read.
++fn blankPages(ptr: *anyopaque, at: u32, near: ?u32, out: *std.ArrayList(u32)) anyerror!api.prompt_cache.Saved {
+     const e = engineOf(ptr);
+     const rest = Rest.of(e);
+     defer rest.done();
+@@ -226,7 +227,7 @@ fn blankPages(ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!api.p
+     if (n == 0) return error.SnapshotShape;
+     const ids = try e.gpa.alloc(u32, n);
+     errdefer e.gpa.free(ids);
+-    const home: ?u8 = if (p.shard) |x| x.parts.choose(n, null) else null; // the recall's home part
++    const home: ?u8 = if (p.shard) |x| x.parts.choose(n, if (near) |id| p.partOf(id) else null) else null; // the recall's home part
+     if (!holdPages(p, home, ids)) return error.LaneMemory;
+     errdefer givePages(p, ids);
+     const id = try ranks.blank(e, at, home, @intCast(n));
+-- 
+2.56.0
+

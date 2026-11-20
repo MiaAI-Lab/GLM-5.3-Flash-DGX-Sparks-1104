@@ -1,0 +1,311 @@
+From b023299dfdbb04ff8a4da6d0ceced4ecc7bd3c74 Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] glm cuda: a sharded share resume adopts only when the
+ untwinned tail pays (TF_GLM_KV_SHARE_UNTWINNED_PCT)
+
+A resumed pass under the share takes no twin and prefills at about 75 % of the twinned rate (measured: about 1,310 against 1,750 tok/s). A kept prefix is adopted only when the new tokens are at most 3x the prefix at the default 75; kv_shard_resumes_skipped_total counts the passes that ran cold instead.
+---
+ zig/src/core/lanes/kv_parts.zig               |  2 +
+ zig/src/families/glm/cuda_kv_shard.zig        |  1 +
+ .../families/glm/cuda_kv_shard_pages_test.zig | 97 +++++++++++++++++++
+ zig/src/families/glm/cuda_lanes.zig           |  1 +
+ zig/src/families/glm/cuda_ranks.zig           |  6 ++
+ zig/src/families/glm/cuda_ranks_test.zig      | 23 +++++
+ zig/src/families/glm/cuda_share.zig           | 65 +++++++++++++
+ 7 files changed, 195 insertions(+)
+
+diff --git a/zig/src/core/lanes/kv_parts.zig b/zig/src/core/lanes/kv_parts.zig
+index 8180bc0c..99aa1e7a 100644
+--- a/zig/src/core/lanes/kv_parts.zig
++++ b/zig/src/core/lanes/kv_parts.zig
+@@ -35,6 +35,7 @@ pub const Stats = struct {
+     carries: u64 = 0,
+     carry_bytes: u64 = 0,
+     resumes_dropped: u64 = 0,
++    resumes_skipped: u64 = 0,
+     checks: u64 = 0,
+     part: [max_parts]Part = @splat(.{}),
+ 
+@@ -55,6 +56,7 @@ pub const Stats = struct {
+         .carries = "Resumes whose kept latent rows went to the rank lacking them.",
+         .carry_bytes = "Bytes those carries sent.",
+         .resumes_dropped = "Resumes that started from 0: the stream could not go to its home part and carries are off.",
++        .resumes_skipped = "Share resumes skipped: the kept prefix would not pay prefilling the tail without a twin, so the pass ran cold.",
+         .checks = "Layout digests rank 0 sent (the follower compared each; a difference ends the pair).",
+     };
+ };
+diff --git a/zig/src/families/glm/cuda_kv_shard.zig b/zig/src/families/glm/cuda_kv_shard.zig
+index 1473c08e..65b9624e 100644
+--- a/zig/src/families/glm/cuda_kv_shard.zig
++++ b/zig/src/families/glm/cuda_kv_shard.zig
+@@ -478,6 +478,7 @@ pub const Counts = struct {
+     carries: u64 = 0, // resumes whose latent rows went to the rank lacking them
+     carry_bytes: u64 = 0,
+     resumes_dropped: u64 = 0, // resumes that started from 0: the stream could not go home and carries are off
++    resumes_skipped: u64 = 0, // share resumes skipped: the kept prefix would not pay its untwinned tail, the pass ran cold
+     checks: u64 = 0, // layout digests sent (rank 0) or compared
+ 
+     pub fn into(c: Counts, out: *kv_parts.Stats) void {
+diff --git a/zig/src/families/glm/cuda_kv_shard_pages_test.zig b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+index b4b1bef6..a709e2d2 100644
+--- a/zig/src/families/glm/cuda_kv_shard_pages_test.zig
++++ b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+@@ -440,3 +440,100 @@ test "kv shard pages: the follower maps a begin whose leading ids are the store'
+     try expectEqual(kvs.Hold{ .owner = 1 }, s.hold.?); // owner-computed pass: rank 0 alone holds the rows
+     try expectEqual(p0.digest(), p1.digest()); // the adopted pages are in the slot's ids, so in the digest
+ }
++
++test "kv shard pages: a share resume whose untwinned tail does not pay runs cold, the kept state stays; one that pays adopts" {
++    const gpa = std.testing.allocator;
++    const Lanes = @import("cuda_lanes.zig").Lanes;
++    const share_mod = @import("cuda_share.zig");
++    const lanes = @import("lanes");
++    const types = @import("cuda_engine_types.zig");
++    const kv = @import("core").kv_pool;
++    var f: Fake = undefined;
++    Fake.reset();
++    try f.init(gpa, 0, true);
++    const p = try f.pool(4, 20, true); // two parts of 8
++    defer f.deinit(p);
++    const x = p.shard.?;
++    // the store's page in part 1 (global 8): a keep left it, a begin holds it once more for the resume it offered
++    var lease: kv.Lease = .{};
++    try x.parts.pools[1].promise(&lease, 1);
++    try x.parts.pools[1].cover(&lease, 1, null);
++    const page = lease.ids.items[0] + 8;
++    x.parts.retain(page); // the tree's own hold on the page
++    x.parts.pools[1].finish(&lease); // the stream's lease goes, the tree's and the begins' holds stay
++    var ln: Lanes = .{ .x = .{ .e = &f.e, .link = undefined } };
++    defer ln.lanes.deinit(gpa);
++    var adopt: std.ArrayList(u32) = .empty;
++    defer adopt.deinit(gpa);
++    var kept: types.Kept = .{ .id = 7, .at = 4096 };
++    var owner: share_mod.Owner = .{ .pending = &kept };
++
++    // 4,096 kept against a 126,407-token prompt: the tail would not pay, the resume is skipped and counted
++    x.parts.retain(page); // the begin's hold for the resume
++    try adopt.append(gpa, page);
++    share_mod.gate(&f.e, &owner, &adopt, 126407);
++    try expectEqual(@as(usize, 0), adopt.items.len);
++    try expect(owner.pending == null);
++    try expectEqual(@as(u64, 1), x.parts.counts.resumes_skipped);
++    try expectEqual(@as(u32, 1), x.parts.holders(page)); // the tree's hold: the kept state is still in the store
++    var s: lanes.Stream = undefined;
++    s.reuse = .{};
++    _ = try ln.seat(&s, 600, 100, adopt.items); // the cold pass: placed by the parts' choice, its twin borrowed
++    const slot = ln.lanes.get(&s).?.slot;
++    try expect(p.twinCount(slot) > 0);
++    p.close(slot);
++
++    // 122,880 kept against the same prompt: the tail pays, the resume adopts with no twin
++    x.parts.retain(page); // a fresh begin's hold
++    var kept2: types.Kept = .{ .id = 7, .at = 122880 };
++    owner = .{ .pending = &kept2 };
++    try adopt.append(gpa, page);
++    share_mod.gate(&f.e, &owner, &adopt, 126407);
++    try expectEqual(@as(usize, 1), adopt.items.len);
++    try expect(owner.pending == &kept2);
++    try expectEqual(@as(u64, 1), x.parts.counts.resumes_skipped); // the adopted one is not a skip
++    var s2: lanes.Stream = undefined;
++    s2.reuse = .{};
++    _ = try ln.seat(&s2, 600, 100, adopt.items); // the resume: its adopted pages' part, no twin
++    const slot2 = ln.lanes.get(&s2).?.slot;
++    try expectEqual(@as(u8, 1), f.st(slot2).hold.?.owner);
++    try expectEqualSlices(u32, &.{page}, f.st(slot2).pages[0..1]);
++    try expectEqual(@as(usize, 0), p.twinCount(slot2));
++    try expectEqual(@as(u32, 2), x.parts.holders(page)); // the tree's and the lease's
++    p.close(slot2);
++
++    // at 100 the short-kept resume adopts too
++    f.e.settings.share_untwinned_pct = 100;
++    x.parts.retain(page); // a fresh begin's hold
++    var kept3: types.Kept = .{ .id = 7, .at = 4096 };
++    owner = .{ .pending = &kept3 };
++    share_mod.gate(&f.e, &owner, &adopt, 126407);
++    try expectEqual(@as(usize, 1), adopt.items.len);
++    try expect(owner.pending == &kept3);
++    try expectEqual(@as(u64, 1), x.parts.counts.resumes_skipped);
++    var s3: lanes.Stream = undefined;
++    s3.reuse = .{};
++    _ = try ln.seat(&s3, 600, 100, adopt.items);
++    try expectEqual(@as(u8, 1), f.st(ln.lanes.get(&s3).?.slot).hold.?.owner);
++    try expectEqual(@as(usize, 0), p.twinCount(ln.lanes.get(&s3).?.slot));
++    p.close(ln.lanes.get(&s3).?.slot);
++}
++
++test "kv shard pages: an unsharded share resume adopts always (the gate leaves the begin's pages alone)" {
++    const gpa = std.testing.allocator;
++    const share_mod = @import("cuda_share.zig");
++    const types = @import("cuda_engine_types.zig");
++    var f: Fake = undefined;
++    Fake.reset();
++    try f.init(gpa, 0, false); // unsharded
++    const p = try f.pool(4, 20, true);
++    defer f.deinit(p);
++    var kept: types.Kept = .{ .id = 7, .at = 4096 };
++    var owner: share_mod.Owner = .{ .pending = &kept };
++    var adopt: std.ArrayList(u32) = .empty;
++    defer adopt.deinit(gpa);
++    try adopt.append(gpa, 3); // a page id nobody holds: the gate must not touch it
++    share_mod.gate(&f.e, &owner, &adopt, 126407);
++    try expectEqual(@as(usize, 1), adopt.items.len);
++    try expect(owner.pending == &kept);
++}
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index bffd1495..0d141a51 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -323,6 +323,7 @@ pub const Lanes = struct {
+         defer adopt.deinit(gpa);
+         // TF_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
+         const marks: []const u32 = if (share) (try share_mod.begin(self.x.e, s, &owner, &adopt)).marks else &.{};
++        if (share) share_mod.gate(self.x.e, &owner, &adopt, ids.len); // sharded: a resume adopts only when its untwinned tail pays
+         var held = true;
+         errdefer if (held) gpa.free(marks);
+         const pages = try self.seat(s, ids.len, s.max_new, adopt.items);
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index 1da33eb6..a305c727 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -6,6 +6,7 @@ const heat = @import("heat");
+ const l2pf = @import("cuda_l2pf.zig");
+ const Sha256 = std.crypto.hash.sha2.Sha256;
+ const kv_shard = @import("cuda_kv_shard.zig");
++const share_mod = @import("cuda_share.zig");
+ 
+ /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
+ pub const Settings = struct {
+@@ -28,6 +29,7 @@ pub const Settings = struct {
+     kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
+     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
+     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
++    share_untwinned_pct: u32 = share_mod.untwinned_pct_default, // TF_GLM_KV_SHARE_UNTWINNED_PCT: a sharded share resume adopts only when its untwinned tail pays
+ 
+     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
+     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
+@@ -143,6 +145,10 @@ pub const Settings = struct {
+             problem.* = kv_shard.why(err).?;
+             return error.BadSetting;
+         };
++        s.share_untwinned_pct = share_mod.untwinnedPct(get("TF_GLM_KV_SHARE_UNTWINNED_PCT")) catch {
++            problem.* = "TF_GLM_KV_SHARE_UNTWINNED_PCT: 1 to 100 (an untwinned prefill's rate as a percentage of the twinned; 75 the default, 100 always adopts a kept prefix)";
++            return error.BadSetting;
++        };
+         if (get("TF_GLM_KV_LIVE_HALF")) |v| {
+             if (std.mem.eql(u8, v, "1")) s.kv_live_half = true else if (!std.mem.eql(u8, v, "0")) {
+                 problem.* = "TF_GLM_KV_LIVE_HALF: 0 or 1";
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index 629930d0..782561a1 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -476,3 +476,26 @@ test "TF_GLM_KV_LIVE_HALF: off by default, 0 or 1, a typo refused, and every ran
+     const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, on, 8192, true, @splat(0), @splat(0), @splat(0)) };
+     try std.testing.expectEqual(Mismatch{ .field = .kv_live_half, .rank = 1 }, mismatch(&all).?);
+ }
++
++test "TF_GLM_KV_SHARE_UNTWINNED_PCT: 75 by default, 1 to 100 read, a value outside refused by name" {
++    const Reader = struct {
++        fn absent(_: [:0]const u8) ?[]const u8 {
++            return null;
++        }
++        fn pct(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_KV_SHARE_UNTWINNED_PCT")) "90" else null;
++        }
++        fn always(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_KV_SHARE_UNTWINNED_PCT")) "100" else null;
++        }
++        fn bad(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_KV_SHARE_UNTWINNED_PCT")) "0" else null;
++        }
++    };
++    var problem: []const u8 = "";
++    try std.testing.expectEqual(@as(u32, 75), (try Settings.read(Reader.absent, &problem)).share_untwinned_pct);
++    try std.testing.expectEqual(@as(u32, 90), (try Settings.read(Reader.pct, &problem)).share_untwinned_pct);
++    try std.testing.expectEqual(@as(u32, 100), (try Settings.read(Reader.always, &problem)).share_untwinned_pct);
++    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
++    try std.testing.expect(std.mem.indexOf(u8, problem, "TF_GLM_KV_SHARE_UNTWINNED_PCT") != null);
++}
+diff --git a/zig/src/families/glm/cuda_share.zig b/zig/src/families/glm/cuda_share.zig
+index c4fdc591..e54b9612 100644
+--- a/zig/src/families/glm/cuda_share.zig
++++ b/zig/src/families/glm/cuda_share.zig
+@@ -62,6 +62,44 @@ pub fn begin(e: *engine.Engine, s: *const Stream, owner: *Owner, adopt: *std.Arr
+     return .{ .from = plan.from, .marks = mine };
+ }
+ 
++/// TF_GLM_KV_SHARE_UNTWINNED_PCT's default: an untwinned prefill's rate as a percentage of the twinned rate.
++pub const untwinned_pct_default: u32 = 75;
++
++/// The setting's value (blank or unset: the default), `error.BadKvShareUntwinned` outside 1 to 100.
++pub fn untwinnedPct(raw: ?[]const u8) error{BadKvShareUntwinned}!u32 {
++    const t = std.mem.trim(u8, raw orelse "", " \t\r\n");
++    if (t.len == 0) return untwinned_pct_default;
++    const v = std.fmt.parseInt(u32, t, 10) catch return error.BadKvShareUntwinned;
++    if (v < 1 or v > 100) return error.BadKvShareUntwinned;
++    return v;
++}
++
++/// Whether a resume adopts a kept prefix of `adopted` tokens before a prompt of `prompt` tokens: the tail it
++/// prefills without a twin pays for the prefix it skips when `new × (100 − pct) ≤ adopted × pct`, the untwinned
++/// rate as `pct`% of the twinned (75: a tail of at most three times the adopted prefix; 100: always adopt).
++pub fn adoptPays(adopted: u32, prompt: usize, pct: u32) bool {
++    const new = prompt -| adopted;
++    return @as(u64, new) * (100 - @as(u64, pct)) <= @as(u64, adopted) * @as(u64, pct);
++}
++
++/// TF_KV_SHARE sharded: a resume adopts only when its untwinned tail pays (TF_GLM_KV_SHARE_UNTWINNED_PCT). A
++/// skipped one runs cold as the pass would without a kept state (its twin borrowed, the kept state left in the
++/// store and still resumable), counted in `kv_shard_resumes_skipped_total`. Rank 0 decides — with nothing adopted
++/// the begin step opens the follower's pass cold as it does today. Unsharded (no parts) a resume adopts always.
++pub fn gate(e: *engine.Engine, owner: *Owner, adopt: *std.ArrayList(u32), prompt: usize) void {
++    if (adopt.items.len == 0) return;
++    const p = e.pages orelse return;
++    const x = p.shard orelse return;
++    const at = if (owner.pending) |k| k.at else return;
++    const pct = e.settings.share_untwinned_pct;
++    if (adoptPays(at, prompt, pct)) return;
++    for (adopt.items) |id| x.parts.release(id); // the begin's holds go back, the tree's keep the state resumable
++    adopt.clearRetainingCapacity();
++    owner.pending = null;
++    x.parts.counts.resumes_skipped += 1;
++    std.log.debug("kv shard: a share resume's kept {d} tokens stay in the store, its {d}-token tail untwinned does not pay (TF_GLM_KV_SHARE_UNTWINNED_PCT {d}); the pass runs cold", .{ at, prompt -| at, pct });
++}
++
+ /// A pass's marks (the engine's Marks.ctx): the mark it stands at, or the last it completed when cancelled, keeps.
+ pub const Keeps = struct {
+     e: *engine.Engine,
+@@ -95,3 +133,30 @@ pub fn marks(e: *engine.Engine, slot: u32, s: *const Stream, at: []const u32, ke
+     keeps.* = .{ .e = e, .slot = slot, .prompt = cacheKey(s) orelse return null };
+     return if (at.len == 0) null else .{ .at = at, .ctx = keeps, .call = Keeps.at, .interrupted = Keeps.at };
+ }
++
++test "TF_GLM_KV_SHARE_UNTWINNED_PCT: 75 the default, 1 to 100 taken, anything else refused" {
++    try std.testing.expectEqual(@as(u32, 75), try untwinnedPct(null));
++    try std.testing.expectEqual(@as(u32, 75), try untwinnedPct(""));
++    try std.testing.expectEqual(@as(u32, 75), try untwinnedPct("  "));
++    try std.testing.expectEqual(@as(u32, 1), try untwinnedPct("1"));
++    try std.testing.expectEqual(@as(u32, 100), try untwinnedPct("100"));
++    try std.testing.expectError(error.BadKvShareUntwinned, untwinnedPct("0"));
++    try std.testing.expectError(error.BadKvShareUntwinned, untwinnedPct("101"));
++    try std.testing.expectError(error.BadKvShareUntwinned, untwinnedPct("-1"));
++    try std.testing.expectError(error.BadKvShareUntwinned, untwinnedPct("half"));
++}
++
++test "TF_GLM_KV_SHARE_UNTWINNED_PCT 75: a resume adopts when the tail is at most three times the kept prefix" {
++    try std.testing.expect(!adoptPays(4096, 126407, 75)); // 122,311 new tokens over 3 x 4,096 adopted: cold
++    try std.testing.expect(adoptPays(122880, 126407, 75)); // 3,527 new tokens: adopted
++    try std.testing.expect(!adoptPays(122880, 610128, 75)); // 487,248 new tokens over 3 x 122,880: cold
++    try std.testing.expect(adoptPays(126407, 126407, 75)); // the whole prompt kept: an empty tail pays
++    try std.testing.expect(!adoptPays(0, 4096, 75)); // nothing kept: cold
++}
++
++test "TF_GLM_KV_SHARE_UNTWINNED_PCT 100: a resume adopts however long its tail; at 1 almost never" {
++    try std.testing.expect(adoptPays(4096, 126407, 100));
++    try std.testing.expect(adoptPays(0, 4096, 100));
++    try std.testing.expect(adoptPays(126407, 126407, 1)); // the tail empty: adopted
++    try std.testing.expect(!adoptPays(4096, 126407, 1)); // a tail a hundredfold the prefix: cold
++}
+-- 
+2.56.0
+

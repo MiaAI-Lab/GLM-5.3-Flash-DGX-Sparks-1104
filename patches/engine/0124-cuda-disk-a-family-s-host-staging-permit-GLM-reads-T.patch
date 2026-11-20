@@ -1,0 +1,229 @@
+From 3b004f5ba0d12ae77396f643421d1c87e803985d Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] cuda disk: a family's host staging permit; GLM reads
+ TF_GLM_LEARN_STAGING_GIB
+
+Ported from upstream 0e5085dca and 12dfa588a. The write-behind's host staging is bounded by a permit (1 GiB by default for GLM) so a long state is saved in pieces and never stages its whole image in host memory.
+---
+ zig/src/families/glm/cuda_native.zig |  5 ++
+ zig/src/native/cuda_disk.zig         | 92 ++++++++++++++++++++++++++--
+ zig/src/native/cuda_glm_disk.zig     | 35 ++++++++++-
+ 3 files changed, 125 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index c9238a1b..c6c98990 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -458,6 +458,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+     return switch (err) {
+         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
+         error.BadHostCache => "TF_GLM_HOST_CACHE_GIB: give GiB of pinned host memory over all the ranks (0 turns the host tier off), or unset it or set auto for a quarter of what the host has available (at most 16 GiB)",
++        error.BadStagingGib => "TF_GLM_LEARN_STAGING_GIB: give GiB of host RAM the conversation states' saves may stage at once (whole pages), or unset it for 1 GiB",
+         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
+         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
+         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
+@@ -487,6 +488,10 @@ test "a checkpoint refused for its format, at the entry or by the loader, is exp
+     for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat, error.UnreadableExl3 }) |e| try std.testing.expect(explain(null, e) != null);
+ }
+ 
++test "TF_GLM_LEARN_STAGING_GIB: a refusal names the switch" {
++    try std.testing.expect(explain(null, error.BadStagingGib) != null);
++}
++
+ test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and 1 page like on, others are refused" {
+     try std.testing.expect(!try paging(null, 1, false));
+     try std.testing.expect(!try paging("auto", 1, false));
+diff --git a/zig/src/native/cuda_disk.zig b/zig/src/native/cuda_disk.zig
+index d81da092..8e0679a6 100644
+--- a/zig/src/native/cuda_disk.zig
++++ b/zig/src/native/cuda_disk.zig
+@@ -154,7 +154,7 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, t: *Target) !
+ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, store: *api.prompt_cache.Store) !void {
+     loaded.target.ctx = ctx;
+     const id = try identity(a, io, ctx, o.dir, kernels, loaded.backend, loaded.target);
+-    try open(o, root, id.id, id.rate, store, "nemotron");
++    try open(o, root, id.id, id.rate, store, "nemotron", null);
+ }
+ 
+ /// The disk module of a family's kept states (image, probe, facts), or null: Nemotron's is this file's own.
+@@ -170,18 +170,26 @@ pub fn attachKept(comptime K: type, name: []const u8, a: Allocator, io: std.Io,
+         const p = try K.probe(a, io, loaded.backend, loaded.target);
+         const facts = K.facts(loaded.target); // an array, or a slice
+         const list: []const u64 = if (@typeInfo(@TypeOf(facts)) == .pointer) facts else &facts;
+-        try open(o, root, try identityOf(a, io, ctx, o.dir, kernels, list, p.hash), p.rate, store, name);
++        const staging = stagingOf(K, loaded.target);
++        try open(o, root, try identityOf(a, io, ctx, o.dir, kernels, list, p.hash), p.rate, store, name, staging);
+     }
+ }
+ 
+-fn open(o: api.Open, root: []const u8, id: u64, rate: f64, store: *api.prompt_cache.Store, name: []const u8) !void {
++/// K.staging, else null (the store's default); a K that declares attach opens the store itself, its staging unread.
++fn stagingOf(comptime K: type, t: anytype) ?u64 {
++    return if (@hasDecl(K, "staging")) K.staging(t) else null;
++}
++
++fn open(o: api.Open, root: []const u8, id: u64, rate: f64, store: *api.prompt_cache.Store, name: []const u8, staging: ?u64) !void {
+     const gibs = struct {
+         fn bytes(g: f64) u64 {
+             return @intFromFloat(g * (1 << 30));
+         }
+     }.bytes;
+     // --spill-gib: evicted states only (or with --learn-conversations, both); --checkpoint-slots bounds RAM beside it
+-    const r = try api.prompt_cache.rows.attach(store.gpa, store, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .spill = o.spill, .slots = @import("disk_spill.zig").slots(o) });
++    var opts: rows.Options = .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .spill = o.spill, .slots = @import("disk_spill.zig").slots(o) };
++    if (staging) |bytes| opts.staging_bytes = bytes; // else the store's own default
++    const r = try rows.attach(store.gpa, store, opts);
+     r.prefill_rate = rate;
+     std.log.info("{s}: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB)", .{ name, r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20 });
+ }
+@@ -209,7 +217,7 @@ test "CUDA disk open: --spill-gib's mode and --checkpoint-slots reach the store"
+     // a disk module that opens the store itself, through this file's open, under a fixed identity and no device
+     const K = struct {
+         pub fn attach(_: Allocator, _: std.Io, _: *const cuda.Context, o: api.Open, root: []const u8, _: ?[]const u8, _: anytype, store: *api.prompt_cache.Store) !void {
+-            try open(o, root, 7, 1.0, store, "fake");
++            try open(o, root, 7, 1.0, store, "fake", 3 << 30);
+         }
+         fn bytes(_: *anyopaque, _: u32) u64 {
+             return 0;
+@@ -237,6 +245,80 @@ test "CUDA disk open: --spill-gib's mode and --checkpoint-slots reach the store"
+         defer r.deinit();
+         defer store.deinit(); // the store before its disk, as the rows fixtures close them
+         try std.testing.expectEqual(mode, r.spill);
++        try std.testing.expectEqual(@as(u64, 3 << 30), r.staging_bytes);
+         try std.testing.expectEqual(if (keep) |n| @as(usize, @intCast(n)) else std.math.maxInt(usize), store.most);
+     }
+ }
++
++/// The store's staging permit after attachKept through disk module K (no attach), on a recording driver.
++fn keptStaging(comptime K: type) !u64 {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var arena: std.heap.ArenaAllocator = .init(gpa); // open's scratch `a`, which identityOf allocates from
++    defer arena.deinit();
++    const Fake = struct {
++        fn name(out: [*]u8, _: c_int, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
++            @memcpy(out[0..5], "fake\x00");
++            return 0;
++        }
++        fn attribute(out: *c_int, which: cuda.abi.DeviceAttribute, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
++            out.* = if (which == .compute_capability_major) 12 else 1;
++            return 0;
++        }
++        fn version(out: *c_int) callconv(.c) cuda.abi.Result {
++            out.* = 13000;
++            return 0;
++        }
++        fn bytes(_: *anyopaque, _: u32) u64 {
++            return 0;
++        }
++        fn save(_: *anyopaque, _: ?*anyopaque, _: u32) anyerror!api.prompt_cache.Saved {
++            return error.Unused;
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: api.prompt_cache.Saved) anyerror!void {}
++        fn drop(_: *anyopaque, _: api.prompt_cache.Saved) void {}
++    };
++    var driver: cuda.Driver = undefined;
++    driver.api.cuDeviceGetName = Fake.name;
++    driver.api.cuDeviceGetAttribute = Fake.attribute;
++    driver.api.cuDriverGetVersion = Fake.version;
++    const gpu: cuda.Context = .{ .d = &driver, .device = 0, .handle = null };
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
++    defer gpa.free(root);
++    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
++    var family: u8 = 0;
++    const vt: api.prompt_cache.Snapshots.VTable = .{ .bytes = Fake.bytes, .save = Fake.save, .restore = Fake.restore, .drop = Fake.drop, .rows = &image };
++    var store = api.prompt_cache.Store.init(gpa, .{ .ptr = &family, .vtable = &vt }, .{ .lookahead = 1 }, 1 << 20);
++    const o: api.Open = .{ .dir = root, .model_type = "m", .learn = root, .learn_conversations = true };
++    attachKept(K, "k", arena.allocator(), io, &gpu, o, root, null, struct { backend: u8 = 0, target: u8 = 0 }{}, &store) catch |e| {
++        store.deinit();
++        return e;
++    };
++    const r = store.disk.?;
++    defer r.deinit();
++    defer store.deinit(); // the store before its disk, as the rows fixtures close them
++    return r.staging_bytes;
++}
++
++test "CUDA disk open: attachKept passes a disk module's staging permit, else the store's default" {
++    const Plain = struct {
++        pub fn probe(_: Allocator, _: std.Io, _: anytype, _: anytype) !struct { hash: u64, rate: f64 } {
++            return .{ .hash = 7, .rate = 1.0 };
++        }
++        pub fn facts(_: anytype) [1]u64 {
++            return .{0};
++        }
++    };
++    const Declared = struct {
++        pub const probe = Plain.probe;
++        pub const facts = Plain.facts;
++        pub fn staging(_: anytype) u64 {
++            return 3 << 30;
++        }
++    };
++    const default = (rows.Options{ .root = "", .identity = 0, .cap = 0, .floor = 0, .daily = 0 }).staging_bytes;
++    try std.testing.expectEqual(default, try keptStaging(Plain));
++    try std.testing.expectEqual(@as(u64, 3 << 30), try keptStaging(Declared));
++}
+diff --git a/zig/src/native/cuda_glm_disk.zig b/zig/src/native/cuda_glm_disk.zig
+index b84e78e9..f0967d2a 100644
+--- a/zig/src/native/cuda_glm_disk.zig
++++ b/zig/src/native/cuda_glm_disk.zig
+@@ -13,6 +13,8 @@ const Engine = glm.engine.Engine;
+ const Kept = glm.engine.Kept;
+ const Allocator = std.mem.Allocator;
+ 
++const t = std.testing;
++
+ pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole };
+ 
+ /// Every rank's prefix bytes, read at attach (one GLM engine a process; rank 0 alone serves).
+@@ -180,12 +182,41 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
+         }
+     }.bytes;
+     // spill stays off: an eviction would gather on rank 0 mid-pass while the other ranks wait in the gate's all-reduce
+-    const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid });
++    const raw = std.c.getenv("TF_GLM_LEARN_STAGING_GIB");
++    const named = raw != null and std.mem.trim(u8, std.mem.span(raw.?), " \t").len > 0;
++    const staging_bytes = try stagingOf(if (raw) |v| std.mem.span(v) else null);
++    const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .staging_bytes = staging_bytes });
+     r.prefill_rate = p.rate;
+     store.disk = r;
+-    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts)", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len });
++    var permit_buf: [48]u8 = undefined;
++    const permit = if (named) try std.fmt.bufPrint(&permit_buf, "; staging {d} GiB", .{staging_bytes >> 30}) else "";
++    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts{s})", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len, permit });
++}
++
++/// The store's staging permit when TF_GLM_LEARN_STAGING_GIB names none: rows_store.Options' 1 GiB default.
++const staging_default: u64 = (rows.Options{ .root = "", .identity = 0, .cap = 0, .floor = 0, .daily = 0 }).staging_bytes;
++
++/// TF_GLM_LEARN_STAGING_GIB: GiB the store stages at once (unset or empty: the store's 1 GiB; a number: that many GiB, whole pages; anything else: refused).
++fn stagingOf(text: ?[]const u8) error{BadStagingGib}!u64 {
++    const s = std.mem.trim(u8, text orelse "", " \t");
++    if (s.len == 0) return staging_default;
++    const g = std.fmt.parseFloat(f64, s) catch return error.BadStagingGib;
++    if (!std.math.isFinite(g) or g < 0 or g > 4096) return error.BadStagingGib;
++    return std.mem.alignBackward(u64, @intFromFloat(g * (1 << 30)), rows.file.alignment);
+ }
+ 
+ test {
+     std.testing.refAllDecls(@This());
+ }
++
++test "TF_GLM_LEARN_STAGING_GIB: unset keeps the store's 1 GiB, a number gives whole pages of GiB, anything else is refused" {
++    try t.expectEqual(staging_default, try stagingOf(null));
++    try t.expectEqual(staging_default, try stagingOf(""));
++    try t.expectEqual(staging_default, try stagingOf("  "));
++    try t.expectEqual(@as(u64, 2 << 30), try stagingOf("2"));
++    try t.expectEqual(@as(u64, 12 << 30), try stagingOf("12"));
++    try t.expectEqual(@as(u64, 4 << 30), try stagingOf("4.0001")); // down to whole pages
++    try t.expectEqual(@as(u64, 0), try stagingOf("0"));
++    try t.expectEqual(@as(u64, 0), try stagingOf("0.000001"));
++    for ([_][]const u8{ "x", "-1", "nan", "inf", "5000" }) |bad| try t.expectError(error.BadStagingGib, stagingOf(bad));
++}
+-- 
+2.56.0
+

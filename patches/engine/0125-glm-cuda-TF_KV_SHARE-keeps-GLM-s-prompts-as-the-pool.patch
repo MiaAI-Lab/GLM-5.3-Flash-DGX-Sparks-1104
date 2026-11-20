@@ -1,0 +1,1611 @@
+From a18c64ea5bdf0f7b03148d5ea847223390b6b25f Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:30:55 +0100
+Subject: [PATCH] glm cuda: TF_KV_SHARE keeps GLM's prompts as the pool's pages
+
+Ported from upstream a6f5615d4, 768170532, d5b0b92f4 and adapted to this recipe's snapshot layout. A kept state's copy and its plan leave the shared store's pages out; the lanes adopt the store's pages at the head of a lease; the store sits over rank 0's pages; combinations not yet supported are refused by name at startup. With TF_KV_SHARE unset every path is unchanged.
+---
+ zig/build/cuda.zig                            |   4 +-
+ zig/build/cuda_engines.zig                    |   7 +-
+ zig/build/glm_family_host.zig                 |   8 +-
+ zig/glm_fp8_pages_host.zig                    |  22 +-
+ zig/glm_pages_host.zig                        |  14 +-
+ zig/glm_snapshot_host.zig                     |   5 +
+ zig/src/families/glm/cuda.zig                 |   2 +
+ zig/src/families/glm/cuda_disk_image_test.zig |   1 +
+ zig/src/families/glm/cuda_disk_shard_test.zig |   4 +-
+ zig/src/families/glm/cuda_engine.zig          |   1 +
+ zig/src/families/glm/cuda_engine_types.zig    |   1 +
+ zig/src/families/glm/cuda_follow.zig          |  28 +-
+ .../families/glm/cuda_kv_shard_pages_test.zig |  32 +-
+ zig/src/families/glm/cuda_lanes.zig           |  74 ++++-
+ zig/src/families/glm/cuda_native.zig          |  58 +++-
+ zig/src/families/glm/cuda_pages.zig           |  52 ++--
+ zig/src/families/glm/cuda_pages_test.zig      | 273 +++++++++++++++++-
+ zig/src/families/glm/cuda_share.zig           |  82 ++++++
+ zig/src/families/glm/cuda_snapshot_layout.zig |  48 ++-
+ zig/src/families/glm/cuda_snapshots.zig       |  19 +-
+ zig/src/native/cuda.zig                       |   2 +-
+ zig/tests/cuda/glm_kv_shard_check.zig         |   8 +-
+ zig/tests/cuda/glm_lanes_tests.zig            |   2 +-
+ zig/tests/cuda/glm_paged_tests.zig            |   2 +-
+ zig/tests/cuda/glm_pair_tests.zig             |   2 +-
+ 25 files changed, 617 insertions(+), 134 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_share.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 596c8ec8..cb9efe86 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -103,7 +103,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     runner.addImport("exlr8_frozen", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen.zig"), .target = target, .optimize = optimize }));
+     runner.addImport("exlr8_frozen_dense", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen_dense.zig"), .target = target, .optimize = optimize }));
+     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
+-    const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat);
++    const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api);
+     runner.addImport("glm_cuda", glm_cuda);
+     for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
+     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+@@ -444,7 +444,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     // the contract's attention reference (tests/cuda/contract_attn.zig): its allocations under failure
+     const attn_ref = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_attn.zig"), .target = host, .optimize = .debug, .imports = &.{.{ .name = "core", .module = mods.core }} });
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = attn_ref })).step);
+-    const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
++    const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat, mods.api);
+     @import("glm_family_host.zig").steps(b, cuda, glm, mods, step);
+     @import("kolibri.zig").host(b, kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), native_modules.api, step);
+     @import("gemma4_cuda.zig").host(b, @import("gemma4_cuda.zig").module(b, host, .debug, cuda, mods.core, mods.lanes), step);
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index bb929f7a..24016e74 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -1,8 +1,8 @@
+ //! The CUDA engines a native server opens (native/cuda.zig) and the family modules they import.
+ const std = @import("std");
+ 
+-/// The GLM-5.3-Flash CUDA family over the runtime, the core, the lane core, canon's shares and core/heat.zig.
+-pub fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, heat: *std.Build.Module) *std.Build.Module {
++/// The GLM-5.3-Flash CUDA family over the runtime, the core, the lane core, canon's shares, core/heat.zig, engine_api.
++pub fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, heat: *std.Build.Module, api: *std.Build.Module) *std.Build.Module {
+     const canon = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/canon.zig"), .target = target, .optimize = optimize });
+     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     m.addImport("cuda", cuda);
+@@ -10,6 +10,7 @@ pub fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     m.addImport("canon", canon);
+     m.addImport("lanes", lanes);
+     m.addImport("heat", heat);
++    m.addImport("engine_api", api); // TF_KV_SHARE's prompt_radix store: family()'s, the server's
+     return m;
+ }
+ 
+@@ -47,7 +48,7 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
+             .{ .name = "core", .module = core },
+             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision, api) },
+-            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat) },
++            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat, api) },
+             .{ .name = "qwen35", .module = qwen35 },
+             .{ .name = "kolibri1", .module = @import("kolibri.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index f8cab27b..233aec0f 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -33,7 +33,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     const page_contract_run = b.addRunArtifact(b.addTest(.{ .root_module = page_contract, .filters = &.{"GLM page contract:"} }));
+     b.step("test-glm-page-contract-host", "GLM paged contract case and planted-control inventory without devices").dependOn(&page_contract_run.step);
+     step.dependOn(&page_contract_run.step);
+-    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = mods.lanes }} });
++    const api = glm.import_table.get("engine_api").?; // the family's own (the shared store's types): one module, one set of types
+     const admission = b.createModule(.{ .root_source_file = b.path("zig/glm_admission_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "engine_api", .module = api } } });
+     const admission_run = b.addRunArtifact(b.addTest(.{ .root_module = admission, .filters = &.{"GLM CUDA admission:"} }));
+     b.step("test-glm-admission-host", "Real GLM admission capabilities through the lane worker without GPU work").dependOn(&admission_run.step);
+@@ -66,14 +66,14 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+ }
+ 
+ pub fn compile(b: *std.Build, target: std.Build.ResolvedTarget, cuda: *std.Build.Module, mods: anytype, comptime makeGlm: anytype) void {
+-    const fp8_gate = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_ref_fp8.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = makeGlm(b, target, .debug, cuda, mods.core, mods.lanes, mods.heat) }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
++    const fp8_gate = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_ref_fp8.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = makeGlm(b, target, .debug, cuda, mods.core, mods.lanes, mods.heat, mods.api) }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+     const fp8_object = b.addObject(.{ .name = "glm-fp8-gate-compile", .root_module = b.createModule(.{ .root_source_file = b.path("zig/glm_fp8_gate_compile.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "gate", .module = fp8_gate }} }) });
+     _ = fp8_object.getEmittedBin();
+     b.step("compile-glm-fp8-gate-host", "Compile synthetic FP8 write/read and FP64 device checks with inert images, never execute").dependOn(&fp8_object.step);
+-    const glm_open = b.addObject(.{ .name = "glm-open-check", .root_module = b.createModule(.{ .root_source_file = b.path("zig/glm_open_compile.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "glm", .module = makeGlm(b, target, .debug, cuda, mods.core, mods.lanes, mods.heat) }} }) });
++    const glm_open = b.addObject(.{ .name = "glm-open-check", .root_module = b.createModule(.{ .root_source_file = b.path("zig/glm_open_compile.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "glm", .module = makeGlm(b, target, .debug, cuda, mods.core, mods.lanes, mods.heat, mods.api) }} }) });
+     _ = glm_open.getEmittedBin();
+     b.step("compile-glm-native-open", "Compile the actual GLM Linux open body with empty GPU images").dependOn(&glm_open.step);
+-    const prompt_gate = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_mm_fixed_tests.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = makeGlm(b, target, .debug, cuda, mods.core, mods.lanes, mods.heat) }, .{ .name = "cuda", .module = cuda } } });
++    const prompt_gate = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_mm_fixed_tests.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = makeGlm(b, target, .debug, cuda, mods.core, mods.lanes, mods.heat, mods.api) }, .{ .name = "cuda", .module = cuda } } });
+     const prompt_gate_compile = b.addObject(.{ .name = "glm-prompt-gate-compile", .root_module = b.createModule(.{ .root_source_file = b.path("zig/glm_prompt_gate_compile.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "gate", .module = prompt_gate }} }) });
+     _ = prompt_gate_compile.getEmittedBin();
+     b.step("compile-glm-prompt-gate-host", "Compile the actual device prompt comparison gate with inert images").dependOn(&prompt_gate_compile.step);
+diff --git a/zig/glm_fp8_pages_host.zig b/zig/glm_fp8_pages_host.zig
+index 91740ce8..eb5edf55 100644
+--- a/zig/glm_fp8_pages_host.zig
++++ b/zig/glm_fp8_pages_host.zig
+@@ -310,11 +310,11 @@ test "GLM FP8 pages: a stream that finishes gives its pages back through the eng
+     var ln: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = undefined } };
+     defer ln.lanes.deinit(t.allocator);
+     var streams: [3]lanes.Stream = undefined;
+-    try t.expectEqual(@as(usize, 2), (try ln.seat(&streams[0], 600, 100)).len); // the engine's own sequence: slot 0
++    try t.expectEqual(@as(usize, 2), (try ln.seat(&streams[0], 600, 100, &.{})).len); // the engine's own sequence: slot 0
+     try t.expectEqual(@as(u32, 0), ln.lanes.get(&streams[0]).?.slot);
+-    try t.expectEqual(@as(usize, 5), (try ln.seat(&streams[1], 2000, 100)).len);
++    try t.expectEqual(@as(usize, 5), (try ln.seat(&streams[1], 2000, 100, &.{})).len);
+     const live = F.live;
+-    try t.expectError(error.LaneMemory, ln.seat(&streams[2], 600, 100)); // both paged sequences taken: it waits
++    try t.expectError(error.LaneMemory, ln.seat(&streams[2], 600, 100, &.{})); // both paged sequences taken: it waits
+     try t.expectEqual(live, F.live); // and no window was made for it
+     try t.expectEqual(@as(usize, 1), f.census().free);
+     // stream 1 finishes: the lane host's release ends in the engine's, which gives its pages back
+@@ -324,7 +324,7 @@ test "GLM FP8 pages: a stream that finishes gives its pages back through the eng
+     try t.expectEqual(@as(usize, 0), f.st(slot).capacity);
+     try t.expectEqual(@as(usize, 6), f.census().free);
+     try t.expectEqual(@as(u32, 0), f.e.slot); // slot 0 bound again
+-    try t.expectEqualSlices(u32, &.{ 6, 5 }, try ln.seat(&streams[2], 600, 100)); // the pages just given back, last first
++    try t.expectEqualSlices(u32, &.{ 6, 5 }, try ln.seat(&streams[2], 600, 100, &.{})); // the pages just given back, last first
+     try t.expectEqual(slot, ln.lanes.get(&streams[2]).?.slot);
+     try expectWhole(&f);
+     for ([_]usize{ 0, 2 }) |i| {
+@@ -447,13 +447,13 @@ test "GLM FP8 pages: a begin that fails on rank 0 after its step went out frees
+     Wire.n = 1; // the begin alone: the slot stays this rank's, and the next begin on it is BadStep (the reported fault)
+     try Wire.replay(&g.e, 0);
+     try t.expect(g.p.used[slot]);
+-    try t.expectError(error.BadStep, g.p.map(slot, &.{ 0, 1 }));
++    try t.expectError(error.BadStep, g.p.map(slot, &.{ 0, 1 }, 0));
+     Wire.n = saved;
+     try Wire.replay(&g.e, 1); // the release rank 0 sent after it
+     try t.expect(!g.p.used[slot] and g.st(slot).capacity == 0);
+     // the retry: its begin maps on the follower, and its end frees the slot on both ranks
+-    const ids = try back.seat(&stream, 3, 600);
+-    try back.x.beginOn(null, ids);
++    const ids = try back.seat(&stream, 3, 600, &.{});
++    try back.x.beginOn(null, ids, 0);
+     try t.expectEqual(glm.follow.Kind.begin, Wire.kind(2));
+     try Wire.replay(&g.e, 2);
+     try t.expect(g.p.used[slot]);
+@@ -525,12 +525,12 @@ test "GLM FP8 pages: a follower maps rank 0's ids, and refuses a pool whose E4M3
+     f.e.pages = f.p;
+     defer f.deinit();
+     try t.expect(!f.p.leader);
+-    try f.p.map(1, &.{ 7, 2, 5 });
++    try f.p.map(1, &.{ 7, 2, 5 }, 0);
+     try t.expectEqualSlices(u32, &.{ 7, 2, 5 }, F.table(f.st(1).table, 3));
+     try t.expectEqual(@as(usize, 1536), f.st(1).capacity);
+-    try t.expectError(error.BadStep, f.p.map(1, &.{1})); // already mapped
+-    try t.expectError(error.BadStep, f.p.map(0, &.{8})); // past the pool
+-    try t.expectError(error.BadStep, f.p.map(2, &.{0})); // not a paged slot
++    try t.expectError(error.BadStep, f.p.map(1, &.{1}, 0)); // already mapped
++    try t.expectError(error.BadStep, f.p.map(0, &.{8}, 0)); // past the pool
++    try t.expectError(error.BadStep, f.p.map(2, &.{0}, 0)); // not a paged slot
+     f.p.close(1);
+     try t.expectEqual(@as(usize, 0), f.st(1).capacity);
+     try t.expect(f.p.pool.idle()); // a follower's pool lends nothing
+diff --git a/zig/glm_pages_host.zig b/zig/glm_pages_host.zig
+index 69b2994f..bd41e6a2 100644
+--- a/zig/glm_pages_host.zig
++++ b/zig/glm_pages_host.zig
+@@ -205,15 +205,15 @@ test "GLM pages: a follower refuses a duplicate owner and rolls back a failed ta
+     defer f.deinit();
+     f.p.leader = false;
+     F.fail_put = true;
+-    try t.expectError(error.NotReady, f.p.map(0, &.{ 3, 2 }));
++    try t.expectError(error.NotReady, f.p.map(0, &.{ 3, 2 }, 0));
+     try t.expectEqual(@as(usize, 0), f.p.leases[0].ids.items.len);
+     try t.expect(!f.p.used[0]);
+     F.fail_put = false;
+-    try f.p.map(0, &.{ 3, 2 });
+-    try t.expectError(error.BadStep, f.p.map(0, &.{ 1, 0 }));
++    try f.p.map(0, &.{ 3, 2 }, 0);
++    try t.expectError(error.BadStep, f.p.map(0, &.{ 1, 0 }, 0));
+     try t.expectEqualSlices(u32, &.{ 3, 2 }, f.e.seqs.items[0].?.st.pages);
+     f.p.close(0);
+-    try f.p.map(0, &.{ 1, 0 });
++    try f.p.map(0, &.{ 1, 0 }, 0);
+     f.p.close(0);
+     try t.expect(f.p.pool.idle());
+ }
+@@ -258,7 +258,7 @@ test "GLM pages: a begin packet the link refuses leaves rank 0's pending keep fo
+     link.keep_pending = .{ .slot = 0, .rows = 3 }; // committed on rank 0, not yet sent: it must not be sent or lost
+     const x: glm.follow.Leader = .{ .e = &f.e, .link = &link };
+     for (0..2) |_| {
+-        try t.expectError(error.TooManyIds, x.beginOn(null, &.{ 4, 5 }));
++        try t.expectError(error.TooManyIds, x.beginOn(null, &.{ 4, 5 }, 0));
+         try t.expect(link.keep_pending != null);
+         try t.expectEqual(@as(u32, 0), link.keep_pending.?.slot);
+         try t.expectEqual(@as(u32, 3), link.keep_pending.?.rows);
+@@ -285,13 +285,13 @@ test "GLM pages: a failed seat binding returns its pages and lane before retry"
+     defer back.deinit();
+     var stream = try lanes.Stream.init(t.allocator, .{ .id = "page-test", .prompt = &.{100}, .max_new = 8 });
+     defer stream.deinit(t.allocator);
+-    try t.expectError(error.OutOfMemory, back.seat(&stream, 1, 8));
++    try t.expectError(error.OutOfMemory, back.seat(&stream, 1, 8, &.{}));
+     try t.expectEqual(@as(usize, 0), back.lanes.count());
+     try t.expect(f.p.pool.idle());
+     try t.expectEqual(@as(usize, 8), f.p.pool.census().free);
+     try t.expectEqual(@as(u32, 1), f.e.slot);
+     v.gpa = t.allocator;
+-    try t.expectEqual(@as(usize, 1), (try back.seat(&stream, 1, 8)).len);
++    try t.expectEqual(@as(usize, 1), (try back.seat(&stream, 1, 8, &.{})).len);
+     try t.expectEqual(@as(usize, 1), back.lanes.count());
+     try t.expectEqual(@as(u32, 0), f.e.slot);
+     f.e.release(0);
+diff --git a/zig/glm_snapshot_host.zig b/zig/glm_snapshot_host.zig
+index bb5292b2..f4ff6cdc 100644
+--- a/zig/glm_snapshot_host.zig
++++ b/zig/glm_snapshot_host.zig
+@@ -1027,3 +1027,8 @@ test "GLM snapshots: an E4M3 state kept on one paged stream restores into anothe
+     }
+     f.e.cur = &f.seq;
+ }
++
++test "GLM snapshots: TF_KV_SHARE's adapter reads GLM's decls as the store it replaced: the 4,096 grid, a lookahead of 1" {
++    const r = adapter.cacheRules(glm.native);
++    try std.testing.expect(r.planned and r.grid == 4096 and r.lookahead == 1 and r.min_prompt == 0 and r.warm == .waits and !r.fork);
++}
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 673acb49..f4e532f0 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -35,6 +35,7 @@ pub const prompt_pair = @import("cuda_prompt_pair.zig");
+ pub const prompt_solo = @import("cuda_prompt_solo.zig");
+ pub const pages = @import("cuda_pages.zig");
+ pub const kv_shard = @import("cuda_kv_shard.zig");
++pub const share = @import("cuda_share.zig");
+ pub const open_owner = @import("cuda_open_owner.zig");
+ pub const images = @import("cuda_images.zig");
+ pub const follow = @import("cuda_follow.zig");
+@@ -53,6 +54,7 @@ test {
+     _ = @import("cuda_images_interleave_test.zig");
+     _ = @import("cuda_pages_test.zig");
+     _ = kv_shard;
++    _ = share;
+     _ = @import("cuda_kv_shard_pages_test.zig");
+     _ = @import("cuda_kv_shard_attn.zig");
+     _ = @import("cuda_kv_shard_attn_test.zig");
+diff --git a/zig/src/families/glm/cuda_disk_image_test.zig b/zig/src/families/glm/cuda_disk_image_test.zig
+index 92892fa8..2198c6c1 100644
+--- a/zig/src/families/glm/cuda_disk_image_test.zig
++++ b/zig/src/families/glm/cuda_disk_image_test.zig
+@@ -270,6 +270,7 @@ const Fake = struct {
+     drafter: ?*@import("dflash.zig").Drafter = null, // 0015: beside DFlash2 a kept state holds no head rows
+     slot: u32 = 0,
+     share: struct { rank: usize = 0, world: usize = 1 } = .{},
++    share_pages: bool = false, // TF_KV_SHARE: the store holds the pages below a kept state's mark
+     settings: @import("cuda_ranks.zig").Settings = .{}, // TF_GLM_KV_SHARD off: no state has a home part
+     // ...so a restore never carries: its staging, counters and link are never read
+     kv_stage: ?cuda.DeviceBuffer = null,
+diff --git a/zig/src/families/glm/cuda_disk_shard_test.zig b/zig/src/families/glm/cuda_disk_shard_test.zig
+index 2fcb85c7..79afb171 100644
+--- a/zig/src/families/glm/cuda_disk_shard_test.zig
++++ b/zig/src/families/glm/cuda_disk_shard_test.zig
+@@ -214,9 +214,9 @@ const Pair = struct {
+ 
+     /// A stream on slot `slot` on both ranks: rank 0 places it (in `home` when it has the room), rank 1 maps its ids.
+     fn open(p: *Pair, slot: u32, n_prompt: usize, home: ?u8) !void {
+-        const ids = try p.r[0].p.openFor(slot, n_prompt, reply, home);
++        const ids = try p.r[0].p.openWith(slot, n_prompt, reply, home, &.{});
+         const twin = p.r[0].p.twinCount(slot);
+-        if (p.r[0].e.settings.kv_shard.on) try p.r[1].p.mapWith(slot, ids, twin) else try p.r[1].p.map(slot, ids);
++        if (p.r[0].e.settings.kv_shard.on) try p.r[1].p.mapWith(slot, ids, twin, 0) else try p.r[1].p.map(slot, ids, 0);
+     }
+ 
+     fn close(p: *Pair, slot: u32) void {
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 53764bf4..a6117bbe 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -137,6 +137,7 @@ pub const Engine = struct {
+     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
+     chunk_busy: bool = false, // the next prompt step takes settings.chunk rows beside a decoding stream (cuda_prompt_solo): rank 0's choice, the chunk's flag 4
+     busy_steps: u64 = 0, // prompt steps that did (glm-solo-check counts them)
++    share_pages: bool = false, // TF_KV_SHARE: a kept state leaves its prefix's pages to the shared store that holds them
+     a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
+     kv_room: ?cuda.DeviceBuffer = null, // TF_GLM_KV_SHARD: owner-computed attention's peer queries and outputs
+     kv_stage: ?cuda.DeviceBuffer = null, // ...and a resume's carry pieces (cuda_kv_shard_keep.piece_bytes)
+diff --git a/zig/src/families/glm/cuda_engine_types.zig b/zig/src/families/glm/cuda_engine_types.zig
+index 1b9c19ab..53facb23 100644
+--- a/zig/src/families/glm/cuda_engine_types.zig
++++ b/zig/src/families/glm/cuda_engine_types.zig
+@@ -25,6 +25,7 @@ pub const Snap = struct {
+     mtp_len: usize,
+     cur: []u1,
+     bases: [2]usize,
++    shared: usize = 0, // TF_KV_SHARE: leading pages the shared store holds, the copy leaves out
+     ring_from: ?i64 = null, // DFlash2's context rows from here up to `pos`, in the plan's last part (null: none kept)
+     home: ?u8 = null, // TF_GLM_KV_SHARD: the part its stream lay in; that rank's copy alone holds the latent rows
+ };
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 3cbd0e6d..f8bbbd9d 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -20,8 +20,8 @@ pub const Header = extern struct {
+     kind: u32,
+     n: u32 = 0, // ids that follow
+     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts; begin: its twin's ids (KV shard)
+-    flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2), a busy step of TF_GLM_CHUNK rows (4); verify, shared: whole rows
+-    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
++    flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2), a busy step of TF_GLM_CHUNK rows (4); verify, shared: whole rows; snapshots: pages shared
++    a: u64 = 0, // begin: the shared store's pages first in its table; keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
+     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
+     temperature: f64 = 0,
+     top_p: f64 = 0,
+@@ -202,16 +202,16 @@ pub const Leader = struct {
+     }
+ 
+     pub fn begin(x: Leader, s: ?sampler.Sampling) !void {
+-        return x.beginOn(s, &.{});
++        return x.beginOn(s, &.{}, 0);
+     }
+ 
+-    /// `begin` on a paged sequence: the page ids it maps (rank 0's lease) go with the step, to every rank's table.
+-    /// Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot (and
+-    /// mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
+-    pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32) !void {
++    /// `begin` on a paged sequence: its page ids (rank 0's lease, the shared store's `kept` first) go to every rank's
++    /// table. Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot
++    /// (and mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
++    pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32, kept: usize) !void {
+         try x.flush();
+         const c = sampler.check(s);
+-        var h: Header = .{ .kind = @backingInt(Kind.begin) };
++        var h: Header = .{ .kind = @backingInt(Kind.begin), .a = kept };
+         if (x.e.settings.kv_shard.on) if (x.e.pages) |p| { // TF_GLM_KV_SHARD: the last ids are its twin's
+             h.depth = @intCast(p.twinCount(x.e.slot));
+         };
+@@ -231,9 +231,10 @@ pub const Leader = struct {
+     }
+ 
+     /// Every rank's prompt cache at rank 0's device budget, and the host tier `asked` (snapshots.agreeTiers): the
+-    /// others make theirs on this step. The pinned bytes each rank holds come back (0: device pages alone).
++    /// others make theirs on this step, its states past the shared store's pages as rank 0's. The pinned bytes each
++    /// rank holds come back (0: device pages alone).
+     pub fn snapshots(x: Leader, budget: u64, asked: u64) !u64 {
+-        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget, .seed = asked }, &.{});
++        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget, .seed = asked, .flags = @intFromBool(x.e.share_pages) }, &.{});
+         return @import("cuda_snapshots.zig").agreeTiers(x.e, budget, asked);
+     }
+ 
+@@ -433,7 +434,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+     e.structured = structuredStep(h); // rank 0 alone masks them
+     switch (kind) {
+         .begin => {
+-            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).mapWith(h.slot, ids_in, h.depth);
++            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).mapWith(h.slot, ids_in, h.depth, @intCast(@min(h.a, std.math.maxInt(u32))));
+             try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
+         },
+         .pool => {
+@@ -510,7 +511,10 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+             try v.take(h.slot, ids_in);
+             try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
+         },
+-        .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
++        .snapshots => {
++            e.share_pages = h.flags & 1 != 0; // TF_KV_SHARE on rank 0: a kept state leaves the shared store's pages out
++            _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed);
++        },
+         .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, ids_in),
+         .layout => try checkLayout(e, h.a),
+         .drop => for (ids_in) |id| e.dropState(id),
+diff --git a/zig/src/families/glm/cuda_kv_shard_pages_test.zig b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+index 1e9a1c6a..872c06f8 100644
+--- a/zig/src/families/glm/cuda_kv_shard_pages_test.zig
++++ b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+@@ -153,7 +153,7 @@ test "kv shard pages: every page's keys, this rank's part's latent pages and a t
+     try expectEqual(@as(u64, 9 * 264_192), F.size(x.lat.?.ptr));
+     try expectEqual(@as(usize, 0), p.pool.total()); // the unsharded pool holds no page
+     try expect(p.fits(600, 100));
+-    const wire = try p.openFor(1, 600, 100, null); // 2 pages in part 0, a twin of 2 in part 1
++    const wire = try p.openWith(1, 600, 100, null, &.{}); // 2 pages in part 0, a twin of 2 in part 1
+     try expectEqualSlices(u32, &.{ 0, 1, 8, 9 }, wire);
+     try expectEqual(@as(usize, 2), p.twinCount(1));
+     const s1 = f.st(1);
+@@ -170,7 +170,7 @@ test "kv shard pages: every page's keys, this rank's part's latent pages and a t
+     try expectEqual(@as(u64, 264_192), c.latPs());
+     try expectEqual(@as(usize, 1024), s1.capacity);
+     // the next stream goes to part 1 (fewer live streams), its twin of one page in part 0: rank 0's latent table on it
+-    const wire2 = try p.openFor(2, 300, 100, null);
++    const wire2 = try p.openWith(2, 300, 100, null, &.{});
+     try expectEqualSlices(u32, &.{ 10, 2 }, wire2);
+     try expectEqual(@as(usize, 1), p.twinCount(2));
+     try expectEqualSlices(u32, &.{2}, F.table(f.st(2).ltable, 1));
+@@ -178,7 +178,7 @@ test "kv shard pages: every page's keys, this rank's part's latent pages and a t
+     try expectEqualSlices(u32, &.{8}, F.table(f.st(2).ltable, 1)); // the twin given back: the trash page
+     // a resume's home part first, though it has more streams
+     p.close(2);
+-    _ = try p.openFor(2, 300, 100, 0);
++    _ = try p.openWith(2, 300, 100, 0, &.{});
+     try expectEqual(@as(u8, 0), f.st(2).hold.?.owner);
+     try p.giveTwin(1);
+     try expectEqual(@as(usize, 0), p.twinCount(1));
+@@ -197,7 +197,7 @@ test "kv shard pages: a request past a part is admitted at once and refused, nev
+     const p = try f.pool(2, 14, true); // parts of 5 pages
+     defer f.deinit(p);
+     try expect(p.fits(2900, 100)); // 6 pages
+-    try std.testing.expectError(error.PoolTooSmall, p.openFor(1, 2900, 100, null));
++    try std.testing.expectError(error.PoolTooSmall, p.openWith(1, 2900, 100, null, &.{}));
+     try expect(!p.used[1] and p.shard.?.parts.pools[0].available() == 5);
+ }
+ 
+@@ -208,7 +208,7 @@ test "kv shard pages: a follower maps rank 0's ids and twin, its latent table on
+     try lead.init(gpa, 0, true);
+     const p0 = try lead.pool(3, 20, true);
+     defer lead.deinit(p0);
+-    const wire = try gpa.dupe(u32, try p0.openFor(1, 900, 100, null));
++    const wire = try gpa.dupe(u32, try p0.openWith(1, 900, 100, null, &.{}));
+     defer gpa.free(wire);
+     const twin = p0.twinCount(1);
+     try expectEqual(@as(usize, 2), twin);
+@@ -216,7 +216,7 @@ test "kv shard pages: a follower maps rank 0's ids and twin, its latent table on
+     try other.init(gpa, 1, true);
+     const p1 = try other.pool(3, 20, false);
+     defer other.deinit(p1);
+-    try p1.mapWith(1, wire, twin);
++    try p1.mapWith(1, wire, twin, 0);
+     const s = other.st(1);
+     try expectEqualSlices(u32, wire[0..2], F.table(s.table, 2));
+     try expectEqualSlices(u32, &.{ 0, 1 }, F.table(s.ltable, 2)); // twin pages 8 and 9: part 1's first two, part-local
+@@ -227,8 +227,8 @@ test "kv shard pages: a follower maps rank 0's ids and twin, its latent table on
+     try expect(p0.digest() != p1.digest());
+     try p0.giveTwin(1);
+     try expectEqual(p0.digest(), p1.digest());
+-    try std.testing.expectError(error.BadStep, p1.mapWith(2, wire, 5)); // a twin longer than the step
+-    try std.testing.expectError(error.KvShardPlacement, p1.mapWith(2, &.{ 1, 9 }, 0)); // across the parts
++    try std.testing.expectError(error.BadStep, p1.mapWith(2, wire, 5, 0)); // a twin longer than the step
++    try std.testing.expectError(error.KvShardPlacement, p1.mapWith(2, &.{ 1, 9 }, 0, 0)); // across the parts
+     try std.testing.expect(!p1.used[2]);
+ }
+ 
+@@ -239,9 +239,9 @@ test "kv shard pages: a twin the other part has no room for is refused and count
+     try f.init(gpa, 0, true);
+     const p = try f.pool(3, 20, true);
+     defer f.deinit(p);
+-    _ = try p.openFor(1, 3000, 100, 1); // 7 pages of part 1, a twin of 6 in part 0
++    _ = try p.openWith(1, 3000, 100, 1, &.{}); // 7 pages of part 1, a twin of 6 in part 0
+     try expectEqual(@as(usize, 6), p.twinCount(1));
+-    const wire = try p.openFor(2, 600, 100, null); // 2 pages: part 0 alone has them; part 1 has 1 left for a twin of 2
++    const wire = try p.openWith(2, 600, 100, null, &.{}); // 2 pages: part 0 alone has them; part 1 has 1 left for a twin of 2
+     try expectEqual(@as(usize, 2), wire.len);
+     try expectEqual(@as(usize, 0), kvs.partOf(wire[0], 8));
+     try expectEqual(@as(usize, 0), p.twinCount(2));
+@@ -258,13 +258,13 @@ test "kv shard pages: TF_KV_POISON fills a stream's key pages and this rank's la
+     const p = try f.pool(2, 20, false);
+     defer f.deinit(p);
+     p.poison = true;
+-    try p.mapWith(1, &.{ 0, 1, 2 }, 0); // part 0's stream on rank 1: keys only
++    try p.mapWith(1, &.{ 0, 1, 2 }, 0, 0); // part 0's stream on rank 1: keys only
+     try expectEqual(@as(usize, 3), F.fills);
+     p.close(1);
+-    try p.mapWith(1, &.{ 9, 10 }, 0); // its own part: keys and latent pages
++    try p.mapWith(1, &.{ 9, 10 }, 0, 0); // its own part: keys and latent pages
+     try expectEqual(@as(usize, 3 + 4), F.fills);
+     p.close(1);
+-    try p.mapWith(1, &.{ 0, 1, 2, 9, 11 }, 2); // part 0's stream with a twin here: its keys and the twin's pages
++    try p.mapWith(1, &.{ 0, 1, 2, 9, 11 }, 2, 0); // part 0's stream with a twin here: its keys and the twin's pages
+     try expectEqual(@as(usize, 7 + 3 + 2), F.fills);
+     try p.giveTwin(1); // the twin given back: the rows stay, nothing filled again
+     try expectEqual(@as(usize, 12), F.fills);
+@@ -278,7 +278,7 @@ test "kv shard pages: a kept state's plan walks the latent rows by the latent ta
+     try f.init(gpa, 1, true);
+     const p = try f.pool(3, 20, false);
+     defer f.deinit(p);
+-    try p.mapWith(1, &.{ 12, 9, 14 }, 0); // part 1's stream on rank 1: latent pages 4, 1, 6
++    try p.mapWith(1, &.{ 12, 9, 14 }, 0, 0); // part 1's stream on rank 1: latent pages 4, 1, 6
+     const st = f.st(1);
+     const at = 1200;
+     const full = try layout.Plan.initFor(st, &f.e.w.config, at, null, true);
+@@ -325,8 +325,8 @@ test "kv shard pages: a stream resuming a kept state is seated in the state's ho
+     var streams: [2]lanes.Stream = undefined;
+     streams[0].reuse = .{ .saved = &kept, .at = 4096 };
+     streams[1].reuse = .{};
+-    _ = try ln.seat(&streams[0], 600, 100); // both parts empty: the tie would pick part 0, its home is part 1
++    _ = try ln.seat(&streams[0], 600, 100, &.{}); // both parts empty: the tie would pick part 0, its home is part 1
+     try expectEqual(@as(u8, 1), f.st(ln.lanes.get(&streams[0]).?.slot).hold.?.owner);
+-    _ = try ln.seat(&streams[1], 600, 100); // no kept state: the part with fewer live streams
++    _ = try ln.seat(&streams[1], 600, 100, &.{}); // no kept state: the part with fewer live streams
+     try expectEqual(@as(u8, 0), f.st(ln.lanes.get(&streams[1]).?.slot).hold.?.owner);
+ }
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 95c0dcd1..86659ad5 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -7,6 +7,7 @@ const follow = @import("cuda_follow.zig");
+ const fw = @import("cuda_forward.zig");
+ const dflash = @import("dflash.zig");
+ const prompt_lp = @import("cuda_prompt_logprobs.zig");
++const share_mod = @import("cuda_share.zig");
+ const cuda = @import("cuda");
+ const rule = @import("draft_rule.zig");
+ 
+@@ -43,6 +44,7 @@ const Lane = struct {
+     held_n: usize = 0,
+     first: ?u64 = null,
+     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
++    marks: []const u32 = &.{}, // TF_KV_SHARE: where the shared prompt store keeps this stream's pass (owned)
+     raw: [max_held]f64 = undefined, // DFlash2's selector chances as drawn (chances may be cut or calibrated)
+     lean: rule.Lean = .{}, // TF_GLM_DRAFT_RULE=tpm: the stream's own lean and tokens a ms
+     windows: u64 = 0, // DFlash2 windows drafted (TF_GLM_DFLASH2_FORCE's turn)
+@@ -66,6 +68,8 @@ pub const Lanes = struct {
+ 
+     pub fn deinit(self: *Lanes) void {
+         if (self.bits) |*b| b.free();
++        var it = self.lanes.valueIterator();
++        while (it.next()) |l| self.x.e.gpa.free(l.marks);
+         self.lanes.deinit(self.x.e.gpa);
+     }
+ 
+@@ -228,13 +232,14 @@ pub const Lanes = struct {
+         try sink.prepare();
+         self.x.e.prompt_logprobs = sink.want();
+         defer self.x.e.prompt_logprobs = null;
+-        const first = try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
++        var keeps: share_mod.Keeps = undefined;
++        const first = try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, self.marksOf(s, &keeps));
+         self.lanes.getPtr(s).?.first = self.take(first);
+     }
+ 
+     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+         const self = of(ptr);
+-        if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
++        if (!self.x.e.m.tiled or ss.len > engine.max_together or share_mod.of(self.x.e) != null) return false; // the store keeps a pass alone
+         for (ss) |s| if (!canBatch(s)) return false;
+         var opened: usize = 0;
+         errdefer for (ss[0..opened]) |s| releaseFn(ptr, s);
+@@ -277,7 +282,8 @@ pub const Lanes = struct {
+         try sink.prepare();
+         self.x.e.prompt_logprobs = sink.want();
+         defer self.x.e.prompt_logprobs = null;
+-        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
++        var keeps: share_mod.Keeps = undefined;
++        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, self.marksOf(s, &keeps));
+         if (step.first) |first| {
+             l.first = self.take(first);
+             l.fill = null;
+@@ -294,7 +300,8 @@ pub const Lanes = struct {
+         const at = l.fill orelse return;
+         if (at <= s.cached or s.reuse.hook == null) return;
+         try self.x.bind(l.slot);
+-        _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
++        var keeps: share_mod.Keeps = undefined;
++        _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, self.marksOf(s, &keeps)) catch |err| {
+             if (err == error.Cancelled) return;
+             return err;
+         };
+@@ -309,27 +316,55 @@ pub const Lanes = struct {
+     fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
+         const ids = s.prompt();
+         if (!fitsContext(ids.len, s.max_new, self.x.e.capacity)) return error.PromptTooLong;
+-        const pages = try self.seat(s, ids.len, s.max_new);
++        const gpa = self.x.e.gpa;
++        const share = self.cached(s);
++        var owner: share_mod.Owner = .{};
++        var adopt: std.ArrayList(u32) = .empty;
++        defer adopt.deinit(gpa);
++        // TF_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
++        const marks: []const u32 = if (share) (try share_mod.begin(self.x.e, s, &owner, &adopt)).marks else &.{};
++        var held = true;
++        errdefer if (held) gpa.free(marks);
++        const pages = try self.seat(s, ids.len, s.max_new, adopt.items);
+         errdefer {
+             self.x.e.release(self.lanes.get(s).?.slot);
+             _ = self.lanes.remove(s);
+         }
+         if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
+-        try self.x.beginOn(s.sampling, pages);
++        try self.x.beginOn(s.sampling, pages, adopt.items.len);
+         s.cached = 0;
+         s.prompt_rows.clearRetainingCapacity();
++        const l = self.lanes.getPtr(s).?;
++        gpa.free(l.marks);
++        l.marks = marks;
++        held = false;
++        if (share) {
++            const k = owner.pending orelse return null;
++            s.cached = k.at;
++            return .{ .id = k.id, .at = k.at };
++        }
+         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+     }
+ 
++    /// Whether the shared prompt store keeps this content-keyed pass, with no prompt logprob rows asked.
++    fn cached(self: *const Lanes, s: *const lanes.Stream) bool {
++        return share_mod.of(self.x.e) != null and share_mod.cacheable(s);
++    }
++
+     /// A prompt, its reply and the last verify window inside the capacity: equal still fits (the window's last row is
+     /// row capacity - 1 at most), so a request of exactly --context opens (capacity = context + a window, rounded up).
+     pub fn fitsContext(prompt: usize, max_new: usize, capacity: usize) bool {
+         return prompt + max_new + max_rows <= capacity;
+     }
+ 
+-    /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
+-    pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize) ![]const u32 {
+-        const l = try self.claim(s);
++    /// The stream's slot, its pages (the store's `adopted` first, given back on a refusal), then its sequence: a slot
++    /// past the paged ones waits before binding makes a window. Sharded (TF_GLM_KV_SHARD), in its kept state's home
++    /// part when that has the room (`home`).
++    pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize, adopted: []const u32) ![]const u32 {
++        const l = self.claim(s) catch |err| {
++            if (self.x.e.pages) |p| p.give(adopted);
++            return err;
++        };
+         l.pending_rows = null;
+         l.held_n = 0;
+         l.fill = null;
+@@ -339,18 +374,22 @@ pub const Lanes = struct {
+             _ = self.lanes.remove(s);
+         }
+         const sharded = self.x.e.settings.kv_shard.on and if (self.x.e.pages) |p| p.shard != null else false; // only then is a kept state's part read
+-        const pages = try self.pagesFor(l.slot, prompt, max_new, if (sharded) self.homeOf(s) else null);
++        const pages = try self.pagesFor(l.slot, prompt, max_new, if (sharded) self.homeOf(s) else null, adopted);
+         try self.x.bind(l.slot);
+         return pages;
+     }
+ 
+     /// A slot's pages for a prompt and its reply (none without a pool); LaneMemory: the pool lacks them now. Sharded
+-    /// (TF_GLM_KV_SHARD), in its kept state's home part when that has the room (`home`).
+-    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize, home: ?u8) ![]const u32 {
++    /// (TF_GLM_KV_SHARD), in its kept state's home part when that has the room (`home`); with TF_KV_SHARE the store's
++    /// `adopted` pages first (never beside the shard: refused at start).
++    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize, home: ?u8, adopted: []const u32) ![]const u32 {
+         const p = self.x.e.pages orelse return &.{};
+-        if (!p.paged(slot)) return error.LaneMemory; // every paged sequence is taken
++        if (!p.paged(slot)) { // every paged sequence is taken
++            p.give(adopted);
++            return error.LaneMemory;
++        }
+         p.close(slot); // a stream that opens again gives its earlier pages back first
+-        return p.openFor(slot, prompt, max_new, home);
++        return p.openWith(slot, prompt, max_new, home, adopted);
+     }
+ 
+     /// The home part of the kept state a stream may resume (TF_GLM_KV_SHARD; null: none, or unsharded).
+@@ -376,7 +415,11 @@ pub const Lanes = struct {
+     }
+     const Sink = @import("cuda_prompt_sink.zig").Sink;
+ 
+-    fn marksOf(s: *lanes.Stream) ?engine.Marks {
++    fn marksOf(self: *Lanes, s: *lanes.Stream, keeps: *share_mod.Keeps) ?engine.Marks {
++        if (self.cached(s)) {
++            const l = self.lanes.getPtr(s) orelse return null;
++            return share_mod.marks(self.x.e, l.slot, s, l.marks, keeps);
++        }
+         return if (s.reuse.hook == null) null else .{
+             .at = s.reuse.marks,
+             .ctx = s,
+@@ -736,6 +779,7 @@ pub const Lanes = struct {
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+         const self = of(ptr);
+         const kv = self.lanes.fetchRemove(s) orelse return;
++        self.x.e.gpa.free(kv.value.marks);
+         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
+         if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
+     }
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index c6c98990..2c671daa 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -14,6 +14,8 @@ const shard = @import("cuda_shard.zig");
+ const dflash = @import("dflash.zig");
+ const dflash_load = @import("dflash_load.zig");
+ const pages_mod = @import("cuda_pages.zig");
++const share_mod = @import("cuda_share.zig");
++const kp = @import("core").kv_prompts;
+ const kv = @import("core").kv_pool;
+ 
+ pub const model_type = "glm5_next";
+@@ -24,6 +26,8 @@ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = fw.prefill_rows;
+ /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
+ pub const snap_grid: u32 = prompt_rows;
++/// TF_KV_SHARE: the shared store's marks (the same chunk grid; the core adapter's default is smaller).
++pub const share_grid: u32 = prompt_rows;
+ /// Warm turns (server/warm.zig): after a reply, the next turn's prompt is prefilled in the background, so a user
+ /// message after an agent loop resumes past the loop's turns, which GLM's template renders without their reasoning
+ /// once that message comes. The pass waits this long for other work before its first chunk, and steps aside at any
+@@ -82,6 +86,20 @@ pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
+     try own.lanes.x.pool(streams + 1, pages, l.pageBytes());
+     own.e.pages = try pages_mod.Pages.init(own.gpa, own.e, l, streams + 1, pages, true);
+     if (own.e.kvCtx() != null) own.e.kv_ctx.counts = &own.e.pages.?.shard.?.parts.counts; // rank 0's counters
++    if (own.share > 0) try share(own, streams + 1);
++}
++
++/// TF_KV_SHARE: each rank's `own.share` snapshots, sized at the window's last mark (rings whole), for the store.
++fn share(own: *Owned, parallel: u32) !void {
++    const e = own.e;
++    e.share_pages = true;
++    // cc-defer: the snapshots take the room set aside for --prompt-cache-gib; from the plan once it plans them
++    const slot = e.stateBytes(e.capacity - e.capacity % snap_grid);
++    try readySnapshots(own, own.share * slot);
++    if (share_mod.fewStates(own.share, parallel)) std.log.warn(
++        "TF_KV_SHARE={d} keeps under 4 states a GLM stream at --parallel {d}: live streams evict each other's before a resume; set it to {d} or more",
++        .{ own.share, parallel, 4 * parallel },
++    );
+ }
+ 
+ /// Whether a request's caches fit now (the lane host's admission, on its engine thread).
+@@ -134,6 +152,7 @@ const Owned = struct {
+     link: follow.Link,
+     lanes: glm_lanes.Lanes,
+     layout: ?kv.Layout,
++    share: usize, // TF_KV_SHARE: states the shared store over the pool's pages keeps (0: the host store)
+ };
+ 
+ const env = @import("sys").env;
+@@ -186,7 +205,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         return err;
+     };
+     set.kv8 = o.kv8;
+-    return startup.open(io, p, if (std.c.getenv("TF_KV_PAGES")) |v| std.mem.span(v) else null, set, cuda.tp_watch, StartArgs{ .gpa = gpa, .io = io, .ctx = ctx, .dir = dir, .o = o, .p = p, .roce_bytes = roce_bytes }, openRank);
++    if (std.c.getenv("TF_GLM_KV_SHARE") != null) return error.GlmKvShareMoved; // before any rank opens
++    const share_snaps = try kp.sharing();
++    return startup.open(io, p, if (std.c.getenv("TF_KV_PAGES")) |v| std.mem.span(v) else null, set, cuda.tp_watch, StartArgs{ .gpa = gpa, .io = io, .ctx = ctx, .dir = dir, .o = o, .p = p, .roce_bytes = roce_bytes, .share = share_snaps }, openRank);
+ }
+ 
+ const StartArgs = struct {
+@@ -197,6 +218,7 @@ const StartArgs = struct {
+     o: Options,
+     p: Place,
+     roce_bytes: usize,
++    share: usize,
+ };
+ 
+ /// After liveness and page settings: NCCL, the engine and the link, then a follower's loop or rank zero's lanes.
+@@ -208,10 +230,14 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
+     const o = a.o;
+     const p = a.p;
+     const roce_bytes = a.roce_bytes;
++    // TF_KV_SHARE keeps prompts as the pool's pages: refused before the weights load, every rank told (startup)
++    if (a.share > 0 and !set.pages) return error.GlmShareNeedsPages;
++    if (a.share > 0 and set.kv_shard.on) return error.KvShareWithShard; // T05 lifts this: one store over the parts
+     cuda.memory_receipt.emit(@intCast(p.rank), .load_begin, true); // the four phases tools/memory_receipts.py reads
+     const own = try gpa.create(Owned);
+     errdefer gpa.destroy(own);
+     own.gpa = gpa;
++    own.share = a.share;
+     // every connection registered at init, while memory is free (lazily, a full GB10's ibv_reg_mr can refuse it)
+     if (std.c.getenv("NCCL_RUNTIME_CONNECT") == null) _ = env.setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+     // NCCL's cuMem host buffers wore out GB10's driver pool under load (NV_ERR_NO_MEMORY; next ranks failed to start)
+@@ -417,14 +443,30 @@ pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaq
+     return k;
+ }
+ 
+-/// A restore outside a prompt pass (the store's `begin`) would leave the other ranks behind, so it refuses.
++/// TF_KV_SHARE's resume waits in `owner` for the pass's start on every rank; any other would leave the ranks behind.
+ pub fn snap_restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
+-    _ = ptr;
+-    _ = owner;
+-    _ = saved;
+-    return error.RestoredInPromptPass;
++    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
++    if (share_mod.of(e) == null) return error.RestoredInPromptPass;
++    const o: *share_mod.Owner = @ptrCast(@alignCast(owner orelse return error.NoGlmOwner));
++    o.pending = @ptrCast(@alignCast(saved));
+ }
+ 
++/// TF_KV_SHARE: the pool the shared store keeps prompts in, rank 0's pages (null: a window a stream).
++pub fn share_pool(ptr: *anyopaque) ?*kv.Pool {
++    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
++    const p = e.pages orelse return null;
++    return &p.pool;
++}
++
++/// TF_KV_SHARE: the store the prompt passes keep and resume through, on rank 0's pages (null: none).
++pub fn share_attach(ptr: *anyopaque, prompts: ?kp.Prompts) void {
++    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
++    if (e.pages) |p| p.prompts = prompts;
++}
++
++/// TF_KV_SHARE: rows past the store's pages are each rank's snapshots, paid by the cache's room: it makes no pages.
++pub const share_kept_ppm: u32 = 0;
++
+ pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
+     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+     const k: *engine.Kept = @ptrCast(@alignCast(saved));
+@@ -463,6 +505,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
+         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
+         error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
++        error.BadKvShare => "TF_KV_SHARE: give how many states the prompt store over the KV pages keeps, or 0 or unset for off",
++        error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
++        error.GlmShareNeedsPages => "TF_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",
++        error.KvShareWithShard => "TF_KV_SHARE with TF_GLM_KV_SHARD=1 is not supported yet: set one",
+         error.BadKvPages => "TF_KV_PAGES: give auto, on (or 1, all) or off (or 0)",
+         error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
+         error.NoPagedCaches => "TF_KV_PAGES: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): unset TF_KV_PAGES or set it off",
+diff --git a/zig/src/families/glm/cuda_pages.zig b/zig/src/families/glm/cuda_pages.zig
+index dfcbe935..9636c2bd 100644
+--- a/zig/src/families/glm/cuda_pages.zig
++++ b/zig/src/families/glm/cuda_pages.zig
+@@ -2,6 +2,7 @@
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const kv = @import("core").kv_pool;
++const kp = @import("core").kv_prompts;
+ const fw = @import("cuda_forward.zig");
+ const state = @import("cuda_state.zig");
+ const types = @import("cuda_engine_types.zig");
+@@ -101,6 +102,7 @@ pub const Pages = struct {
+     used: []bool,
+     leader: bool,
+     poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
++    prompts: ?kp.Prompts = null, // TF_KV_SHARE: the shared prompt store over this pool (rank 0's), from the server
+     waiting: ?usize = null, // rank 0: the pages the request admission last held back needs (one log line a wait)
+     shard: ?*Shard = null, // TF_GLM_KV_SHARD: the pool's two parts (then `pool` holds no page)
+ 
+@@ -240,13 +242,19 @@ pub const Pages = struct {
+ 
+     /// Rank 0: paged slot `slot` takes the pages of a prompt, its reply and a last window; LaneMemory: not yet.
+     pub fn open(p: *Pages, slot: u32, prompt: usize, max_tokens: usize) ![]const u32 {
+-        return p.openFor(slot, prompt, max_tokens, null);
++        return p.openWith(slot, prompt, max_tokens, null, &.{});
++    }
++
++    /// The shared store's pages a resume held, given back when no lease took them.
++    pub fn give(p: *Pages, adopted: []const u32) void {
++        for (adopted) |id| p.pool.release(id);
+     }
+ 
+     /// `open`, sharded in `home` (a kept state's part) when it has the room (cuda_kv_shard.Parts.choose), with a twin
+     /// of the prompt's pages in the other part under TF_GLM_KV_SHARD_TWINS when it has them. The ids that cross with
+-    /// the begin step: the stream's, then its twin's (`twinCount`).
+-    pub fn openFor(p: *Pages, slot: u32, prompt: usize, max_tokens: usize, home: ?u8) ![]const u32 {
++    /// the begin step: the stream's, then its twin's (`twinCount`). Unsharded with `adopted` (the shared store's pages
++    /// a resume held, first in the lease): their rows stay as the store kept them, the rest promised and covered.
++    pub fn openWith(p: *Pages, slot: u32, prompt: usize, max_tokens: usize, home: ?u8, adopted: []const u32) ![]const u32 {
+         if (!p.paged(slot) or p.used[slot]) return error.SlotTaken;
+         if (p.shard) |x| {
+             const n = need(p.layout, prompt, max_tokens);
+@@ -262,25 +270,33 @@ pub const Pages = struct {
+             try x.wire.appendSlice(p.gpa, sl.twin.items);
+             return x.wire.items;
+         }
++        var held = adopted.len > 0;
++        errdefer if (held) for (adopted) |id| p.pool.release(id);
+         const n = need(p.layout, prompt, max_tokens);
+-        if (n > tableLen(p.e.capacity)) return error.PromptTooLong;
+-        if (n > p.pool.total()) return error.PoolTooSmall; // never fits, even with every other stream done
++        if (n > tableLen(p.e.capacity) or adopted.len > n) return error.PromptTooLong;
++        if (n - adopted.len > p.pool.total()) return error.PoolTooSmall; // never fits, even with every other stream done
+         const l = &p.leases[slot];
+-        try p.pool.promise(l, n);
++        try p.pool.promise(l, n - adopted.len);
+         errdefer p.pool.finish(l);
++        if (adopted.len > 0) {
++            held = false;
++            try p.pool.adopt(l, adopted); // the lease holds them now (its finish releases them)
++        }
+         var up: Upload = .{ .p = p, .slot = slot };
++        if (adopted.len > 0) try Upload.write(&up, l.ids.items, 0);
+         try p.pool.cover(l, n, .{ .ctx = &up, .write = Upload.write });
+-        try p.mapped(slot, l.ids.items);
++        try p.mapped(slot, l.ids.items, adopted.len);
+         return l.ids.items;
+     }
+ 
+     /// Another rank: paged slot `slot` maps rank 0's page ids (sent with the stream's begin step).
+-    pub fn map(p: *Pages, slot: u32, ids: []const u32) !void {
+-        return p.mapWith(slot, ids, 0);
++    pub fn map(p: *Pages, slot: u32, ids: []const u32, kept: usize) !void {
++        return p.mapWith(slot, ids, 0, kept);
+     }
+ 
+-    /// `map` of a begin step whose last `twin` ids are a sharded stream's twin (cuda_follow: the header's depth).
+-    pub fn mapWith(p: *Pages, slot: u32, all: []const u32, twin: usize) !void {
++    /// `map` of a begin step whose last `twin` ids are a sharded stream's twin (cuda_follow: the header's depth), the
++    /// shared store's `kept` first (its rows stay; TF_KV_POISON leaves them alone).
++    pub fn mapWith(p: *Pages, slot: u32, all: []const u32, twin: usize, kept: usize) !void {
+         if (p.shard) |x| {
+             if (!p.paged(slot) or twin > all.len or p.used[slot]) return error.BadStep;
+             const ids = all[0 .. all.len - twin];
+@@ -291,7 +307,7 @@ pub const Pages = struct {
+         }
+         if (twin != 0) return error.BadStep;
+         const ids = all;
+-        if (!p.paged(slot) or ids.len == 0 or ids.len > tableLen(p.e.capacity)) return error.BadStep;
++        if (!p.paged(slot) or ids.len == 0 or ids.len > tableLen(p.e.capacity) or kept > ids.len) return error.BadStep;
+         if (p.used[slot]) return error.BadStep;
+         for (ids) |id| if (id >= p.pool.total()) return error.BadStep;
+         const l = &p.leases[slot];
+@@ -300,17 +316,17 @@ pub const Pages = struct {
+         errdefer l.ids.clearRetainingCapacity();
+         var up: Upload = .{ .p = p, .slot = slot };
+         try Upload.write(&up, l.ids.items, 0);
+-        try p.mapped(slot, l.ids.items);
++        try p.mapped(slot, l.ids.items, kept);
+     }
+ 
+-    /// The slot's sequence reaches its pages' rows (NaN first under TF_KV_POISON).
+-    fn mapped(p: *Pages, slot: u32, ids: []const u32) !void {
++    /// The slot's sequence reaches its pages' rows (past the `kept` first, NaN first under TF_KV_POISON).
++    fn mapped(p: *Pages, slot: u32, ids: []const u32, kept: usize) !void {
+         // every id names a page of this pool, on every rank (the kernels read pt[pos / 512] for pos under the capacity
+         // set below, and State.ready refuses a pass past it), so no table can send a kernel past the pages' arena
+         for (ids) |id| if (id >= p.pool.total()) return error.BadStep;
+         const st = &p.e.seqs.items[slot].?.st;
+         const page = p.layout.pageBytes();
+-        if (p.poison) for (ids) |id| try p.e.d.check(p.e.d.api.cuMemsetD32Async(p.arena.?.ptr + id * page, 0xFFFF_FFFF, page / 4, p.e.stream.handle), "cuMemsetD32Async");
++        if (p.poison) for (ids[kept..]) |id| try p.e.d.check(p.e.d.api.cuMemsetD32Async(p.arena.?.ptr + id * page, 0xFFFF_FFFF, page / 4, p.e.stream.handle), "cuMemsetD32Async");
+         st.pages = ids;
+         st.capacity = @min(ids.len * state.page_rows, p.e.capacity);
+         p.used[slot] = true;
+@@ -392,11 +408,11 @@ pub const Pages = struct {
+         x.parts.stats(out);
+     }
+ 
+-    /// The idle server's line: nothing promised, every page free (the copy store holds none).
++    /// The idle server's line: nothing promised, every page free or, under TF_KV_SHARE, the store's.
+     fn report(p: *const Pages) void {
+         if (@import("builtin").is_test) return;
+         const c = p.pool.census();
+-        const ok = p.pool.idle() and c.free == c.total;
++        const ok = p.pool.idle() and (p.e.share_pages or c.free == c.total);
+         std.log.info("kv pool idle{s}: promised {d}, free {d} + store {d} == total {d}", .{ if (ok) "" else " (UNEVEN)", c.promised, c.free, c.kept, c.total });
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_pages_test.zig b/zig/src/families/glm/cuda_pages_test.zig
+index 080b0778..8fd5dfa2 100644
+--- a/zig/src/families/glm/cuda_pages_test.zig
++++ b/zig/src/families/glm/cuda_pages_test.zig
+@@ -4,6 +4,15 @@ const cuda = @import("cuda");
+ const weights = @import("cuda_weights.zig");
+ const shard = @import("cuda_shard.zig");
+ const pages_mod = @import("cuda_pages.zig");
++const Plan = @import("cuda_snapshot_layout.zig").Plan;
++const page_rows = @import("cuda_state.zig").page_rows;
++const sparse = @import("cuda_sparse.zig");
++const share = @import("cuda_share.zig");
++const native = @import("cuda_native.zig");
++const kv = @import("core").kv_pool;
++const kp = @import("core").kv_prompts;
++const radix = @import("engine_api").prompt_radix;
++const Kept = @import("cuda_engine.zig").Kept;
+ const Engine = @import("cuda_engine.zig").Engine;
+ const Lanes = @import("cuda_lanes.zig").Lanes;
+ const lanes = @import("lanes");
+@@ -170,16 +179,47 @@ test "a follower maps rank 0's ids, and refuses ids past its pool or a slot that
+     const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
+     const p = try f.pool(l, 3, 8, false);
+     defer f.deinit(p);
+-    try p.map(2, &.{ 5, 3, 7 });
++    try p.map(2, &.{ 5, 3, 7 }, 0);
+     try std.testing.expectEqualSlices(u32, &.{ 5, 3, 7 }, F.table(f.e.seqs.items[2].?.st.table, 3));
+     try expectEqual(@as(usize, 1536), f.e.seqs.items[2].?.st.capacity);
+-    try std.testing.expectError(error.BadStep, p.map(1, &.{8}));
+-    try std.testing.expectError(error.BadStep, p.map(3, &.{1}));
++    try std.testing.expectError(error.BadStep, p.map(1, &.{8}, 0));
++    try std.testing.expectError(error.BadStep, p.map(3, &.{1}, 0));
+     p.close(2);
+     try expectEqual(@as(usize, 0), f.e.seqs.items[2].?.st.capacity);
+     try expect(p.pool.idle()); // a follower's pool lends nothing
+ }
+ 
++test "TF_KV_SHARE at TP: two followers map rank 0's resumed table, NaN past the store's pages, more kept refused" {
++    var ids: [4]u32 = undefined;
++    {
++        var f: Fake = undefined; // rank 0: the prompt cache keeps the first two pages, and a resume holds them again
++        try f.init(std.testing.allocator);
++        const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++        const p = try f.pool(l, 3, 8, true);
++        defer f.deinit(p);
++        _ = try p.open(1, 1500, 100);
++        for ([_]u32{ 0, 1, 0, 1 }) |id| p.pool.retain(id);
++        p.close(1);
++        @memcpy(&ids, try p.openWith(2, 1500, 100, null, &.{ 0, 1 }));
++        p.close(2);
++        for ([_]u32{ 0, 1 }) |id| p.pool.release(id);
++        try expect(p.pool.idle());
++    }
++    for (1..3) |_| { // ranks 1 and 2, one after the other on the fake driver
++        var f: Fake = undefined;
++        try f.init(std.testing.allocator);
++        const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++        const p = try f.pool(l, 3, 8, false);
++        defer f.deinit(p);
++        p.poison = true;
++        try p.map(2, &ids, 2);
++        try std.testing.expectEqualSlices(u32, &ids, F.table(f.e.seqs.items[2].?.st.table, 4));
++        try expectEqual(@as(usize, 2), F.fills); // the stream's two fresh pages alone
++        p.close(2);
++        try std.testing.expectError(error.BadStep, p.map(2, ids[0..2], 3));
++    }
++}
++
+ test "a follower refuses rank 0's pool when its KV page has other bytes, and makes no pool" {
+     var f: Fake = undefined;
+     try f.init(std.testing.allocator);
+@@ -203,17 +243,17 @@ test "TF_KV_PAGES: a stream past the paged sequences waits for one, and its slot
+     var ln: Lanes = .{ .x = .{ .e = &f.e, .link = undefined } };
+     defer ln.lanes.deinit(f.e.gpa);
+     var streams: [3]lanes.Stream = undefined; // as many at once as lanes: the engine's own sequence and one more
+-    try expectEqual(@as(usize, 2), (try ln.seat(&streams[0], 600, 100)).len);
++    try expectEqual(@as(usize, 2), (try ln.seat(&streams[0], 600, 100, &.{})).len);
+     try expectEqual(@as(u32, 0), ln.lanes.get(&streams[0]).?.slot); // the engine's own takes pages too
+-    try expectEqual(@as(usize, 2), (try ln.seat(&streams[1], 600, 100)).len);
++    try expectEqual(@as(usize, 2), (try ln.seat(&streams[1], 600, 100, &.{})).len);
+     const live = F.live;
+-    try std.testing.expectError(error.LaneMemory, ln.seat(&streams[2], 600, 100)); // slot 2: past the paged ones
++    try std.testing.expectError(error.LaneMemory, ln.seat(&streams[2], 600, 100, &.{})); // slot 2: past the paged ones
+     try expectEqual(live, F.live); // nothing allocated for it
+     try expectEqual(@as(usize, 2), f.e.seqs.items.len);
+     try expectEqual(@as(usize, 2), ln.lanes.count());
+     _ = ln.lanes.remove(&streams[0]); // a stream ends: the one that waited takes its paged sequence
+     p.close(0);
+-    _ = try ln.seat(&streams[2], 600, 100);
++    _ = try ln.seat(&streams[2], 600, 100, &.{});
+     try expectEqual(@as(u32, 0), ln.lanes.get(&streams[2]).?.slot);
+     try expectEqual(@as(u32, 0), f.e.slot);
+ }
+@@ -229,8 +269,8 @@ test "TF_KV_PAGES: the lane host admits a request by the pool alone, the engine'
+     defer ln.lanes.deinit(f.e.gpa);
+     try expect(ln.fits(3000, 100)); // 7 of the 8 pages
+     var streams: [2]lanes.Stream = undefined;
+-    _ = try ln.seat(&streams[0], 600, 100); // slot 0: 2 pages
+-    _ = try ln.seat(&streams[1], 2000, 100); // slot 1: 5 pages
++    _ = try ln.seat(&streams[0], 600, 100, &.{}); // slot 0: 2 pages
++    _ = try ln.seat(&streams[1], 2000, 100, &.{}); // slot 1: 5 pages
+     _ = ln.lanes.remove(&streams[0]);
+     p.close(0);
+     try expect(!ln.fits(3000, 100)); // the engine's own is free, but only 3 pages are
+@@ -248,6 +288,220 @@ test "TF_KV_POISON: every page a stream takes is filled with NaN before its rows
+     try expectEqual(@as(usize, 3), F.fills);
+ }
+ 
++test "a stream resuming a kept prompt takes the prompt cache's pages first: its table starts with them, NaN spares them" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++    const p = try f.pool(l, 3, 8, true);
++    defer f.deinit(p);
++    p.poison = true;
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, try p.open(1, 1500, 100));
++    p.pool.retain(0); // the prompt cache keeps the first two pages
++    p.pool.retain(1);
++    p.close(1);
++    p.pool.retain(0); // its resume holds them once more for the stream
++    p.pool.retain(1);
++    F.fills = 0;
++    const ids = try p.openWith(2, 1500, 100, null, &.{ 0, 1 });
++    try expectEqual(@as(usize, 4), ids.len);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, ids[0..2]);
++    try std.testing.expectEqualSlices(u32, ids, F.table(f.e.seqs.items[2].?.st.table, 4));
++    try expectEqual(@as(usize, 2), F.fills); // the two fresh pages alone
++    try expectEqual(@as(u32, 2), p.pool.holders(0)); // the cache and the stream
++    p.close(2);
++    try expectEqual(@as(u32, 1), p.pool.holders(0)); // the cache's alone again
++    p.pool.release(0);
++    p.pool.release(1);
++    try expect(p.pool.idle() and p.pool.census().free == 8);
++}
++
++test "a resume that cannot have its fresh pages gives the prompt cache's back, and nothing is mapped" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++    const p = try f.pool(l, 3, 8, true);
++    defer f.deinit(p);
++    _ = try p.open(1, 1500, 100); // pages 0 to 3
++    p.pool.retain(0);
++    p.close(1);
++    _ = try p.open(0, 3000, 100); // 7 of the 7 free pages
++    p.pool.retain(0); // the resume's hold
++    try std.testing.expectError(error.LaneMemory, p.openWith(2, 1500, 100, null, &.{0}));
++    try expectEqual(@as(u32, 1), p.pool.holders(0)); // the cache's alone
++    try expectEqual(@as(usize, 0), f.e.seqs.items[2].?.st.capacity);
++    p.close(0);
++    p.pool.release(0);
++    try expect(p.pool.idle() and p.pool.census().free == 8);
++}
++
++test "a kept state's copy leaves the prompt cache's pages out: past them, two pools a paged cache and the head's rows" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++    const p = try f.pool(l, 2, 8, true);
++    defer f.deinit(p);
++    const ids = try p.open(1, 3000, 100); // 7 pages
++    const st = &f.e.seqs.items[1].?.st;
++    const c = &f.e.w.config;
++    const at = 2048;
++    const held = at / page_rows;
++    const whole = try Plan.initShared(st, c, at, at, 0);
++    const kept = try Plan.initShared(st, c, at, at, held);
++    const latent = c.kv_lora * 2; // a row's
++    const pooled = c.i_dim * 2; // a pool's
++    // the DSA layer's and the MTP head's caches: their 2,048 latent rows and 512 pools stay on the held pages
++    try expectEqual(whole.len - kept.len, 2 * (at * latent + at / sparse.pool * pooled));
++    var parts: usize = 0;
++    for (kept.parts[0..kept.count]) |part| if (part.span != 0) {
++        parts += 1;
++        try expectEqual(2 * pooled, part.len); // the pooled keys' two rows past the last whole pool
++        try expectEqual(part.live + @as(u64, ids[held]) * part.page, kept.piece(part, 0).live); // the next page's first
++    };
++    try expectEqual(@as(usize, 2), parts);
++    // the head 8 rows past the mark: those rows are copied from the next page too
++    const ahead = try Plan.initShared(st, c, at, at + 8, held);
++    var rows: usize = 0;
++    for (ahead.parts[0..ahead.count]) |part| if (part.span == page_rows * latent) {
++        rows += part.len / latent;
++        try expectEqual(part.live + @as(u64, ids[held]) * part.page, ahead.piece(part, 0).live);
++    };
++    try expectEqual(@as(usize, 8), rows);
++    try std.testing.expectError(error.SnapshotShape, Plan.initShared(st, c, at, at, held + 1)); // a page past the mark
++}
++
++/// The shared store's states without a device: each a Kept, live until the store drops it, restored by GLM's decl.
++const States = struct {
++    gpa: std.mem.Allocator,
++    e: *Engine,
++    next: u64 = 1,
++    live: usize = 0,
++
++    fn of(p: *anyopaque) *States {
++        return @ptrCast(@alignCast(p));
++    }
++    fn bytes(_: *anyopaque, _: u32) u64 {
++        return 1;
++    }
++    fn save(p: *anyopaque, _: ?*anyopaque, at: u32) anyerror!*anyopaque {
++        const x = of(p);
++        const k = try x.gpa.create(Kept);
++        k.* = .{ .id = x.next, .at = at };
++        x.next += 1;
++        x.live += 1;
++        return k;
++    }
++    fn drop(p: *anyopaque, saved: *anyopaque) void {
++        const x = of(p);
++        x.gpa.destroy(@as(*Kept, @ptrCast(@alignCast(saved))));
++        x.live -= 1;
++    }
++    fn restore(p: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
++        return native.snap_restore(of(p).e, owner, saved);
++    }
++    const vtable: radix.Snapshots.VTable = .{ .bytes = bytes, .save = save, .restore = restore, .drop = drop };
++};
++
++/// The shared store over GLM's pool as native/cuda_prompt_pages.zig opens it from GLM's decls, without the server.
++const Store = struct {
++    gpa: std.mem.Allocator,
++    store: radix.Store,
++
++    fn of(ctx: *anyopaque) *Store {
++        return @ptrCast(@alignCast(ctx));
++    }
++    fn open(x: *Store, gpa: std.mem.Allocator, e: *Engine, states: radix.Snapshots, snaps: usize) !void {
++        const pool = native.share_pool(e).?;
++        const rules: radix.Rules = .{ .page = page_rows, .planned = true, .grid = native.snap_grid, .lookahead = 1, .min_prompt = 0, .tail = true };
++        x.* = .{ .gpa = gpa, .store = try radix.Store.init(gpa, states, radix.pagesOf(kv.Pool, pool, pool.page_bytes), rules) };
++        x.store.limit(.{ .pages = pool.total(), .snaps = snaps });
++        pool.reclaim = .{ .ctx = x, .call = reclaim };
++        native.share_attach(e, .{ .ctx = x, .vtable = &vtable });
++    }
++    fn close(x: *Store, e: *Engine) void {
++        native.share_attach(e, null);
++        native.share_pool(e).?.reclaim = null;
++        x.store.deinit();
++    }
++    fn reclaim(ctx: *anyopaque, want: usize) bool {
++        return of(ctx).store.reclaim(want);
++    }
++    fn begin(ctx: *anyopaque, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!kp.Plan {
++        const x = of(ctx);
++        const plan = try x.store.begin(x.gpa, prompt, history_len, shared, owner, adopt);
++        return .{ .from = plan.from, .marks = plan.marks };
++    }
++    fn keep(ctx: *anyopaque, prompt: []const u32, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize {
++        return of(ctx).store.keep(prompt, at, owner, mine, path).shared;
++    }
++    fn report(_: *anyopaque, _: usize, _: u32, _: u64) void {}
++    fn free(ctx: *anyopaque, marks: []const u32) void {
++        of(ctx).gpa.free(marks);
++    }
++    const vtable: kp.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .free = free };
++};
++
++test "TF_KV_SHARE: a pass's pages below its mark go to the shared store, and a later pass resumes on those pages" {
++    const gpa = std.testing.allocator;
++    var f: Fake = undefined;
++    try f.init(gpa);
++    f.e.capacity = 16384; // the mark's grid is 4,096, so the prompt past it needs a table the default lacks
++    const l = try pages_mod.layout(gpa, &f.e, 0);
++    const p = try f.pool(l, 3, 12, true);
++    defer f.deinit(p);
++    f.e.pages = p;
++    var states: States = .{ .gpa = gpa, .e = &f.e };
++    var owner: share.Owner = .{};
++    var none: Kept = .{ .id = 0, .at = 0 };
++    try std.testing.expectError(error.RestoredInPromptPass, native.snap_restore(&f.e, &owner, &none)); // no store: refused
++    var x: Store = undefined;
++    try x.open(gpa, &f.e, .{ .ptr = &states, .vtable = &States.vtable }, 4);
++    defer x.close(&f.e);
++    const prompts = share.of(&f.e).?;
++    var adopt: std.ArrayList(u32) = .empty;
++    defer adopt.deinit(gpa);
++    var a: [4100]u32 = undefined;
++    for (&a, 1..) |*t, i| t.* = @intCast(i);
++    // a cold pass: a mark on the grid below its end, where the tree takes the pages below it and the state
++    const cold = try prompts.begin(&a, 0, &.{}, &owner, &adopt);
++    defer prompts.free(cold.marks);
++    try std.testing.expectEqualSlices(u32, &.{4096}, cold.marks);
++    try expect(cold.from == 0 and owner.pending == null and adopt.items.len == 0);
++    var kept: [8]u32 = undefined;
++    @memcpy(&kept, (try p.openWith(1, a.len, 100, null, adopt.items))[0..8]);
++    const keeps: share.Keeps = .{ .e = &f.e, .slot = 1, .prompt = &a };
++    keeps.keep(4096);
++    try expectEqual(@as(usize, 1), states.live);
++    p.close(1); // its pages past the mark free again, those below it the tree's
++    for (kept) |id| try expectEqual(@as(u32, 1), p.pool.holders(id));
++    // the same 4,097 tokens, another tail: the pass resumes at 4,096 on the tree's pages, its state pending
++    var b = a;
++    for (b[4097..]) |*t| t.* += 10_000;
++    const warm = try prompts.begin(&b, 0, &.{}, &owner, &adopt);
++    defer prompts.free(warm.marks);
++    try expectEqual(@as(u32, 4096), warm.from);
++    try expectEqual(@as(u32, 4096), owner.pending.?.at);
++    try std.testing.expectEqualSlices(u32, &kept, adopt.items);
++    try std.testing.expectEqualSlices(u32, &kept, (try p.openWith(2, b.len, 100, null, adopt.items))[0..8]);
++    for (kept) |id| try expectEqual(@as(u32, 2), p.pool.holders(id)); // the tree and the stream
++    adopt.clearRetainingCapacity();
++    p.close(2);
++    // another token at the mark: the head's row 4,095 read it, so the last page is another page and nothing resumes
++    var c = a;
++    for (c[4096..]) |*t| t.* += 10_000;
++    owner = .{};
++    const miss = try prompts.begin(&c, 0, &.{}, &owner, &adopt);
++    defer prompts.free(miss.marks);
++    try expect(miss.from == 0 and owner.pending == null and adopt.items.len == 0);
++    // a stream that needs the tree's pages: its promise evicts the state, and the pages are the stream's
++    _ = try p.openWith(0, c.len, 100, null, &.{}); // 9 pages: the 4 free and 5 of the tree's
++    try expectEqual(@as(usize, 0), states.live);
++    p.close(0);
++    const gone = try prompts.begin(&a, 0, &.{}, &owner, &adopt);
++    defer prompts.free(gone.marks);
++    try expect(gone.from == 0 and owner.pending == null and adopt.items.len == 0);
++    try expect(p.pool.idle() and p.pool.census().free == 12);
++}
++
+ fn made(gpa: std.mem.Allocator) !void {
+     var f: Fake = undefined;
+     try f.init(gpa);
+@@ -338,7 +592,6 @@ test "TF_KV_PAGES on a model of KDA layers alone without the MTP head: nothing t
+ }
+ 
+ test "capacity keeps a request exactly at --context: prompt + max_tokens == context passes the opening and prompt checks" {
+-    const native = @import("cuda_native.zig");
+     const window: usize = @import("cuda_state.zig").window_rows; // a verify window's rows past the reply (8, or 16 with W16)
+     for ([_]usize{ 8192 - window, 8184, 8192, 8191, 245_760, 864_256, 1_048_576 }) |context| {
+         const cap = native.capacity(context);
+diff --git a/zig/src/families/glm/cuda_share.zig b/zig/src/families/glm/cuda_share.zig
+new file mode 100644
+index 00000000..aea0be74
+--- /dev/null
++++ b/zig/src/families/glm/cuda_share.zig
+@@ -0,0 +1,82 @@
++//! TF_KV_SHARE: GLM's side of the shared prompt store (native/cuda_prompt_pages.zig) over rank 0's KV pages.
++const std = @import("std");
++const kp = @import("core").kv_prompts;
++const engine = @import("cuda_engine.zig");
++const page_rows = @import("cuda_state.zig").page_rows;
++const Stream = @import("lanes").Stream;
++
++/// Image passes require the server's content key; text without a key retains its token identity.
++pub fn cacheKey(s: *const Stream) ?[]const u32 {
++    if (s.key.len != 0) return if (s.key.len == s.prompt_len) s.key else null;
++    return if (s.images.len == 0) s.prompt() else null;
++}
++
++pub fn cacheable(s: *const Stream) bool {
++    return s.prompt_logprobs == null and !s.untaught and s.embedding == null and cacheKey(s) != null;
++}
++
++/// Below 4 states a stream, live streams evict each other's before a resume reaches them.
++pub fn fewStates(states: usize, parallel: usize) bool {
++    return states > 0 and states < 4 * parallel;
++}
++
++test "TF_KV_SHARE below 4 states a GLM stream is too few; off is not" {
++    try std.testing.expect(fewStates(4, 4));
++    try std.testing.expect(fewStates(15, 4));
++    try std.testing.expect(!fewStates(16, 4));
++    try std.testing.expect(!fewStates(0, 4));
++}
++
++/// The store the server attached to rank 0's pages (null: none, or another rank).
++pub fn of(e: *const engine.Engine) ?kp.Prompts {
++    const p = e.pages orelse return null;
++    return p.prompts;
++}
++
++/// A resume's state: restored by the prompt pass's start on every rank (engine.Resume), once its pages are mapped.
++pub const Owner = struct { pending: ?*engine.Kept = null };
++
++/// Before a prompt pass: the deepest kept state's pages in `adopt` (held for the stream), the state in `owner`.
++pub fn begin(e: *engine.Engine, s: *const Stream, owner: *Owner, adopt: *std.ArrayList(u32)) !kp.Plan {
++    const prompts = of(e) orelse return error.NoPromptStore;
++    const plan = try prompts.begin(cacheKey(s) orelse return error.ImageCacheKeyRequired, s.history_len, s.shared_prefixes, owner, adopt);
++    defer prompts.free(plan.marks);
++    const mine = e.gpa.dupe(u32, plan.marks) catch |err| { // the lane's own marks, freed by its allocator
++        e.pages.?.give(adopt.items);
++        adopt.clearRetainingCapacity();
++        return err;
++    };
++    return .{ .from = plan.from, .marks = mine };
++}
++
++/// A pass's marks (the engine's Marks.ctx): the mark it stands at, or the last it completed when cancelled, keeps.
++pub const Keeps = struct {
++    e: *engine.Engine,
++    slot: u32,
++    prompt: []const u32,
++
++    pub fn at(ctx: *anyopaque, mark: u32) void {
++        const k: *Keeps = @ptrCast(@alignCast(ctx));
++        k.keep(mark);
++    }
++
++    /// Slot `slot`'s pass at mark `mark`: the store takes the pages below it it lacks, and the state (no table swaps).
++    pub fn keep(k: *const Keeps, mark: u32) void {
++        const prompts = of(k.e) orelse return;
++        const p = k.e.pages.?;
++        if (!p.paged(k.slot)) return;
++        const n = mark / page_rows;
++        const ids = p.leases[k.slot].ids.items;
++        if (n > ids.len) return;
++        const path = k.e.gpa.alloc(u32, n) catch return;
++        defer k.e.gpa.free(path);
++        var owner: Owner = .{};
++        _ = prompts.keep(k.prompt, mark, &owner, ids[0..n], path);
++    }
++};
++
++/// The same content key names lookup and every completed or interrupted keep.
++pub fn marks(e: *engine.Engine, slot: u32, s: *const Stream, at: []const u32, keeps: *Keeps) ?engine.Marks {
++    keeps.* = .{ .e = e, .slot = slot, .prompt = cacheKey(s) orelse return null };
++    return if (at.len == 0) null else .{ .at = at, .ctx = keeps, .call = Keeps.at, .interrupted = Keeps.at };
++}
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index 38bef0f1..be82bf92 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -6,9 +6,9 @@ const Config = @import("config.zig").Config;
+ const cache = @import("cuda_dsa_block.zig");
+ const sparse = @import("cuda_sparse.zig");
+ 
+-/// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page, the pages `page` bytes apart; `lat`: a
+-/// sharded sequence's latent rows (TF_GLM_KV_SHARD), whose pages are its latent table's (`Plan.lids`).
+-pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0, lat: bool = false };
++/// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page `page` bytes apart, from byte `from`;
++/// `lat`: a sharded sequence's latent rows (TF_GLM_KV_SHARD), whose pages are its latent table's (`Plan.lids`).
++pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0, lat: bool = false, from: usize = 0 };
+ pub const Plan = struct {
+     pub const max_parts = 5 * (@import("config.zig").max_layers + 1) + 3;
+     parts: [max_parts]Part = undefined, // and one outside the arena (`outside`)
+@@ -18,15 +18,27 @@ pub const Plan = struct {
+     lids: []const u32 = &.{}, // sharded: its latent pages in row order (this rank's, cuda_kv_shard.latentIds)
+     sizing: bool = false, // `size`: the rows counted, not read, so no page need be mapped
+     latent: bool = true, // the latent codes and scales are parts (sharded: only where this rank keeps them)
++    shared: usize = 0, // TF_KV_SHARE: a paged sequence's first pages the shared store holds: their rows stay on them
+ 
++    /// The state at `at` (a kept copy's plan; `initForShared` past a shared store's pages).
+     pub fn init(st: *const State, c: *const Config, at: usize, head: ?usize) !Plan {
+-        return make(st, c, at, head, false, true);
++        return make(st, c, at, head, 0, false, true);
++    }
++
++    /// `init` past the shared store's `shared` pages (TF_KV_SHARE, a state's own copy).
++    pub fn initShared(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize) !Plan {
++        return make(st, c, at, head, shared, false, true);
+     }
+ 
+     /// `init` with or without the DSA caches' latent codes and scales (`latent`: a sharded state off its home rank
+     /// holds every other part; cuda_snapshots).
+     pub fn initFor(st: *const State, c: *const Config, at: usize, head: ?usize, latent: bool) !Plan {
+-        return make(st, c, at, head, false, latent);
++        return initForShared(st, c, at, head, 0, latent);
++    }
++
++    /// `initFor` past the shared store's `shared` pages (TF_KV_SHARE; a resume's state leaves their rows out).
++    pub fn initForShared(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, latent: bool) !Plan {
++        return make(st, c, at, head, shared, false, latent);
+     }
+ 
+     /// A prefix's bytes at `at`, rows to `capacity` counted held or not (a paged sequence holds its request's alone).
+@@ -36,15 +48,21 @@ pub const Plan = struct {
+ 
+     /// `size` with or without the latent codes and scales (`initFor`'s `latent`).
+     pub fn sizeFor(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, latent: bool) !usize {
++        return sizeForShared(st, c, capacity, at, head, 0, latent);
++    }
++
++    /// `sizeFor` past the shared store's `shared` pages (TF_KV_SHARE).
++    pub fn sizeForShared(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, shared: usize, latent: bool) !usize {
+         var whole = st.*;
+         whole.capacity = capacity;
+-        return (try make(&whole, c, at, head, true, latent)).len;
++        return (try make(&whole, c, at, head, shared, true, latent)).len;
+     }
+ 
+-    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, sizing: bool, latent: bool) !Plan {
++    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, sizing: bool, latent: bool) !Plan {
+         if (at > st.capacity or st.caches.len > @import("config.zig").max_layers) return error.SnapshotShape;
+         if (st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;
+-        var p: Plan = .{ .ids = st.pages, .lids = st.lpages, .sizing = sizing, .latent = latent };
++        if (shared > 0 and (st.table == 0 or shared * page_rows > at)) return error.SnapshotShape; // pages below `at` only
++        var p: Plan = .{ .ids = st.pages, .lids = st.lpages, .sizing = sizing, .latent = latent, .shared = shared };
+         // a paged sequence's caches are its pages: its fields up to them end at its first ring
+         const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
+         if (first < st.arena.buf.ptr) return error.SnapshotShape;
+@@ -77,13 +95,14 @@ pub const Plan = struct {
+         try p.addCache(st, x, x.pk, pooled, page_rows / sparse.pool * @as(usize, c.i_dim) * 2);
+     }
+ 
+-    /// A cache's rows: in the arena, or on the sequence's pages, `span` bytes a page.
++    /// A cache's rows: in the arena, or on the sequence's pages, `span` bytes a page (past the store's `shared`).
+     fn addCache(p: *Plan, st: *const State, x: cache.Caches, live: u64, len: usize, span: usize) !void {
+         if (x.pt == 0) return p.add(st, live, len);
+-        if (len == 0) return;
++        const from = @min(len, p.shared * span);
++        if (len == from) return;
+         if ((!p.sizing and (len - 1) / span >= p.ids.len) or p.count == p.parts.len) return error.SnapshotShape;
+-        p.len = try std.math.add(usize, p.len, len);
+-        p.parts[p.count] = .{ .live = live, .len = len, .span = span, .page = x.ps };
++        p.len = try std.math.add(usize, p.len, len - from);
++        p.parts[p.count] = .{ .live = live, .len = len - from, .span = span, .page = x.ps, .from = from };
+         p.count += 1;
+     }
+ 
+@@ -109,9 +128,10 @@ pub const Plan = struct {
+     /// Where a part's bytes from `done` on sit, as many as lie in a row there.
+     pub fn piece(p: *const Plan, part: Part, done: usize) Part {
+         if (part.span == 0) return .{ .live = part.live + done, .len = part.len - done };
+-        const off = done % part.span;
++        const at = part.from + done;
++        const off = at % part.span;
+         const ids = if (part.lat) p.lids else p.ids;
+-        return .{ .live = part.live + @as(u64, ids[done / part.span]) * part.page + off, .len = @min(part.span - off, part.len - done) };
++        return .{ .live = part.live + @as(u64, ids[at / part.span]) * part.page + off, .len = @min(part.span - off, part.len - done) };
+     }
+ 
+     fn add(p: *Plan, st: *const State, live: u64, len: usize) !void {
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index c965eec8..4e203af7 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -86,11 +86,16 @@ fn mtpHead(e: anytype, at: usize) error{Overflow}!?usize {
+ pub fn bytes(e: anytype, at: usize) u64 {
+     const head = mtpHead(e, at) catch return std.math.maxInt(u64);
+     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
+-    const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
++    const n = layout.Plan.sizeForShared(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at), true) catch return std.math.maxInt(u64);
+     const ring: usize = if (e.drafter != null) dflash.ring_bytes else 0; // at most: DFlash2's ring when it holds rows
+     return pages.rounded(n + ring) catch std.math.maxInt(u64);
+ }
+ 
++/// The pages below `at` the shared prompt store holds (TF_KV_SHARE): a kept state's copy leaves them out.
++fn heldPages(e: anytype, at: usize) usize {
++    return if (e.share_pages) at / @import("cuda_state.zig").page_rows else 0;
++}
++
+ /// DFlash2's ring for the bound slot as the plan's last part, when it holds the context rows right up to `at`; where
+ /// those rows start (null: no drafter, or nothing worth keeping).
+ fn drafterPart(e: anytype, plan: *layout.Plan, at: usize) !?i64 {
+@@ -132,10 +137,12 @@ pub fn keepAs(e: anytype, id: u64) !void {
+     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
+     const hold = holdOf(e);
+     const head = if (e.mtp) e.cur.st.mtp_len else null;
+-    // TF_GLM_KV_SHARD: the latent rows on their owner's copy alone; every rank leases the whole state's bytes
++    // TF_GLM_KV_SHARD: the latent rows on their owner's copy alone; every rank leases the whole state's bytes.
++    // TF_KV_SHARE: the shared store's pages below the mark stay out (the state's copy resumes from them by reference).
+     const own = kv_keep.keepsLatent(hold, e.share.rank);
+-    var plan = try layout.Plan.initFor(&e.cur.st, &e.c, e.cur.st.pos, head, own);
+-    const latent_bytes = if (own) 0 else (try layout.Plan.initFor(&e.cur.st, &e.c, e.cur.st.pos, head, true)).len - plan.len;
++    const held = heldPages(e, e.cur.st.pos);
++    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, own);
++    const latent_bytes = if (own) 0 else (try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, true)).len - plan.len;
+     const ring = try drafterPart(e, &plan, e.cur.st.pos);
+     var lease = try pool.take(plan.len + latent_bytes);
+     errdefer {
+@@ -147,7 +154,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
+     const t0 = now();
+     try pool.move(e.stream, &lease, &plan, true);
+     try e.stream.synchronize();
+-    const s: types.Snap = .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .ring_from = ring, .home = if (hold) |h| h.owner else null };
++    const s: types.Snap = .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared, .ring_from = ring, .home = if (hold) |h| h.owner else null };
+     note(e, "kept", &s, t0);
+     e.snaps.putAssumeCapacityNoClobber(id, s);
+ }
+@@ -196,7 +203,7 @@ pub fn restore(e: anytype, id: u64) !void {
+     const hold = holdOf(e);
+     const home: ?u8 = if (e.settings.kv_shard.on) s.home else null;
+     const own = if (home) |h| h == e.share.rank else true; // this rank's copy holds the latent rows
+-    var plan = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, own);
++    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, own);
+     if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), dflash.ring_bytes);
+     if (plan.len != s.len) return error.SnapshotSize;
+     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index d5f77937..1cc5861e 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -455,7 +455,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         };
+     }
+     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
+-    if (comptime @hasDecl(F, "share_attach")) if (share and cache > 0) {
++    if (comptime @hasDecl(F, "share_attach")) if (share and (cache > 0 or F.share_kept_ppm == 0)) { // GLM keeps copies: the store opens at any cache
+         h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), try @import("core").kv_prompts.sharing());
+     };
+     errdefer if (h.prompts) |x| x.close();
+diff --git a/zig/tests/cuda/glm_kv_shard_check.zig b/zig/tests/cuda/glm_kv_shard_check.zig
+index 6322dbc2..83ddeb0c 100644
+--- a/zig/tests/cuda/glm_kv_shard_check.zig
++++ b/zig/tests/cuda/glm_kv_shard_check.zig
+@@ -151,14 +151,14 @@ pub fn shardCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
+         for (ids, 0..) |*u, i| u.* = @intCast(100 + (i * 7919 + k * 31) % 5000);
+         // a live stream in the other part, so the placement is the case's, not an empty pool's
+         try x.bind(other_slot);
+-        const busy = try pages.openFor(other_slot, 600, 0, 1 - c.home);
+-        try x.beginOn(null, busy);
++        const busy = try pages.openWith(other_slot, 600, 0, 1 - c.home, &.{});
++        try x.beginOn(null, busy, 0);
+         pages.shard.?.switches.twins = c.twin;
+         var first: [2]u32 = undefined;
+         const at: usize = glm.engine.prompt_rows; // the kept state's mark (a chunk start)
+         for ([_]u32{ sharded_slot, twin_slot }, 0..) |slot, j| {
+             try x.bind(slot);
+-            if (slot == sharded_slot) try x.beginOn(null, try pages.openFor(slot, c.len, 64, c.home)) else try x.begin(null);
++            if (slot == sharded_slot) try x.beginOn(null, try pages.openWith(slot, c.len, 64, c.home, &.{}), 0) else try x.begin(null);
+             const marks: ?glm.engine.Marks = if (c.resume_part != null and slot == sharded_slot) .{ .at = &.{@as(u32, @intCast(at))}, .ctx = e, .call = keepAt } else null;
+             first[j] = try x.prefill(ids, null, null, marks);
+             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
+@@ -172,7 +172,7 @@ pub fn shardCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
+             pages.shard.?.switches.twins = c.resume_twin;
+             if (c.disk and kept_id != 0) kept_id = try throughDisk(a, e, kept_id);
+             try x.bind(sharded_slot);
+-            try x.beginOn(null, try pages.openFor(sharded_slot, c.len, 64, rp));
++            try x.beginOn(null, try pages.openWith(sharded_slot, c.len, 64, rp, &.{}), 0);
+             if (kept_id == 0) {
+                 std.debug.print("FAIL kv shard: {s}: no state was kept at {d}\n", .{ c.name, at });
+                 failed = true;
+diff --git a/zig/tests/cuda/glm_lanes_tests.zig b/zig/tests/cuda/glm_lanes_tests.zig
+index 07bac919..525c96b3 100644
+--- a/zig/tests/cuda/glm_lanes_tests.zig
++++ b/zig/tests/cuda/glm_lanes_tests.zig
+@@ -264,7 +264,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank:
+         if (set.pages) {
+             const held = try e.pages.?.open(@intCast(slot), ids.len + 512, 64); // the prompt and every round's rows
+             try x.bind(@intCast(slot));
+-            try x.beginOn(sampling, held);
++            try x.beginOn(sampling, held, 0);
+         } else {
+             try x.bind(@intCast(slot));
+             try x.begin(sampling);
+diff --git a/zig/tests/cuda/glm_paged_tests.zig b/zig/tests/cuda/glm_paged_tests.zig
+index 7da2faa4..db6aab6b 100644
+--- a/zig/tests/cuda/glm_paged_tests.zig
++++ b/zig/tests/cuda/glm_paged_tests.zig
+@@ -66,7 +66,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
+         var drafts: [2][glm.engine.max_drafts]u32 = undefined;
+         for ([_]u32{ paged_slot, twin_slot }, 0..) |slot, j| {
+             try x.bind(slot);
+-            if (slot == paged_slot) try x.beginOn(null, held) else try x.begin(null);
++            if (slot == paged_slot) try x.beginOn(null, held, 0) else try x.begin(null);
+             first[j] = try x.prefill(ids, null, null, null);
+             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
+             try x.draft(true, &.{first[j]}, 2, &drafts[j], null);
+diff --git a/zig/tests/cuda/glm_pair_tests.zig b/zig/tests/cuda/glm_pair_tests.zig
+index 6e65ee1c..7ce0d29f 100644
+--- a/zig/tests/cuda/glm_pair_tests.zig
++++ b/zig/tests/cuda/glm_pair_tests.zig
+@@ -95,7 +95,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
+                 for (held[1..], held[0 .. held.len - 1]) |b, prev| unordered += @intFromBool(b != prev + 1);
+             }
+             try x.bind(slots[twin]);
+-            if (set.pages) try x.beginOn(null, held) else try x.begin(null);
++            if (set.pages) try x.beginOn(null, held, 0) else try x.begin(null);
+             const before = e.pair.?.steps;
+             var at: usize = 0;
+             const t = while (true) {
+-- 
+2.56.0
+

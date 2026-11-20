@@ -1,0 +1,424 @@
+From f8d725f8cb0a3e0b673208c25bed9a23336ac6c4 Mon Sep 17 00:00:00 2001
+From: GrgaPalcic <26028466+GrgaPalcic@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 18:21:26 +0100
+Subject: [PATCH] glm cuda: a cold pass seats in its held prefix's part; a
+ cross-part keep evicts idle branches instead of refusing
+
+Under TF_GLM_KV_SHARD with TF_KV_SHARE, a cold pass with nothing to resume was seated in the part with fewer live
+streams. When the tree held its prefix (a system block, earlier turns) in the other part with other branches below,
+every keep was refused (kv_shard_keeps_refused_total), so nothing was kept and every later turn ran cold again:
+a 335K-token conversation re-prefilled for ~207 s each turn (a second two-Spark pair running this stack, 2026-11-11).
+
+- The Prompts hooks gain an optional `first` (the first page the store holds of a prompt); cuda_share.prefixHome
+  turns it into a part, and a cold pass with nothing adopted takes that part as its seat hint (the parts still
+  choose when it lacks room), as a skipped resume already does.
+- Store.keep: when the path would span the parts and the chain is not alone, the idle leaves under the chain go one
+  at a time (Tree.evictUnder), then the chain is replaced whole as before. A refusal is left only when a live
+  stream holds those leaves.
+---
+ zig/src/core/kv_prompts.zig                   |   8 +
+ zig/src/core/prompt_radix.zig                 |  22 ++-
+ zig/src/core/prompt_radix_tree.zig            |  16 ++
+ .../families/glm/cuda_kv_shard_pages_test.zig | 160 ++++++++++++++++--
+ zig/src/families/glm/cuda_lanes.zig           |   4 +-
+ zig/src/families/glm/cuda_share.zig           |  12 ++
+ zig/src/native/cuda_prompt_pages.zig          |  25 +--
+ 7 files changed, 218 insertions(+), 29 deletions(-)
+
+diff --git a/zig/src/core/kv_prompts.zig b/zig/src/core/kv_prompts.zig
+index 655ddaab..d7317002 100644
+--- a/zig/src/core/kv_prompts.zig
++++ b/zig/src/core/kv_prompts.zig
+@@ -20,6 +20,9 @@ pub const Prompts = struct {
+         /// The kept state at `at` for `prompt` goes (a peer could not resume it, or its pages would span the parts).
+         forget: *const fn (ctx: *anyopaque, prompt: []const u32, at: u32) void,
+         free: *const fn (ctx: *anyopaque, marks: []const u32) void,
++        /// The first page the store holds of `prompt` (null: none): a sharded pool seats a cold pass in its part,
++        /// so the pass's keep shares the tree's prefix in one part instead of spanning both (TF_GLM_KV_SHARD).
++        first: ?*const fn (ctx: *anyopaque, prompt: []const u32) ?u32 = null,
+     };
+ 
+     pub fn begin(p: Prompts, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) !Plan {
+@@ -41,6 +44,11 @@ pub const Prompts = struct {
+     pub fn free(p: Prompts, marks: []const u32) void {
+         p.vtable.free(p.ctx, marks);
+     }
++
++    pub fn firstHeld(p: Prompts, prompt: []const u32) ?u32 {
++        const f = p.vtable.first orelse return null;
++        return f(p.ctx, prompt);
++    }
+ };
+ 
+ /// A kept state's copied rows in store-held pages: byte o in chunk c = o / chunk, region c % regions, page c / regions.
+diff --git a/zig/src/core/prompt_radix.zig b/zig/src/core/prompt_radix.zig
+index cef831b2..b79b35d3 100644
+--- a/zig/src/core/prompt_radix.zig
++++ b/zig/src/core/prompt_radix.zig
+@@ -187,6 +187,16 @@ pub const Store = struct {
+         s.tree.evict(n);
+     }
+ 
++    /// The first page the tree holds of `prompt` (null: none, or too short to match a page and its lookahead).
++    pub fn firstHeld(s: *const Store, prompt: []const u32) ?u32 {
++        if (!s.on()) return null;
++        const t = &s.tree;
++        if (prompt.len < t.page + t.ahead) return null;
++        var one: [1]u32 = undefined;
++        var last: ?*Node = null;
++        return if (t.heldPrefix(prompt, 1, one[0..], &last) == 1) one[0] else null;
++    }
++
+     fn sharedKey(tokens: []const u32) u64 {
+         return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(tokens));
+     }
+@@ -262,9 +272,15 @@ pub const Store = struct {
+             if (s.parts) |g| { // TF_GLM_KV_SHARD: a kept state's path never spans the parts
+                 @memcpy(path[got..], mine[got..]); // the pages the tree lacks: the path's tail
+                 if (!g.one(g.ctx, path[0..mine.len])) {
+-                    if (got < mine.len) if (last) |n| if (t.alone(n)) {
+-                        t.dropChain(n); // the older prefix chain goes: the new state is longer and replaces it whole
+-                        continue;
++                    if (got < mine.len) if (last) |n| {
++                        if (t.alone(n)) {
++                            t.dropChain(n); // the older prefix chain goes: the new state is longer and replaces it whole
++                            continue;
++                        }
++                        // other branches share the chain: their idle leaves go, oldest and never-resumed first, then
++                        // the path is looked up again. Refusing here instead left a conversation seated in the other
++                        // part unkept on every turn, each turn cold (2026-11-11).
++                        if (t.evictUnder(n)) continue;
+                     };
+                     g.refused(g.ctx);
+                     std.log.debug("kv shard: keeping {d} tokens refused: the kept pages and the new ones would span two parts (TF_GLM_KV_SHARD)", .{at});
+diff --git a/zig/src/core/prompt_radix_tree.zig b/zig/src/core/prompt_radix_tree.zig
+index a357543e..dc12b307 100644
+--- a/zig/src/core/prompt_radix_tree.zig
++++ b/zig/src/core/prompt_radix_tree.zig
+@@ -281,6 +281,22 @@ pub const Tree = struct {
+         t.prune(n);
+     }
+ 
++    /// Evicts the least valuable idle leaf in the subtree of `n`'s chain (from the root's child it hangs under);
++    /// false when every leaf there is held. A keep whose pages would span the parts frees the other part's branches
++    /// this way, one at a time, until the chain is `alone` and goes whole (dropChain).
++    pub fn evictUnder(t: *Tree, n: *Node) bool {
++        var top: *Node = n;
++        while (top.parent) |up| {
++            if (up.parent == null) break;
++            top = up;
++        }
++        var best: ?*Node = null;
++        t.weakestLeaf(top, &best, null);
++        const leaf = best orelse return false;
++        if (leaf.entry != null) t.evict(leaf) else t.prune(leaf);
++        return true;
++    }
++
+     /// Whether nothing but the tree holds the pages of `n`.
+     fn idle(t: *const Tree, n: *const Node) bool {
+         for (n.pages) |id| if (t.pages.vtable.holders(t.pages.ptr, id) != 1) return false;
+diff --git a/zig/src/families/glm/cuda_kv_shard_pages_test.zig b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+index ac3754bd..38940ef9 100644
+--- a/zig/src/families/glm/cuda_kv_shard_pages_test.zig
++++ b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+@@ -668,7 +668,10 @@ const Stored = struct {
+     fn free(ctx: *anyopaque, marks: []const u32) void {
+         of(ctx).gpa.free(marks);
+     }
+-    const vtable: kp.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .forget = forget, .free = free };
++    fn firstHeld(ctx: *anyopaque, prompt: []const u32) ?u32 {
++        return of(ctx).store.firstHeld(prompt);
++    }
++    const vtable: kp.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .forget = forget, .free = free, .first = firstHeld };
+ };
+ 
+ test "kv shard pages: the GPU's sequence — a skipped resume seats at its prefix's part, its keep and the next resume stay in one part, the follower maps it" {
+@@ -856,7 +859,7 @@ test "kv shard pages: part A full, the skipped resume's cold pass seats in part
+     for (adopt2.items) |id| x.parts.release(id); // the begin's holds go back, the tree's stay
+ }
+ 
+-test "kv shard pages: a keep under a branched prefix of the other part is refused and counted, the tree unchanged" {
++test "kv shard pages: a keep under a branched prefix of the other part evicts the idle branch and replaces the chain" {
+     const gpa = std.testing.allocator;
+     const kv = @import("core").kv_pool;
+     var f: Fake = undefined;
+@@ -892,25 +895,98 @@ test "kv shard pages: a keep under a branched prefix of the other part is refuse
+     var path1: [16]u32 = undefined;
+     try expect(st.store.keep(branched, 8192, &owner, lease1.ids.items, &path1).held);
+     x.parts.pools[0].finish(&lease1);
++    try expectEqual(@as(usize, 2), st.live);
+ 
+-    // a part-B pass over the same 4,096 prefix, longer: its pages would span the parts, the prefix node's other
+-    // child stands, so the keep is refused and counted, and nothing of the tree moves
++    // a part-B pass over the same 4,096 prefix, longer: its own pages for the whole prompt
+     var tail: kv.Lease = .{};
+     try x.parts.pools[1].promise(&tail, 240);
+     try x.parts.pools[1].cover(&tail, 240, null);
+     var mine: [240]u32 = undefined;
+     for (tail.ids.items, 0..) |id, i| mine[i] = id + 258;
++
++    // the branch is idle: it goes, the chain is alone and goes whole, the new path is all part B, nothing refused
++    var path2: [240]u32 = undefined;
++    try expect(st.store.keep(big, 122880, &owner, &mine, &path2).held);
++    x.parts.pools[1].finish(&tail);
++    try expectEqual(@as(u64, 0), x.parts.counts.keeps_refused);
++    try expectEqual(@as(usize, 1), st.live);
++    for (path0) |id| try expectEqual(@as(u32, 0), x.parts.holders(id));
++    for (path1) |id| try expectEqual(@as(u32, 0), x.parts.holders(id));
++    for (path2) |id| {
++        try expectEqual(@as(usize, 1), kvs.partOf(id, x.parts.h));
++        try expectEqual(@as(u32, 1), x.parts.holders(id));
++    }
++
++    // the next turn resumes whole, from part B
++    var adopt: std.ArrayList(u32) = .empty;
++    defer adopt.deinit(gpa);
++    const plan = try prompts.begin(big, 0, &.{}, &owner, &adopt);
++    defer prompts.free(plan.marks);
++    try expectEqual(@as(u32, 122880), plan.from);
++    try expectEqual(@as(usize, 240), adopt.items.len);
++    for (adopt.items) |id| try expectEqual(@as(usize, 1), kvs.partOf(id, x.parts.h));
++    for (adopt.items) |id| x.parts.release(id);
++}
++
++test "kv shard pages: a keep under a branched prefix of the other part whose branch a stream holds is refused and counted, the branch kept" {
++    const gpa = std.testing.allocator;
++    const kv = @import("core").kv_pool;
++    var f: Fake = undefined;
++    Fake.reset();
++    try f.init(gpa, 0, true);
++    f.e.capacity = 262144;
++    const p = try f.pool(4, 520, true); // two parts of 258
++    defer f.deinit(p);
++    const x = p.shard.?;
++    var st: Stored = undefined;
++    try st.open(gpa, &f.e, 8);
++    defer st.close(&f.e);
++    const prompts = share_mod.of(&f.e).?;
++    const big = try gpa.alloc(u32, 126407);
++    defer gpa.free(big);
++    for (big, 1..) |*t, i| t.* = @intCast(i);
++
++    // the 4,096-token state kept in part A, and a longer one below it in part A: the prefix node has another child
++    var owner: share_mod.Owner = .{};
++    var lease: kv.Lease = .{};
++    try x.parts.pools[0].promise(&lease, 8);
++    try x.parts.pools[0].cover(&lease, 8, null);
++    var path0: [8]u32 = undefined;
++    try expect(st.store.keep(big, 4096, &owner, lease.ids.items, &path0).held);
++    x.parts.pools[0].finish(&lease);
++    const branched = try gpa.alloc(u32, 8193);
++    defer gpa.free(branched);
++    @memcpy(branched, big[0..8193]);
++    for (branched[4096..]) |*t| t.* += 1_000_000; // it parts from the 4,096 prefix's next page
++    var lease1: kv.Lease = .{};
++    try x.parts.pools[0].promise(&lease1, 16);
++    try x.parts.pools[0].cover(&lease1, 16, null);
++    var path1: [16]u32 = undefined;
++    try expect(st.store.keep(branched, 8192, &owner, lease1.ids.items, &path1).held);
++    x.parts.pools[0].finish(&lease1);
++    try expectEqual(@as(usize, 2), st.live);
++
++    // a part-B pass over the same 4,096 prefix, longer: its own pages for the whole prompt
++    var tail: kv.Lease = .{};
++    try x.parts.pools[1].promise(&tail, 240);
++    try x.parts.pools[1].cover(&tail, 240, null);
++    var mine: [240]u32 = undefined;
++    for (tail.ids.items, 0..) |id, i| mine[i] = id + 258;
++
++    // a live stream holds the branch's pages: the idle 4,096 state on the chain goes, the held branch cannot, so the
++    // keep is refused and counted; the branch stays
++    for (path1) |id| x.parts.retain(id);
++    defer for (path1) |id| x.parts.release(id);
+     var path2: [240]u32 = undefined;
+     const refused = st.store.keep(big, 122880, &owner, &mine, &path2);
+     try expect(!refused.held);
+-    try expectEqual(@as(usize, 8), refused.shared); // the pages the tree already held
++    try expectEqual(@as(usize, 7), refused.shared); // the pages the tree still holds: the branch's shared head
+     x.parts.pools[1].finish(&tail);
+     try expectEqual(@as(u64, 1), x.parts.counts.keeps_refused);
+-    try expectEqual(@as(usize, 2), st.live);
+-    for (path0) |id| try expectEqual(@as(u32, 1), x.parts.holders(id));
+-    for (path1[8..]) |id| try expectEqual(@as(u32, 1), x.parts.holders(id));
++    try expectEqual(@as(usize, 1), st.live);
++    for (path1) |id| try expectEqual(@as(u32, 2), x.parts.holders(id)); // the tree's and the stream's (path1 starts with path0)
+ 
+-    // both kept states still resume
++    // the branch still resumes
+     var adopt: std.ArrayList(u32) = .empty;
+     defer adopt.deinit(gpa);
+     const plan = try prompts.begin(branched, 0, &.{}, &owner, &adopt);
+@@ -918,12 +994,66 @@ test "kv shard pages: a keep under a branched prefix of the other part is refuse
+     try expectEqual(@as(u32, 8192), plan.from);
+     try expectEqual(@as(usize, 16), adopt.items.len);
+     for (adopt.items) |id| x.parts.release(id);
+-    adopt.clearRetainingCapacity();
+-    const plan2 = try prompts.begin(big, 0, &.{}, &owner, &adopt);
+-    defer prompts.free(plan2.marks);
+-    try expectEqual(@as(u32, 4096), plan2.from);
+-    try expectEqual(@as(usize, 8), adopt.items.len);
+-    for (adopt.items) |id| x.parts.release(id);
++}
++
++test "kv shard pages: a cold pass with nothing to resume is seated in the part of the prefix the store holds" {
++    const gpa = std.testing.allocator;
++    const kv = @import("core").kv_pool;
++    var f: Fake = undefined;
++    Fake.reset();
++    try f.init(gpa, 0, true);
++    f.e.capacity = 262144;
++    const p = try f.pool(4, 520, true); // two parts of 258
++    defer f.deinit(p);
++    const x = p.shard.?;
++    var st: Stored = undefined;
++    try st.open(gpa, &f.e, 8);
++    defer st.close(&f.e);
++    const prompts = share_mod.of(&f.e).?;
++    const big = try gpa.alloc(u32, 126407);
++    defer gpa.free(big);
++    for (big, 1..) |*t, i| t.* = @intCast(i);
++
++    // the 4,096-token state kept in part A, and a longer one below it in part A: the prefix node has another child
++    var owner: share_mod.Owner = .{};
++    var lease: kv.Lease = .{};
++    try x.parts.pools[0].promise(&lease, 8);
++    try x.parts.pools[0].cover(&lease, 8, null);
++    var path0: [8]u32 = undefined;
++    try expect(st.store.keep(big, 4096, &owner, lease.ids.items, &path0).held);
++    x.parts.pools[0].finish(&lease);
++    const branched = try gpa.alloc(u32, 8193);
++    defer gpa.free(branched);
++    @memcpy(branched, big[0..8193]);
++    for (branched[4096..]) |*t| t.* += 1_000_000; // it parts from the 4,096 prefix's next page
++    var lease1: kv.Lease = .{};
++    try x.parts.pools[0].promise(&lease1, 16);
++    try x.parts.pools[0].cover(&lease1, 16, null);
++    var path1: [16]u32 = undefined;
++    try expect(st.store.keep(branched, 8192, &owner, lease1.ids.items, &path1).held);
++    x.parts.pools[0].finish(&lease1);
++    try expectEqual(@as(usize, 2), st.live);
++
++    // a part-B pass over the same 4,096 prefix, longer: its own pages for the whole prompt
++    var tail: kv.Lease = .{};
++    try x.parts.pools[1].promise(&tail, 240);
++    try x.parts.pools[1].cover(&tail, 240, null);
++    var mine: [240]u32 = undefined;
++    for (tail.ids.items, 0..) |id, i| mine[i] = id + 258;
++
++    x.parts.pools[1].finish(&tail);
++    // a prompt that shares the part-A prefix but resumes nothing kept (it parts before the 4,096 state's end)
++    const other = try gpa.alloc(u32, 6000);
++    defer gpa.free(other);
++    @memcpy(other, big[0..6000]);
++    for (other[2048..]) |*t| t.* += 2_000_000;
++    const id = prompts.firstHeld(other).?;
++    try expectEqual(@as(usize, 0), kvs.partOf(id, x.parts.h));
++    // nothing held for an unrelated prompt
++    const fresh = try gpa.alloc(u32, 6000);
++    defer gpa.free(fresh);
++    for (fresh, 1..) |*t, i| t.* = @intCast(i + 5_000_000);
++    try expect(prompts.firstHeld(fresh) == null);
+ }
+ 
+ test "kv shard pages: a hand-built cross-part kept state is not adopted by begin, it is evicted" {
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 1e809e70..fa6fc063 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -323,7 +323,9 @@ pub const Lanes = struct {
+         defer adopt.deinit(gpa);
+         // TF_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
+         const marks: []const u32 = if (share) (try share_mod.begin(self.x.e, s, &owner, &adopt)).marks else &.{};
+-        const cold: ?u8 = if (share) share_mod.gate(self.x.e, &owner, &adopt, ids.len) else null; // a skipped resume's cold pass: the kept prefix's part
++        // a skipped resume's cold pass: the kept prefix's part; a pass with nothing to resume: its held prefix's part
++        const cold: ?u8 = if (share) share_mod.gate(self.x.e, &owner, &adopt, ids.len) orelse
++            (if (adopt.items.len == 0) share_mod.prefixHome(self.x.e, s) else null) else null;
+         var held = true;
+         errdefer if (held) gpa.free(marks);
+         const pages = try self.seatCold(s, ids.len, s.max_new, adopt.items, cold);
+diff --git a/zig/src/families/glm/cuda_share.zig b/zig/src/families/glm/cuda_share.zig
+index fbb964e7..73ea03d7 100644
+--- a/zig/src/families/glm/cuda_share.zig
++++ b/zig/src/families/glm/cuda_share.zig
+@@ -116,6 +116,18 @@ pub fn gate(e: *engine.Engine, owner: *Owner, adopt: *std.ArrayList(u32), prompt
+     return home;
+ }
+ 
++/// TF_KV_SHARE sharded: the part a cold pass with nothing adopted takes, the part of the first page the store holds
++/// of its prompt (a shared system block, an earlier turn), so its keeps share those pages in one part (the seat
++/// falls back to the parts' choice when that part lacks room). Null: unsharded, no store, or nothing held.
++pub fn prefixHome(e: *engine.Engine, s: *const Stream) ?u8 {
++    const prompts = of(e) orelse return null;
++    const p = e.pages orelse return null;
++    _ = p.shard orelse return null;
++    const key = cacheKey(s) orelse return null;
++    const id = prompts.firstHeld(key) orelse return null;
++    return p.partOf(id);
++}
++
+ /// A pass's marks (the engine's Marks.ctx): the mark it stands at, or the last it completed when cancelled, keeps.
+ pub const Keeps = struct {
+     e: *engine.Engine,
+diff --git a/zig/src/native/cuda_prompt_pages.zig b/zig/src/native/cuda_prompt_pages.zig
+index bb6234a7..9289ecff 100644
+--- a/zig/src/native/cuda_prompt_pages.zig
++++ b/zig/src/native/cuda_prompt_pages.zig
+@@ -209,7 +209,11 @@ pub const Adapter = struct {
+         of(ctx).gpa.free(marks);
+     }
+ 
+-    const vtable: hooks.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .forget = forget, .free = free };
++    fn firstHeld(ctx: *anyopaque, prompt: []const u32) ?u32 {
++        return of(ctx).store.firstHeld(prompt);
++    }
++
++    const vtable: hooks.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .forget = forget, .free = free, .first = firstHeld };
+ };
+ 
+ const testing = std.testing;
+@@ -439,7 +443,7 @@ test "TF_KV_SHARE's adapter over a sharded pool: a keep the other part's prefix
+     try testing.expect(f.pools[0].idle() and f.pools[1].idle());
+ }
+ 
+-test "TF_KV_SHARE's adapter over a sharded pool: a keep the other part's branched prefix would span is refused" {
++test "TF_KV_SHARE's adapter over a sharded pool: a keep the other part's branched prefix would span evicts those idle branches and stands" {
+     var f: Sharded = .{ .h = 16, .pools = .{ try kv.Pool.init(testing.allocator, 16, 1), try kv.Pool.init(testing.allocator, 16, 1) } };
+     defer for (&f.pools) |*p| p.deinit();
+     const x = (try Adapter.open(Sharded, testing.allocator, &f, 4, 4)).?;
+@@ -463,23 +467,24 @@ test "TF_KV_SHARE's adapter over a sharded pool: a keep the other part's branche
+     try testing.expectEqual(@as(usize, 4), p.keep(&longer, 16, &owner, &mine_b, &path_b));
+     f.pools[1].finish(&b);
+     // a part-0 pass over the shared prefix, parting from the part-1 tail at its first page: the prefix node's
+-    // other child stands, so the keep is refused and the tree unchanged
++    // other child is idle, so it goes (with the part-1 prefix) and the keep stands whole in part 0, none refused
+     const branch = base[0..8].* ++ [_]u32{ 41, 42, 43, 44 } ++ base[12..16].*;
+     var d: kv.Lease = .{};
+     try f.pools[0].promise(&d, 4);
+     try f.pools[0].cover(&d, 4, null);
+     var path_d: [4]u32 = undefined;
+-    try testing.expectEqual(@as(usize, 2), p.keep(&branch, 16, &owner, d.ids.items, &path_d)); // the two matched pages
++    try testing.expectEqual(@as(usize, 4), p.keep(&branch, 16, &owner, d.ids.items, &path_d));
+     f.pools[0].finish(&d);
+-    try testing.expectEqual(@as(u64, 1), f.keeps_refused);
+-    for (path_a) |id| try testing.expectEqual(@as(u32, 1), f.holders(id)); // the tree unchanged
+-    for (path_b[2..]) |id| try testing.expectEqual(@as(u32, 1), f.holders(id));
++    try testing.expectEqual(@as(u64, 0), f.keeps_refused);
++    for (path_a) |id| try testing.expectEqual(@as(u32, 0), f.holders(id)); // the part-1 states' pages are free again
++    for (path_b[2..]) |id| try testing.expectEqual(@as(u32, 0), f.holders(id));
+     var adopt: std.ArrayList(u32) = .empty;
+     defer adopt.deinit(testing.allocator);
+-    const plan = try p.begin(&longer, longer.len, &.{}, &owner, &adopt);
++    const next = branch ++ [_]u32{ 51, 52, 53, 54 };
++    const plan = try p.begin(&next, next.len, &.{}, &owner, &adopt);
+     defer p.free(plan.marks);
+-    try testing.expectEqual(@as(u32, 16), plan.from); // the kept states still resume
+-    try testing.expectEqualSlices(u32, path_a ++ path_b[2..], adopt.items);
++    try testing.expectEqual(@as(u32, 16), plan.from); // the part-0 state resumes whole
++    try testing.expectEqualSlices(u32, &path_d, adopt.items);
+     for (adopt.items) |id| f.release(id);
+     x.close();
+     try testing.expect(f.pools[0].idle() and f.pools[1].idle());
+-- 
+2.56.0
+
