@@ -121,6 +121,26 @@ cache, 6 → 8.5, 4 → 9.4, 2 → 10.2 (and multi-4 falls to 55.8 tok/s); `MEMO
 (decode 39.9, multi-4 77.6) and `TF_ROCE=1` (38.0, 79.9) are inside the noise of 40.0 / 81.0, and RoCE is the default
 here already. With 7.6 GiB holding roughly two hundred 30K-token states, cache capacity is not the constraint.
 
+## The biggest lever is not a patch: `TF_GLM_REQUEST_STARTS=1`
+
+1.3.0's prompt cache stores states at 4,096-token cuts, so a follow-up turn re-prefills whatever sits past the last
+cut — at 68K that is up to 4,096 tokens, about 2 s. `TF_GLM_REQUEST_STARTS=1` (off by default; refused with
+`--learn-conversations` or `TF_KV_SHARE`) also cuts the pass at the request's chunk starts, so the state lands at the
+start of the next turn instead of at the last 4,096 boundary. Same build, same prompts:
+
+| depth | default | `TF_GLM_REQUEST_STARTS=1` |
+|---|---|---|
+| 34K | cold 21.6 s, warm 0.88-0.93 s (96.6 % cached) | cold 22.2 s, warm **0.14-0.19 s** (99.9 %) |
+| 68K | cold 22.3 s, warm 1.97-2.00 s (95.9 %) | cold 23.1 s, warm **0.17-0.22 s** (99.9 %) |
+
+A twenty-turn session at 68K therefore costs 22.3 + 19 × 2.0 = 60 s by default and 23.1 + 19 × 0.2 = 27 s with the
+flag: **2.2× end to end**, on top of every patch in this PR, for one environment variable. The cold prompt pays about
+3 %. It cannot be combined with `LEARN_GIB>0`, which is why it fits a 1.3.0 deployment (that stack refuses
+`--learn-conversations` for GLM on CUDA anyway) and not the current 1.1.9 one.
+
+`TF_GLM_REQUEST_STARTS` also explains why a changed line near the top of a prompt is so expensive: the same 25K probe
+reads `cached 0` and 15.9-17.1 s against `cached 25,724` and 0.2 s when only the tail changed.
+
 ## Reproducing
 
 ```bash
