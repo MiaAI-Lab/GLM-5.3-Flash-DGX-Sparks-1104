@@ -109,6 +109,18 @@ reversal rather than a patch.
 `TF_GLM_CHUNK_SOLO`, `TF_GLM_PROMPT_PAIR` and `TF_GLM_OVERLAP_PIECES` are read in `cuda_ranks.zig`
 (`s.pair` defaults **true**, `solo` false, `pieces` 3), not in `platform/environment.zig` — grep the whole tree.
 
+## Configuration room, measured (nothing here needs an engine change)
+
+Warm prompts are at parity between stacks: same 12,493-token prompt, `cached 12,288`, **0.28-0.31 s on both**; 25K
+0.40-0.66 s both; five turns 0.29-0.33 s a turn each. So the -6 % below is cold-prompt only.
+
+Every configuration lever either does nothing or trades concurrency for prompt-cache room: `PARALLEL` 8 → 7.6 GiB of
+cache, 6 → 8.5, 4 → 9.4, 2 → 10.2 (and multi-4 falls to 55.8 tok/s); `MEMORY_RESERVE_GIB=10` → 9.1 GiB with multi-4 at
+76.8. Prefill sits at 1,618-1,623 in all of them. Asking for `PROMPT_CACHE_GIB=16` with `MIN=12` refuses to start
+(`E_CACHE`), and `KV_SHARD=0` refuses too (4.3 GiB funded against `PROMPT_CACHE_MIN_GIB=6`). `TF_GLM_L2PF=1`
+(decode 39.9, multi-4 77.6) and `TF_ROCE=1` (38.0, 79.9) are inside the noise of 40.0 / 81.0, and RoCE is the default
+here already. With 7.6 GiB holding roughly two hundred 30K-token states, cache capacity is not the constraint.
+
 ## Reproducing
 
 ```bash
