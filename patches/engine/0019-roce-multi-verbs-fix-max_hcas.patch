@@ -1,0 +1,13 @@
+diff --git a/zig/src/fabric/tp/roce_multi_verbs.zig b/zig/src/fabric/tp/roce_multi_verbs.zig
+index 0df0a2580..3e4f65a3d 100644
+--- a/zig/src/fabric/tp/roce_multi_verbs.zig
++++ b/zig/src/fabric/tp/roce_multi_verbs.zig
+@@ -185,7 +185,7 @@ pub const VerbsWire = struct {
+     /// peer_rkey[p][s]: the rkey of rank p's HCA that stripe s lands on.
+     peer_rkey: [max_peers][max_hcas]u32 = @splat(@splat(0)),
+     /// via[p][s]: our HCA that carries stripe s to rank p (`connect` pairs them; on a switch, HCA s).
+-    via: [max_peers][max_hcas]u8 = @splat(.{ 0, 1 }),
++    via: [max_peers][max_hcas]u8 = @splat(.{ 0, 1, 2, 3 }),
+     /// Stripes a post makes to each peer, every peer the same (0 before `connect`): the kernel's `n_hca`.
+     stripes: u32 = 0,
+     relay: bool = false,

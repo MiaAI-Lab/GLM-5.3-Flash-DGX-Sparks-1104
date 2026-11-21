@@ -1,0 +1,46 @@
+Engine patch 0022: RoCE all-gather takes all four HCAs (max_hcas 4, flag_stride 256)
+
+SPDX-FileCopyrightText: 2026 sojoerner-2049
+SPDX-License-Identifier: Apache-2.0
+--- a/zig/src/cuda/roce_verbs.zig
++++ b/zig/src/cuda/roce_verbs.zig
+@@ -1,7 +1,7 @@
+ //! libibverbs for the RoCE all-gather (rdma-core's verbs.h ABI, offsets checked) and the HCA and GID lookups.
+ const std = @import("std");
+ 
+-pub const max_hcas = 2;
++pub const max_hcas = 4;
+ 
+ // -- libibverbs (the ABI of rdma-core's verbs.h; offsets checked against its headers) ---------------------------------
+ pub const Device = opaque {};
+@@ -125,7 +125,7 @@
+     return slot.*;
+ }
+ 
+-/// The HCAs to stripe over, at most two: TF_ROCE_HCA, else NCCL_IB_HCA without "=^" prefixes or ":port" suffixes.
++/// The HCAs to stripe over, at most max_hcas: TF_ROCE_HCA, else NCCL_IB_HCA without "=^" prefixes or ":port" suffixes.
+ pub fn hcaNames(given: ?[*:0]const u8, names: *[max_hcas][64]u8, lens: *[max_hcas]usize) !u32 {
+     const raw = given orelse return error.NoHca;
+     var n: u32 = 0;
+--- a/zig/src/cuda/roce_layout.zig
++++ b/zig/src/cuda/roce_layout.zig
+@@ -4,7 +4,7 @@
+ 
+ pub const max_world = 8; // ranks a group may have on this path (GB10 kits are 2 or 4)
+ pub const slots = 2;
+-pub const flag_stride = 128;
++pub const flag_stride = 256;  // holds the connect probe at max_hcas = 4 (assert below)
+ 
+ /// A rank's peers in rank order, without itself: rank `peer` is this rank's peer number `peerIndex`.
+ pub fn peerIndex(rank: usize, peer: usize) usize {
+--- a/zig/kernels/cuda/roce_gather.cu
++++ b/zig/kernels/cuda/roce_gather.cu
+@@ -5,7 +5,7 @@
+ namespace {
+ 
+ constexpr int C_SEQ = 0, C_NBYTES = 1, C_ERROR = 3, C_HCA = 4, C_PEER = 5;  // ctrl words (C_NBYTES + slot)
+-constexpr int FLAG_STRIDE = 128;
++constexpr int FLAG_STRIDE = 256;  // must equal roce_layout.zig flag_stride
+ // counters (device memory, u32): epoch, poison, then stage and tail arrivals for each grid size class
+ constexpr int K_EPOCH = 0, K_POISON = 1, K_CLASSES = 4;
+ 

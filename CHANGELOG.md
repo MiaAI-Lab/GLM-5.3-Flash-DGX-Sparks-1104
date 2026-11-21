@@ -1,5 +1,15 @@
 # Changelog
 
+- **2026-11-21** -- Engine patches `0017`-`0020b` and a `start.sh` change so a GB10 pair stripes TP traffic over all four RDMA devices instead of two. A GB10's ConnectX-7 reaches the chip over two PCIe Gen 5 x4 links, so each QSFP port is two devices (`rocep1s0f0` and `roceP2p1s0f0` for port 0; `rocep1s0f1` and `roceP2p1s0f1` for port 1) and a two-cable pair has four. Three caps kept the extra devices out:
+  - `0017` `zig/src/fabric/tp/roce_guard.zig`: `max_hcas` 2 -> 4.
+  - `0018` `zig/src/fabric/tp/roce_multi_guard.zig`: `max_hcas` 2 -> 4.
+  - `0019` `zig/src/fabric/tp/roce_multi_verbs.zig`: the `via` default splat covers stripes 2 and 3.
+  - `0020a`/`0020b` `zig/src/fabric/tp/config.zig`: the default and the `TF_TP_ROCE_HCAS` range (2, 1, 2 -> 4, 1, 4).
+  - `start.sh`: `TF_TP_ROCE_HCA` joins `MANAGED_ENV` and both ranks now receive it alongside `TF_ROCE_HCA` (the TP RoCE config reads `TF_TP_ROCE_HCA`; before, the explicit list reached only the CUDA all-gather path and NCCL).
+  Set every four names in `TF_ROCE_HCA` (`scripts/local.sh`); names are case-sensitive (`roceP2p1s0f0`'s capital P) and a wrong case is silently dropped. NCCL reads the list as a preference order: with `rocep1s0f0` first, per-port counters during TP=2 serving showed about 95% of inter-node bytes on the port-0 pair; P2-first flips the split (all four devices stay active either way). Verified live on 2x DGX Spark
+  - `0021` `zig/src/fabric/tp/mailbox.cu` and `zig/src/fabric/tp/roce.zig`: `kRoceHcas` 2 -> 4 and host flag index uses `rv.max_hcas` (tp RoCE mailbox follows `roce_guard.max_hcas`; required for coherence since `0017` raised the guard to 4). This path is dormant in our lane (backend=.nccl) but fixes a latent mismatch.
+  - `0022` `zig/src/cuda/roce_verbs.zig` `max_hcas` 2 -> 4, `zig/src/cuda/roce_layout.zig` `flag_stride` 128 -> 256 (satisfies comptime assert), `zig/kernels/cuda/roce_gather.cu` `FLAG_STRIDE` 128 -> 256 (must match layout). Active path — the log now reads "4 HCA(s)" instead of "2 HCA(s)". (`tensorfold-glm53-spark:736aa7a29163`, 21 engine patches, NCCL 2.30.7): smoke test passed, the 1,048,576-token window held, and counter deltas show traffic on all four rails. The small all-gather path (`zig/src/cuda/roce_verbs.zig`) still caps at two, so its "N HCA(s)" line under-reports.
+
 - **2026-11-20 (fixes)** -- Engine patches `0014`-`0016`, found and verified on the 2x RTX PRO 6000 recipe with the same engine pin (`81de26f6`) and patch stack; not yet run on a GB10 pair, rebuild the image to pick them up:
   - `0014` DFlash2 selector: a draft row with NaN or -inf logits returned the kernel's no-winner id `0x7fffffff`, which the host used to index the successor codebook and crashed the server. Ids outside the vocabulary are skipped now.
   - `0015` `KV=fp8` on the page pool: the sparse token lists were written as BF16 page rows but read as positions by the E4M3 kernel, so prompts past `index_topk` (2,048 keys) attended the wrong rows (issue #64).

@@ -1,0 +1,35 @@
+Engine patch 0021: tp RoCE mailbox and host flag reads follow max_hcas (4)
+
+SPDX-FileCopyrightText: 2026 sojoerner-2049
+SPDX-License-Identifier: Apache-2.0
+--- a/zig/src/fabric/tp/mailbox.cu
++++ b/zig/src/fabric/tp/mailbox.cu
+@@ -371,7 +371,7 @@
+ // The RoCE variant (roce.zig): blocks stage into the send slot, the last rings the doorbell, a host proxy RDMA-writes.
+ namespace tftp {
+ 
+-constexpr int kRoceHcas = 2;
++constexpr int kRoceHcas = 4;  // keep in step with roce_guard.max_hcas (all four CX7 devices)
+ // ctrl words shared with roce.zig's proxy: [0] doorbell seq, [4 + slot] padded bytes, [8] completed, [16..21] failure
+ constexpr int kRoceSeq = 0;
+ constexpr int kRoceSlotBytes = 4;
+--- a/zig/src/fabric/tp/roce.zig
++++ b/zig/src/fabric/tp/roce.zig
+@@ -464,7 +464,7 @@
+     }
+ 
+     fn flagWord(r: *const Roce, slot: usize) u32 {
+-        const p: *std.atomic.Value(u32) = @ptrCast(@alignCast(r.region[flag_off + slot * 2 * flag_stride ..].ptr));
++        const p: *std.atomic.Value(u32) = @ptrCast(@alignCast(r.region[flag_off + slot * rv.max_hcas * flag_stride ..].ptr));
+         return p.load(.acquire);
+     }
+ 
+@@ -506,7 +506,7 @@
+         @memcpy(out[r.me * n + off ..][0..mine], in[off..][0..mine]);
+         const t0 = sock.nowNs();
+         for (0..r.wire.hcas()) |h| {
+-            const flag: *std.atomic.Value(u32) = @ptrCast(@alignCast(r.region[flag_off + (slot * 2 + h) * flag_stride ..].ptr));
++            const flag: *std.atomic.Value(u32) = @ptrCast(@alignCast(r.region[flag_off + (slot * rv.max_hcas + h) * flag_stride ..].ptr));
+             while (flag.load(.acquire) != seq) {
+                 if (r.word(w_abort).load(.monotonic) != 0) return error.Aborted;
+                 if (sock.nowNs() - t0 > r.timeout_ns) return error.Timeout;
