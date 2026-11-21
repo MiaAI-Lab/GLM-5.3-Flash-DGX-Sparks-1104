@@ -1,0 +1,24 @@
+glm-cuda: a prompt chunk takes 4,096 rows again (1.3.0 dropped it to 2,048)
+
+The pre-1.3.0 stack carried this as patch 0094. Upstream 1.3.0 ships prefill_rows = 2048, which
+halves the rows each EXL3 experts call amortises its trellis weight decode over. Measured on this
+pair: 2,048 -> 1,233/1,265 tok/s (8K/32K prompts), the 121-patch build with 4,096 -> 1,584/1,719.
+
+Exact, not a numerics change: a pair's sums do not depend on the chunk size, so the gate is
+identical greedy replies, not an NLL comparison. index_ring and solo_rows follow it (2x), so the
+chunk's device scratch roughly doubles; both ranks must run the same value, which one image gives.
+
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -15,9 +15,9 @@
+ const mlp = @import("cuda_mlp.zig");
+ const kda_block = @import("cuda_kda_block.zig");
+ 
+ /// A prompt chunk's rows (decode.PREFILL_ROWS).
+-pub const prefill_rows = 2048;
++pub const prefill_rows = 4096;
+ /// A decode window's rows (Engine's max_rows).
+ pub const window_rows = 32;
+ /// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.
+ pub const prompt_heads = 16;

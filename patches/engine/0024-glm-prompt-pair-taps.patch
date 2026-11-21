@@ -1,0 +1,76 @@
+diff --git a/zig/src/families/glm/cuda_forward_pieces.zig b/zig/src/families/glm/cuda_forward_pieces.zig
+--- a/zig/src/families/glm/cuda_forward_pieces.zig
++++ b/zig/src/families/glm/cuda_forward_pieces.zig
+@@ -132,24 +132,24 @@
+ 
+ /// DFlash2's taps after layer j: split glue posts a rank's own rows of x only, so it taps those (shareTaps sends them).
+ pub fn tapPieces(f: *const Forward, t: taps.Taps, j: usize, cut: []const [2]usize) !void {
++    for (cut) |piece| try tapPiece(f, f.stream, t, j, piece[0], piece[1] - piece[0]);
++}
++
++/// One piece's taps on `s`: the rows its own glue posted (a paired step taps on the side stream).
++pub fn tapPiece(f: *const Forward, s: cuda.Stream, t: taps.Taps, j: usize, lo: usize, n: usize) !void {
+     if (taps.slot(j) == null) return;
+     const r = f.ranks[0];
+     const world = r.w.share.world;
+     const row = r.w.config.hc * r.w.config.hidden * 2;
+-    for (cut) |piece| {
+-        const lo = piece[0];
+-        const n = piece[1] - lo;
+-        if (f.splits(n) and f.exchange == .nccl) {
+-            const mine = share(n, world, r.w.share.rank);
+-            try t.at(f.stream, j, r.b.x, lo + mine[0], mine[1] - mine[0]);
+-            continue;
+-        }
+-        if (f.splits(n)) for (f.ranks) |from| if (from.w.share.rank != r.w.share.rank) {
+-            const mine = share(n, world, from.w.share.rank);
+-            try f.copy(f.stream, r.b.x + (lo + mine[0]) * row, from.b.x + (lo + mine[0]) * row, (mine[1] - mine[0]) * row);
+-        };
+-        try t.at(f.stream, j, r.b.x, lo, n);
++    if (f.splits(n) and f.exchange == .nccl) {
++        const mine = share(n, world, r.w.share.rank);
++        return t.at(s, j, r.b.x, lo + mine[0], mine[1] - mine[0]);
+     }
++    if (f.splits(n)) for (f.ranks) |from| if (from.w.share.rank != r.w.share.rank) {
++        const mine = share(n, world, from.w.share.rank);
++        try f.copy(s, r.b.x + (lo + mine[0]) * row, from.b.x + (lo + mine[0]) * row, (mine[1] - mine[0]) * row);
++    };
++    try t.at(s, j, r.b.x, lo, n);
+ }
+ 
+ /// After a pieced pass: every split piece's own tap rows (tapPieces) to every rank, so each rank's taps hold every row.
+diff --git a/zig/src/families/glm/cuda_forward_pair.zig b/zig/src/families/glm/cuda_forward_pair.zig
+--- a/zig/src/families/glm/cuda_forward_pair.zig
++++ b/zig/src/families/glm/cuda_forward_pair.zig
+@@ -16,7 +16,7 @@
+     var cuts: [2][fw.max_pieces][2]usize = undefined;
+     var n: [2]usize = undefined;
+     for (two, rows, 0..) |f, R, i| {
+-        if (f.pieces == null or f.prof != null or f.taps != null) return error.BadPair;
++        if (f.pieces == null or f.prof != null) return error.BadPair;
+         const c = &f.ranks[0].w.config;
+         for (f.ranks) |r| {
+             if (r.segs.len > 0 or !r.b.prefill or R == 0 or R > r.b.rows) return error.BadPair;
+@@ -51,6 +51,8 @@
+         try awaitShared(f, f.pieces.?, n[i]);
+         try f.finish(R);
+     }
++    // the side stream is drained of both chunks' work here, so the taps' exchange runs alone on the main stream
++    for (two, 0..) |f, i| if (f.taps) |t| try pieces.shareTaps(f, t, cuts[i][0..n[i]]);
+ }
+ 
+ /// A paired site: each piece filled on the main stream, then on the side stream its exchange, glue and (split) sharing.
+@@ -73,8 +75,12 @@
+                 const mine = share(n, world, r.w.share.rank);
+                 try g.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
+             }
++            if (site == .ffn) if (f.taps) |t| try pieces.tapPiece(f, p.side, t, j, lo, n); // the rows this glue posted
+             try pieces.shareGlued(f, p, lo, n, last);
+-        } else for (f.ranks) |r| try g.glueRows(r, j, site, lo, piece[1], room(r, lo));
++        } else {
++            for (f.ranks) |r| try g.glueRows(r, j, site, lo, piece[1], room(r, lo));
++            if (site == .ffn) if (f.taps) |t| try pieces.tapPiece(f, p.side, t, j, lo, n);
++        }
+         try p.shared[q].record(p.side);
+     }
+ }
