@@ -667,4 +667,4 @@ CC BY-NC-ND 4.0.
 
 ## Offline experiment validation
 
-[Validation tools](scripts/validation/README.md) compare complete A0/B/A1 call timings, check recorded numerical results, and keep independent serving measurements separate. They run with Python only, without a checkpoint or Spark. The [q8 scale-register case](scripts/validation/examples/q8-scale-registers/CASE_STUDY.md) preserves a positive local screen and an unconfirmed end-to-end result; it proposes no kernel or serving change.
+See [docs/offline-validation.md](docs/offline-validation.md) for the standalone analyzer and the preserved q8 scale-register case.
