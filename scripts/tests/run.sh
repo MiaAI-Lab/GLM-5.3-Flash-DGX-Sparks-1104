@@ -13,6 +13,7 @@ for f in scripts/*.py; do
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"
 done
 echo 'python: pass'
+python3 -m unittest discover -s scripts/validation -p test_validate.py -v
 for t in scripts/tests/*.sh; do
   [[ "$t" != scripts/tests/run.sh ]] || continue
   bash "$t"

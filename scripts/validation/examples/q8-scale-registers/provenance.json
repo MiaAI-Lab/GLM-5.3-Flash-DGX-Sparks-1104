@@ -1,0 +1,18 @@
+{
+  "kind": "Historical measurement extract, not a fresh benchmark",
+  "sources": [
+    {
+      "source": "q8-scale-registers/screen01/rank0.log",
+      "sha256": "7b56f339986afe61d3b93d9e2663aefde09352d22a86bcbc721bb394df63f916"
+    },
+    {
+      "source": "q8-scale-registers/screen01/rank1.log",
+      "sha256": "899edc27cf47e87eda344ffd6d1f17ec156ff05fed2988d4eda52cdcf38a0c86"
+    },
+    {
+      "source": "q8-scale-register-native/confirmation-analysis.json",
+      "sha256": "3f88fb1fb6dda10f1f992f4d3004a2bd41424b32619ee7fe807e2fcbbd5b9705"
+    }
+  ],
+  "transform": "Timing records copied without filtering or rounding; all service tps arrays copied. Numeric/resource/control records retained. Host and run-controller records excluded. Original logs remain local; hashes are provenance, not a public attestation."
+}
