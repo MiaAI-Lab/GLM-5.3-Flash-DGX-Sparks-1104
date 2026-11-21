@@ -72,8 +72,11 @@ against 42.0 / 82.2.
 
 Profiled again after `0023` + `0024`: the side stream carries `SendRecv` 4.71 s + `hc_post` 0.52 s +
 `hc_partial` 0.29 s + `hc_finish` 0.15 s, the main stream 20.09 s, and the overlap factor is back to **1.29×**.
-What remains is no longer overlap but total GPU work (25.78 s against 23.12 s) — that is what `0025` attacks, and its
-own capture is still to be taken.
+After `0025` the totals are **24.20 s of GPU work in 19.40 s (1.25×)** against 1.1.9's 23.12 s in 17.99 s (1.29×), so
+what is left is mostly GPU work again, in three small places: `tf_exl3_prompt_gu` 3.55 s against 3.08 (the expert
+prompt GEMM is ~15 % slower a row), `tf_glm_merge` 0.66 s against 0.11 — it is launched as a dependent kernel now, so
+part of that number is the wait it clocks rather than work — and `tf_glm_combine` 1.09 against 1.05. `SendRecv` is
+in fact cheaper than 1.1.9's (3.61 against 3.91).
 
 The last piece is the packed prompt GEMM. 1.1.9 fed 4/6/8-bit prompt weights to a 128-row kernel with a two-stage
 pipeline and `__launch_bounds__(256, 2)` (41 KiB of shared memory: two blocks an SM, so a 768-row piece's 384 blocks
