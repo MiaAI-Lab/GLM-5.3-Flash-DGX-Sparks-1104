@@ -1,0 +1,499 @@
+Subject: [PATCH] glm cuda: opt in to a 256-row Q8 prompt tile on GB10
+
+Opt-in TF_GLM_PROMPT_WIDE=1. Same group and accumulation order.
+Focused contract registrations, independent FP64 fixture, full-shape baseline bytes.
+Ported to TensorFold 1.3.0. The replacement check uses its stock glm_mm8_128.
+Two-Spark throughput measurements were taken on the earlier recipe.
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 27b5541..7e4cd7d 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -129,6 +129,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     runner.addImport("moss_image_cuda", b.createModule(.{ .root_source_file = b.path("zig/src/families/moss_image/cuda_kernels.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} }));
+     runner.addImport("prompt_pages", b.createModule(.{ .root_source_file = b.path("zig/src/native/cuda_prompt_pages.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = mods.api }, .{ .name = "core", .module = mods.core } } })); // TF_KV_SHARE's store, for the pages checks
+     const runner_exe = b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner });
++    const wide_runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_wide_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
++    wide_runner.addImport("cuda", cuda);
++    wide_runner.addImport("core", mods.core);
++    const wide_exe = b.addExecutable(.{ .name = "tf-glm-wide-contract", .root_module = wide_runner });
++    b.step("glm-wide-contract", "Build the focused GB10 prompt tile contract diagnostic").dependOn(&b.addInstallArtifact(wide_exe, .{}).step);
+     b.installArtifact(runner_exe);
+     @import("muse.zig").tool(b, @import("muse.zig").module(b, target, optimize, cuda, mods.core, mods.lanes), strip); // tf-muse: rank 1 and checks
+     // tf-tp-watch-check: the ranks' lines with no GPU or NCCL; a failing or dying rank stops every rank
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index e082485..417de8a 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -56,6 +56,19 @@ __device__ __forceinline__ int frag_k(int lane, int v) {
+     return kt * 16 + 2 * t + (j & 1) + (j >> 1) * 8;
+ }
+ 
++// (t & 0x007F007F) | c and (t & 0x00800080) ^ c, one LOP3 each with c in a register (two immediates in one LOP3
++// would cost a MOV a use)
++__device__ __forceinline__ uint32_t low7_or(uint32_t t, uint32_t c) {
++    uint32_t y;
++    asm("lop3.b32 %0, %1, 0x007F007F, %2, 0xea;\n" : "=r"(y) : "r"(t), "r"(c));
++    return y;
++}
++__device__ __forceinline__ uint32_t top_xor(uint32_t t, uint32_t c) {
++    uint32_t y;
++    asm("lop3.b32 %0, %1, 0x00800080, %2, 0x6a;\n" : "=r"(y) : "r"(t), "r"(c));
++    return y;
++}
++
+ // the B-fragment bf16 pairs of a chunk: pairs 2 kt and 2 kt + 1 are step kt's b0 and b1
+ template <int BITS>
+ __device__ __forceinline__ void bpairs(const uint32_t* __restrict__ p, uint32_t (&b)[8]) {
+@@ -73,6 +86,21 @@ __device__ __forceinline__ void bpairs(const uint32_t* __restrict__ p, uint32_t
+     }
+ }
+ 
++// bpairs<8>'s pairs with fewer instructions (the packed prompt kernels): a byte pair of codes u (stored q + 128) spread
++// into the halves' low bytes; a = 128 + (u & 127) (0x4300 | the low 7 bits), c = 256, or 128 when u >= 128 (0x4380 with
++// its lowest exponent bit cleared), and a - c = u - 128 exactly: both and the difference are integers bf16 holds, so
++// the bf16 subtraction rounds nothing and gives bf16((float)(u - 128)), +0 at u = 128 as (float)0 does.
++__device__ __forceinline__ void bpairs8_fast(const uint32_t* __restrict__ p, uint32_t (&b)[8]) {
++    const uint32_t k43 = 0x43004300u, k438 = 0x43804380u;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const uint32_t t = __byte_perm(p[i >> 1], 0u, (i & 1) ? 0x4342 : 0x4140);
++        const uint32_t a = low7_or(t, k43), c = top_xor(t, k438);
++        const __nv_bfloat162 d = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&a), *reinterpret_cast<const __nv_bfloat162*>(&c));
++        b[i] = *reinterpret_cast<const uint32_t*>(&d);
++    }
++}
++
+ template <int BITS, int BM, int WM, int STAGES>
+ struct Tile {
+     static constexpr int WN = 4, BN = 64, NT = 2, MT = BM / WM / 16, THREADS = WM * WN * 32;
+@@ -86,7 +114,9 @@ struct Tile {
+ };
+ 
+ // ROWS_FIRST: row blocks fastest, so the blocks reading one weight tile run together and share it in L2 (prompts)
+-template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false>
++// P2 (the packed prompt kernels): each thread's cp.async sources, destinations and bounds worked out once a block (a
++// stage adds its group's offset), and bpairs8_fast; the loads, MMAs and FMAs stay those of the other instances.
++template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false, bool P2 = false>
+ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
+         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
+         int f32, int M, int N, int K, int SK) {
+@@ -124,6 +154,53 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
+             }
+         }
+     };
++    // P2: the same pieces as loadX / loadW, sources at group g0, a stage adds (g - g0) groups
++    constexpr int XPT = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS;
++    constexpr int PER_TILE_ = 32 * T::WPC * 4 / 16, WPT = (8 * PER_TILE_ + T::THREADS - 1) / T::THREADS;
++    const unsigned char* xsrc[P2 ? XPT : 1];
++    uint32_t xdst[P2 ? XPT : 1];
++    bool xin[P2 ? XPT : 1], xok[P2 ? XPT : 1];
++    const unsigned char* wsrc[P2 ? WPT : 1];
++    bool wok[P2 ? WPT : 1];
++    const unsigned char* ssrc = nullptr;
++    bool sok = false;
++    if constexpr (P2) {
++#pragma unroll
++        for (int j = 0; j < XPT; ++j) {
++            const int c = tid + j * T::THREADS, r = c / T::CHUNKS, ch = c % T::CHUNKS;
++            xin[j] = c < BM * T::CHUNKS;
++            const int row = min(m0 + r, M - 1);
++            xsrc[j] = reinterpret_cast<const unsigned char*>(x + (long long)row * ldx + (long long)g0 * 64 + ch * 8);
++            xdst[j] = (uint32_t)(r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
++            xok[j] = m0 + r < M;
++        }
++#pragma unroll
++        for (int j = 0; j < WPT; ++j) {
++            const int c = tid + j * T::THREADS, tt = c / PER_TILE_, off = c % PER_TILE_;
++            wok[j] = c < 8 * PER_TILE_ && t0 + tt < N8;
++            wsrc[j] = reinterpret_cast<const unsigned char*>(w) + (wok[j] ? ((long long)(t0 + tt) * KG + g0) * 32 * T::WPC * 4 + off * 16 : 0);
++        }
++        if constexpr (BITS != 16) {
++            sok = tid < 8 && t0 + tid < N8;
++            ssrc = reinterpret_cast<const unsigned char*>(s + (sok ? ((long long)(t0 + tid) * KG + g0) * 8 : 0));
++        }
++    }
++    auto loadPX = [&](int st, int g) {   // P2: loadX of group g into stage st
++        unsigned char* p = stage(st);
++        const long long dg = g - g0;
++#pragma unroll
++        for (int j = 0; j < XPT; ++j)
++            if (xin[j]) cp16z(p + xdst[j], xsrc[j] + dg * 128, xok[j]);
++    };
++    auto loadPW = [&](int st, int g) {   // P2: loadW of group g into stage st
++        unsigned char* pw = stage(st) + T::X;
++        const long long dg = g - g0;
++#pragma unroll
++        for (int j = 0; j < WPT; ++j)
++            if (wok[j]) cp16(pw + (tid + j * T::THREADS) * 16, wsrc[j] + dg * (32 * T::WPC * 4));
++        if constexpr (BITS != 16)
++            if (sok) cp16(pw + T::W + tid * 16, ssrc + dg * 16);
++    };
+     float acc[T::MT][T::NT][4];
+ #pragma unroll
+     for (int i = 0; i < T::MT; ++i)
+@@ -135,11 +212,17 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
+     grid_launch();
+ #pragma unroll
+     for (int st = 0; st < STAGES - 1; ++st)
+-        if (st < per) loadW(st, g0 + st);
++        if (st < per) {
++            if constexpr (P2) loadPW(st, g0 + st);
++            else loadW(st, g0 + st);
++        }
+     grid_wait();
+ #pragma unroll
+     for (int st = 0; st < STAGES - 1; ++st) {
+-        if (st < per) loadX(st, g0 + st);
++        if (st < per) {
++            if constexpr (P2) loadPX(st, g0 + st);
++            else loadX(st, g0 + st);
++        }
+         commit();
+     }
+     for (int it = 0; it < per; ++it) {
+@@ -147,8 +230,13 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
+         __syncthreads();
+         const int next = it + STAGES - 1;
+         if (next < per) {
+-            loadX(next % STAGES, g0 + next);
+-            loadW(next % STAGES, g0 + next);
++            if constexpr (P2) {
++                loadPX(next % STAGES, g0 + next);
++                loadPW(next % STAGES, g0 + next);
++            } else {
++                loadX(next % STAGES, g0 + next);
++                loadW(next % STAGES, g0 + next);
++            }
+         }
+         commit();
+         const unsigned char* p = stage(it % STAGES);
+@@ -156,7 +244,10 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
+         const __half* ps = reinterpret_cast<const __half*>(p + T::X + T::W);
+         uint32_t b[T::NT][8];
+ #pragma unroll
+-        for (int j = 0; j < T::NT; ++j) bpairs<BITS>(pw + ((wn * T::NT + j) * 32 + lane) * T::WPC, b[j]);
++        for (int j = 0; j < T::NT; ++j) {
++            if constexpr (P2 && BITS == 8) bpairs8_fast(pw + ((wn * T::NT + j) * 32 + lane) * T::WPC, b[j]);
++            else bpairs<BITS>(pw + ((wn * T::NT + j) * 32 + lane) * T::WPC, b[j]);
++        }
+         float d[T::MT][T::NT][4];
+ #pragma unroll
+         for (int kt = 0; kt < 4; ++kt) {
+@@ -253,6 +344,17 @@ GLM_MM_ALL(6)
+ GLM_MM_ALL(8)
+ GLM_MM_ALL(16)
+ 
++// On GB10, twice the rows reuse each packed weight tile. K groups and
++// each output's MMA/FMA order stay identical to glm_mm8_128. The caller opts in
++// only for the measured 12576 x 4096 projection at 2048 or more prompt rows.
++extern "C" __global__ void __launch_bounds__(512, 1) glm_mm8_256s2(
++    const __nv_bfloat16* __restrict__ x, long long ldx,
++    const uint32_t* __restrict__ w, const __half* __restrict__ s,
++    void* __restrict__ out, float* __restrict__ part,
++    int f32, int M, int N, int K, int SK) {
++    mm_kernel<8, 256, 4, 2, false, true>(x, ldx, w, s, out, part, f32, M, N, K, SK);
++}
++
+ // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
+ template <int BITS>
+ __device__ __forceinline__ void tile_packed(const uint32_t* __restrict__ src, const __half* __restrict__ ss,
+diff --git a/zig/src/core/contract/glm_cuda_records.zig b/zig/src/core/contract/glm_cuda_records.zig
+index 1b29f5a..f3e93dc 100644
+--- a/zig/src/core/contract/glm_cuda_records.zig
++++ b/zig/src/core/contract/glm_cuda_records.zig
+@@ -3,6 +3,8 @@ const registry = @import("registry.zig");
+ 
+ /// nvcc 13.0's usage, the compiler of the release fatbins.
+ pub const cuda = [_]registry.CudaRecord{
++    // Resource usage measured with nvcc 13.0 on sm_121.
++    .{ .launch = .{ .name = "glm_mm8_256s2", .symbol = "glm_mm8_256s2", .image = "glm_mm", .threads = 512, .dynamic = 73984, .opt_in = true, .min_sm = 121 }, .usage = .{ .{ .regs = 0, .static = 0 }, .{ .regs = 0, .static = 0 }, .{ .regs = 0, .static = 0 }, .{ .regs = 0, .static = 0 }, .{ .regs = 125, .static = 0, .bound = 512 } } },
+     .{ .launch = .{ .name = "glm_glue tf_glm_router_tile", .symbol = "tf_glm_router_tile", .image = "glm_glue", .threads = 128, .dynamic = 27648, .min_sm = 80 }, .usage = .{ .{ .regs = 34, .static = 0, .bound = 128 }, .{ .regs = 36, .static = 0, .bound = 128 }, .{ .regs = 36, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 } }, .later_pending = true },
+     .{ .launch = .{ .name = "glm_mm16_16", .symbol = "glm_mm16_16", .image = "glm_mm", .threads = 128, .dynamic = 31104, .opt_in = true, .min_sm = 80 }, .usage = .{ .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 52, .static = 0, .bound = 128 }, .{ .regs = 52, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "glm_mm16_32", .symbol = "glm_mm16_32", .image = "glm_mm", .threads = 128, .dynamic = 37248, .opt_in = true, .min_sm = 80 }, .usage = .{ .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 } } },
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index d1f8dfe..3dfc350 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -46,6 +46,7 @@ pub const Kernels = struct {
+     tile: cuda.Function,
+     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
+     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
++    wide_prompt: ?cuda.Function = null,
+     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+@@ -62,11 +63,20 @@ pub const Kernels = struct {
+             k.tile_packed[wi] = try m.function(std.fmt.comptimePrint("glm_mm_tile{d}", .{b}));
+         }
+         try k.prompt.allowDynamicShared(smem(128));
++        if (std.c.getenv("TF_GLM_PROMPT_WIDE")) |v| {
++            if (std.mem.eql(u8, std.mem.span(v), "1") and try k.packed_rows[2][3].attribute(.binary_version) == 121) {
++                const f = try m.function("glm_mm8_256s2");
++                try f.allowDynamicShared(wide_bytes);
++                k.wide_prompt = f;
++            }
++        }
+         k.pdl = cuda_pdl.on();
+         return k;
+     }
+ };
+ 
++const wide_bytes = 2 * (256 * 128 + 8 * 32 * 4 * 4 + 128); // two stages of Q8 weights and 256 input rows
++
+ const split_target = 192; // column tiles times K slices a launch aims at (the GB10's SMs, a few blocks each)
+ 
+ fn bucket(i: usize) usize {
+@@ -107,7 +117,8 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
+         const big = if (one) !k.prompt_fixed_k else m - done >= 128;
+         const rows = if (big) m - done else @min(m - done, 64);
+         const i: usize = if (big) 3 else if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
+-        const bm = bucket(i);
++        const wider = big and one and w.bits == 8 and w.n == 12576 and w.k == 4096 and rows >= 2048 and k.wide_prompt != null;
++        const bm = if (wider) @as(usize, 256) else bucket(i);
+         const sk = if (big) 1 else splitK(w.n, w.k); // a prompt's blocks share each weight tile in L2: no slices
+         const o = out + done * w.n * @as(usize, if (wide) 4 else 2);
+         var a: cuda.Args = .{};
+@@ -126,6 +137,8 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
+         const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
+         if (big and wi == 0) {
+             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
++        } else if (wider) {
++            try cuda.launch.launch(k.wide_prompt.?, .{ .grid = .{ .x = cols, .y = row_blocks }, .block = .{ .x = 512 }, .shared = wide_bytes, .pdl = k.pdl }, s, &a);
+         } else { // packed prompts take the 128-row bucket's blocks, one slice
+             const f = if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
+             try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(w.bits, bm), .pdl = k.pdl }, s, &a);
+diff --git a/zig/tests/cuda/contract_glm_wide.zig b/zig/tests/cuda/contract_glm_wide.zig
+new file mode 100644
+index 0000000..f1315a4
+--- /dev/null
++++ b/zig/tests/cuda/contract_glm_wide.zig
+@@ -0,0 +1,165 @@
++//! GB10 prompt tile checks use the shared affine fixture, independent packing,
++//! full-shape replacement bytes, cropped-column FP64, and the standard four gates.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const check = @import("check.zig");
++const Rig = @import("contract_rig.zig").Rig;
++const c = core.contract.spec;
++const g = core.contract.gates;
++const Affine = core.contract.affine.Affine;
++
++fn depth(s: c.Shape) usize { return 64 + s.k / 64; }
++const full = [_]c.Shape{
++    .{ .rows = 257, .n = 64, .k = 4096 },
++    .{ .rows = 2048, .n = 12576, .k = 4096 },
++    .{ .rows = 4096, .n = 12576, .k = 4096 },
++};
++const cropped = [_]c.Shape{
++    .{ .rows = 257, .n = 64, .k = 4096 },
++    .{ .rows = 512, .n = 128, .k = 4096 },
++    .{ .rows = 37, .n = 1000, .k = 1024 },
++};
++
++pub const Case = struct {
++    rig: Rig,
++    f: cuda.Function,
++    old: cuda.Function,
++    wide: bool,
++    bits: bool,
++    truncate: bool = false,
++    input: ?Affine = null,
++    x: u64 = 0,
++    w: u64 = 0,
++    scales: u64 = 0,
++    out: u64 = 0,
++    base: u64 = 0,
++
++    pub fn deinit(self: *Case) void {
++        self.rig.s.synchronize() catch @panic("wide prompt contract drain");
++        if (self.input) |f| f.deinit();
++        self.rig.deinit();
++    }
++    pub fn kernel(self: *Case) g.Kernel {
++        const name = if (self.truncate) "control: glm wide tile drops the last row tile" else
++            if (self.bits) (if (self.wide) "cuda glm wide q8 FP32 replacement" else "cuda glm wide q8 BF16 replacement") else
++            (if (self.wide) "cuda glm wide q8 FP32 FP64 reference" else "cuda glm wide q8 BF16 FP64 reference");
++        return .{ .spec = .{
++            .name = name, .accum = .f32, .depth = depth,
++            .out = if (self.wide) .f32 else .bf16,
++            .replaces = if (self.bits) "glm_mm8_128, unchanged in this image" else null,
++            .tiles = .{ .{ .size = 256 }, .{ .size = 64, .step = 8, .min = 8 }, .{ .size = 64, .step = 64, .min = 64 } },
++            .served = if (self.bits) &full else &cropped,
++        }, .ctx = self, .vt = &vt, .control = if (self.truncate) .shapes else null };
++    }
++    const vt = g.hooks(Case);
++    pub fn prepare(self: *Case, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.n == 0 or shape.k == 0 or shape.n % 8 != 0 or shape.k % 64 != 0) return false;
++        self.rig.reset();
++        if (self.input) |f| f.deinit();
++        self.input = null;
++        var f = try Affine.init(self.rig.gpu.gpa, shape, 8, 64);
++        errdefer f.deinit();
++        try f.fill(fill, seed);
++        f.form = .dequantized;
++        // The GLM codes are centered at 128. These BF16 scales are also exact FP16
++        // values; -128*scale is exact, so the shared FP64 formula is the same weight.
++        for (f.scales, f.biases) |s, *b| b.* = c.toBf16(-128 * c.fromBf16(s));
++        var arena = std.heap.ArenaAllocator.init(self.rig.gpu.gpa);
++        defer arena.deinit();
++        const a = arena.allocator();
++        const words = try a.alloc(u32, shape.n * shape.k / 4);
++        const scales = try a.alloc(u16, shape.n * shape.k / 64);
++        const groups = shape.k / 64;
++        for (0..shape.n / 8) |tile| for (0..groups) |group| {
++            for (0..8) |col| scales[(tile * groups + group) * 8 + col] = @bitCast(@as(f16, @floatCast(c.fromBf16(f.scales[(tile * 8 + col) * groups + group]))));
++            for (0..32) |lane| {
++                const col = tile * 8 + lane / 4;
++                const at = ((tile * groups + group) * 32 + lane) * 4;
++                @memset(words[at..][0..4], 0);
++                for (0..16) |v| {
++                    const j = v % 4;
++                    const index = (v / 4) * 16 + 2 * (lane % 4) + (j % 2) + (j / 2) * 8;
++                    words[at + v / 4] |= @as(u32, f.codes[col * shape.k + group * 64 + index]) << @as(u5, @intCast(8 * (v % 4)));
++                }
++            }
++        };
++        self.x = try self.rig.input(std.mem.sliceAsBytes(f.x));
++        self.w = try self.rig.input(std.mem.sliceAsBytes(words));
++        self.scales = try self.rig.input(std.mem.sliceAsBytes(scales));
++        self.out = try self.rig.output(shape.rows * shape.n * @as(usize, if (self.wide) 4 else 2));
++        self.base = try self.rig.scratch(shape.rows * shape.n * @as(usize, if (self.wide) 4 else 2));
++        self.input = f;
++        return true;
++    }
++    fn launch(self: *Case, baseline: bool) !void {
++        const shape = self.input.?.shape;
++        var args: cuda.Args = .{};
++        args.add(self.x);
++        args.add(@as(c_longlong, @intCast(shape.k)));
++        args.add(self.w);
++        args.add(self.scales);
++        args.add(if (baseline) self.base else self.out);
++        args.add(@as(u64, 0));
++        args.add(@as(c_int, @intFromBool(self.wide)));
++        args.add(@as(c_int, @intCast(shape.rows)));
++        args.add(@as(c_int, @intCast(shape.n)));
++        args.add(@as(c_int, @intCast(shape.k)));
++        args.add(@as(c_int, 1));
++        const bm: usize = if (baseline) 128 else 256;
++        var blocks = (shape.rows + bm - 1) / bm;
++        if (!baseline and self.truncate and blocks > 1) blocks -= 1;
++        try cuda.launch.launch(if (baseline) self.old else self.f, .{
++            .grid = .{ .x = @intCast((shape.n + 63) / 64), .y = @intCast(blocks) },
++            .block = .{ .x = if (baseline) 256 else 512 },
++            .shared = if (baseline) 61824 else 73984,
++        }, self.rig.s, &args);
++        try self.rig.s.synchronize();
++    }
++    pub fn run(self: *Case) !void { try self.launch(false); }
++    pub fn replaced(self: *Case) ![]const u8 {
++        try self.launch(true);
++        return self.rig.bytes(self.base, self.count() * @as(usize, if (self.wide) 4 else 2));
++    }
++    pub fn count(self: *Case) usize { return self.input.?.outputs(); }
++    pub fn reference(self: *Case, want: []f64, mag: []f64) !void { try self.input.?.reference(want, mag); }
++    pub fn simulate(self: *Case, acc: c.Accum, order: g.Order, out: []f64) !void { try self.input.?.simulate(acc, order, out); }
++};
++
++pub fn collect(gpu: check.Gpu, stream: cuda.Stream, module: cuda.Module, cases: *[5]Case, list: *std.ArrayList(g.Kernel)) !void {
++    const f = try module.function("glm_mm8_256s2");
++    const old = try module.function("glm_mm8_128");
++    try f.allowDynamicShared(73984);
++    try old.allowDynamicShared(61824);
++    for (cases, 0..) |*item, i| {
++        item.* = .{ .rig = .{ .gpu = gpu, .s = stream }, .f = f, .old = old,
++            .wide = i % 2 == 1, .bits = i < 2 or i == 4, .truncate = i == 4 };
++        try list.append(gpu.gpa, item.kernel());
++    }
++}
++
++// Focused diagnostic entry; the same five registrations also live in kernel-contract.
++pub fn run(gpu: check.Gpu) !void {
++    try check.expect(try gpu.ctx.capability() == 121, "wide prompt experiment is GB10 only", .{});
++    var stream = try cuda.Stream.init(gpu.d, false);
++    defer stream.deinit();
++    var module = try cuda.Module.load(gpu.d, cuda.kernels.glm_mm);
++    defer module.unload();
++    var cases: [5]Case = undefined;
++    var list: std.ArrayList(g.Kernel) = .empty;
++    defer list.deinit(gpu.gpa);
++    try collect(gpu, stream, module, &cases, &list);
++    defer for (&cases) |*item| item.deinit();
++    var tally: g.Tally = .{};
++    try g.runAll(gpu.gpa, list.items, 0x6b63, &tally);
++    const f = try module.function("glm_mm8_256s2");
++    const regs = try f.attribute(.num_regs);
++    const shared = try f.attribute(.shared_size_bytes);
++    const local = try f.attribute(.local_size_bytes);
++    const bound = try f.attribute(.max_threads_per_block);
++    const occupancy = try f.occupancy(512, 73984);
++    const limits_ok = regs == 125 and shared == 0 and local == 0 and bound == 512 and occupancy > 0;
++    std.debug.print("{s} glm wide limits: regs={d} static={d} dynamic=73984 local={d} threads={d} blocks/SM={d}\n", .{ if (limits_ok) "PASS" else "FAIL", regs, shared, local, bound, occupancy });
++    std.debug.print("SUMMARY glm wide focused: {d} kernels, {d} passed, {d} failed; {d}/{d} planted controls caught; limits={s}\n", .{ tally.kernels, tally.passed, tally.failed, tally.caught, tally.controls, if (limits_ok) "PASS" else "FAIL" });
++    try check.expect(tally.problems() == 0 and limits_ok, "glm wide focused contract", .{});
++}
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index 15137fe..eeb346d 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -586,6 +586,13 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
+     defer weight_only.destroy(a);
+     const families = try @import("contract_family_sets.zig").Sets.init(gpu, s, a, &kernels, &affine4, cap);
+     defer families.deinit();
++    var wide_module = if (cap == 121) try cuda.Module.load(gpu.d, kk.glm_mm) else null;
++    defer if (wide_module) |*module| module.unload();
++    var wide_cases: [5]@import("contract_glm_wide.zig").Case = undefined;
++    if (wide_module) |module| try @import("contract_glm_wide.zig").collect(gpu, s, module, &wide_cases, &kernels);
++    defer if (wide_module != null) {
++        for (&wide_cases) |*item| item.deinit();
++    };
+     var t: g.Tally = .{};
+     try @import("contract_dump.zig").run(a, kernels.items);
+     t0.* = check.now(gpu.io);
+diff --git a/zig/tests/cuda/glm_wide_main.zig b/zig/tests/cuda/glm_wide_main.zig
+new file mode 100644
+index 0000000..84d2fc0
+--- /dev/null
++++ b/zig/tests/cuda/glm_wide_main.zig
+@@ -0,0 +1,15 @@
++//! Focused executable for the same registrations included by tf-cuda-test kernel-contract.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++pub fn main(init: std.process.Init) !u8 {
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    @import("contract_glm_wide.zig").run(.{ .d = &driver, .ctx = &ctx, .gpa = init.gpa, .io = init.io }) catch |err| {
++        std.debug.print("FAIL glm wide contract: {t}\n", .{err});
++        return 1;
++    };
++    return 0;
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 8f7bf72..f96d6a7 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -250,6 +250,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "glm-exl3-layer")) return glm_exl3_layer_tests.run(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else "0", if (rest.len > 2) rest[2] else "0", if (rest.len > 3) rest[3] else "1");
+     if (std.mem.eql(u8, cmd, "glm-kda-pad-split")) return glm_kda_pad_check.run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-mm-fixed")) return @import("glm_mm_fixed_tests.zig").run(gpu);
++    if (std.mem.eql(u8, cmd, "glm-mm-wide-contract")) return @import("contract_glm_wide.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-mm-bench")) return @import("glm_mm_bench.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-pdl-order")) return @import("glm_pdl_order.zig").run(gpu, if (rest.len > 0) rest[0] else null);
+     if (std.mem.eql(u8, cmd, "glm-index-check")) return glm_index_check.run(gpu);
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index 274f8a5..97ef687 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -157,6 +157,7 @@ pub const usage =
+     \\  glm-kda-pad-split         TF_GLM_KDA_PAD's padding of the bf16 and split KDA stacks at TP=3 (synthetic)
+     \\  glm-vision MODEL F32 BF16 IMG  GLM's image tower and preparation against vision_ref.py's torch runs
+     \\  glm-mm-fixed              Prompt K policies: FP64, every row alone/batched, offsets and guarded tails
++    \\  glm-mm-wide-contract      GB10 wide Q8 prompt tile: stock kernel bytes, FP64 reference and launch limits
+     \\  glm-mm-bench              GLM's bf16 linears: b16.matmul against glm_mm, by rows (one GPU)
+     \\  glm-index-check           GLM's indexer with glm_index against tf_glm_scores and tf_glm_select_rows, byte for byte (one GPU)
+     \\  glm-kv-host-slots         TF_GLM_KV_HOST's gather past its slots is refused as error.GlmKvHostSlots, then one within (one GPU)

@@ -35,15 +35,27 @@ fit_key() {
     "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CACHE_FIRST" "$HOST_CACHE_GIB" "$LEARN_GIB" "$KV_SHARD" "$ROCE" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
     | sha256sum | cut -c1-16
 }
+fit_boot_id() {
+  if [[ -n "${FIT_BOOT_ID:-}" ]]; then printf '%s\n' "$FIT_BOOT_ID"
+  elif [[ -r /proc/sys/kernel/random/boot_id ]]; then cat /proc/sys/kernel/random/boot_id
+  fi
+}
 remembered_context() {
   [[ -f "$FIT_FILE" ]] || return 0
-  awk -F'\t' -v k="$1" '$1 == k { v = $2 } END { if (v != "") print v }' "$FIT_FILE"
+  local boot; boot=$(fit_boot_id)
+  awk -F'\t' -v k="$1" -v max="$CONTEXT_MAX" -v boot="$boot" '
+    $1 == k { v = $2; b = $4 }
+    END {
+      if (v == "") exit
+      if (v + 0 >= max + 0 || (boot != "" && b == boot)) print v
+    }' "$FIT_FILE"
 }
 remember_context() {
-  local tmp="$FIT_FILE.tmp"
+  local tmp="$FIT_FILE.tmp" boot
+  boot=$(fit_boot_id)
   mkdir -p "$STATE_DIR"
   { if [[ -f "$FIT_FILE" ]]; then awk -F'\t' -v k="$1" '$1 != k' "$FIT_FILE"; fi
-    printf '%s\t%s\t%s\n' "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } > "$tmp"
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$boot"; } > "$tmp"
   mv -- "$tmp" "$FIT_FILE"
 }
 # A smaller window the engine's memory refusals in the ranks' logs allow (nothing when they show none). The native
@@ -97,7 +109,9 @@ PY
 FIT_KEY=$(fit_key)
 if [[ "$CONTEXT" == auto ]]; then
   CTX=$(remembered_context "$FIT_KEY")
-  if [[ -n "$CTX" ]]; then CTX_NOTE="auto: the window that served these settings last time ($FIT_FILE)"
+  if [[ -n "$CTX" ]]; then
+    if (( CTX < CONTEXT_MAX )); then CTX_NOTE="auto: cached shrunk fit from this boot ($FIT_FILE; delete it to retry $CONTEXT_MAX)"
+    else CTX_NOTE="auto: the window that served these settings last time ($FIT_FILE)"; fi
   else CTX=$CONTEXT_MAX; CTX_NOTE="auto: try $CONTEXT_MAX, then once the largest window the engine's memory refusal allows"; fi
 else
   CTX=$CONTEXT; CTX_NOTE=explicit
@@ -178,7 +192,7 @@ declare -a PASS_ENV=()
 WORKER_ENV_FILE=''
 MANAGED_ENV=' HOME HF_HUB_OFFLINE CUDA_DEVICE_ORDER CUDA_VISIBLE_DEVICES TENSORFOLD_NO_UPDATE_CHECK TENSORFOLD_NO_LIVE
  TENSORFOLD_MEMORY_RESERVE_GIB TF_GLM_DENSE_BITS TF_GLM_HEAD_BITS TF_GLM_CLEAR_THINKING TF_GLM_RANK TF_GLM_WORLD TF_CUDA_DEVICE
- TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_PROMPT_CACHE_FIRST TF_GLM_KV_SHARD TF_GLM_L2PF TF_EXTRA_EOS TF_THINK_OFF_SPLIT
+ TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_PROMPT_WIDE TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_PROMPT_CACHE_FIRST TF_GLM_KV_SHARD TF_GLM_L2PF TF_EXTRA_EOS TF_THINK_OFF_SPLIT
  TF_ROCE TF_ROCE_MAX_KB TF_ROCE_HCA TF_BIN TF_REPO TF_REF
  NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS '
 # The flags both ranks share. Everything that places a rank is added per rank, so the two fingerprints agree on the rest.
@@ -187,7 +201,7 @@ build_env_args() {
   ENV_ARGS=(-e HOME=/state/home -e HF_HUB_OFFLINE=1 -e TENSORFOLD_NO_UPDATE_CHECK=1 -e TENSORFOLD_NO_LIVE=1
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e "TENSORFOLD_MEMORY_RESERVE_GIB=$MEMORY_RESERVE_GIB"
     -e "TF_GLM_DENSE_BITS=$(bits "$DENSE")" -e "TF_GLM_HEAD_BITS=$(bits "$HEAD")" -e "TF_GLM_CLEAR_THINKING=$CLEAR_THINKING"
-    -e "TF_KV_PAGES=$KV_PAGES" -e "TF_GLM_CE_EXCHANGE=$CE_EXCHANGE" -e "TF_GLM_ABSORB_MMA=$ABSORB_MMA" -e "TF_GLM_W8A8=$W8A8"
+    -e "TF_KV_PAGES=$KV_PAGES" -e "TF_GLM_CE_EXCHANGE=$CE_EXCHANGE" -e "TF_GLM_ABSORB_MMA=$ABSORB_MMA" -e "TF_GLM_W8A8=$W8A8" -e "TF_GLM_PROMPT_WIDE=$TF_GLM_PROMPT_WIDE"
     -e "TF_CUDA_DEVICE=0" -e "TF_GLM_WORLD=$TP" -e "NCCL_COMM_ID=$LINK_SELF:$NCCL_PORT"
     -e "TF_ROCE=$([[ "$ROCE" == on ]] && echo 1 || echo 0)" -e "TF_ROCE_MAX_KB=$ROCE_MAX_KB"
     -e "TF_BIN=$TF_BIN" -e "TENSORFOLD_PREFILL_SHARE=$PREFILL_SHARE")
@@ -197,8 +211,8 @@ build_env_args() {
   [[ "$CACHE_FIRST" != 1 ]] || ENV_ARGS+=(-e "TF_PROMPT_CACHE_FIRST=1")
   # KV_SHARD=1: engine patch 0114 keeps each stream's latent rows on its owner rank (both ranks must agree)
   [[ "$KV_SHARD" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_KV_SHARD=1")
-  # L2PF=1: engine patch 0117 prefetches each decode window's next weights into L2 (both ranks must agree)
-  [[ "$L2PF" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_L2PF=1")
+  # L2PF: each decode window's next weights read into L2 (both ranks must agree). Named either way: unset is on on GB10
+  ENV_ARGS+=(-e "TF_GLM_L2PF=$L2PF")
   # EXTRA_EOS: engine patch 0120 ends a reply at these tokens too (both ranks alike)
   [[ "$EXTRA_EOS" == none ]] || ENV_ARGS+=(-e "TF_EXTRA_EOS=$EXTRA_EOS")
   # THINK_OFF_SPLIT: engine patch 0121 moves a thinking-off draft closed by </think> into reasoning_content

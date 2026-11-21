@@ -13,13 +13,13 @@
 > **This is a brand-new recipe, version 1104.** It is not an update of
 > [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
 > (the Python-engine recipe and its `zig-engine` branch, which stay as they are). It descends from the lab's
-> [2x RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold): the same engine pin
+> [2x RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold): originally the same engine pin
 > and 93 of its patches unchanged, plus a two-Spark launch over the ConnectX-7 link, unified-memory budgeting and twelve
 > GB10 patches, every default measured on the pair. Different engine lineage, different patch stack, different numbers.
 
-**Engine: TensorFold 1.1.9** (`tensorfold-native --version`), upstream commit
-[`f350cd3e`](https://github.com/ashhart/TensorFold/commit/f350cd3ea253a042e205746928271f9d8f71a82d) plus this recipe's
-121 engine patches (`patches/engine/`).
+**Engine: TensorFold 1.3.0** (`tensorfold-native --version`), upstream commit
+[`81de26f6`](https://github.com/ashhart/TensorFold/commit/81de26f649677aa72ae0034d4af6e010cd947038) plus this recipe's
+17 engine patches (`patches/engine/`).
 
 This recipe serves GLM-5.3-Flash from an EXL3 checkpoint on **two NVIDIA DGX Sparks** (GB10, 128 GB unified memory
 each) at tensor parallel 2, one rank on each Spark, over their ConnectX-7 link. It uses TensorFold's native Zig/CUDA
@@ -33,7 +33,7 @@ pages, 12.5 GiB on each rank). Rank 0 serves the OpenAI-compatible API; rank 1 f
 DRY_RUN=1 ./start.sh  # print the whole plan: the link it finds, the docker build, both ranks' command lines, the health wait
 ```
 
-The engine is TensorFold 1.1.9 at commit `f350cd3e` ([ashhart/TensorFold](https://github.com/ashhart/TensorFold)), plus the
+The engine is TensorFold 1.3.0 at commit `81de26f6` ([ashhart/TensorFold](https://github.com/ashhart/TensorFold)), plus the
 `patches/engine/*.patch` files, compiled with Zig 0.17.0 for `sm_121` by `docker/Dockerfile`.
 
 
@@ -49,7 +49,8 @@ The engine is TensorFold 1.1.9 at commit `f350cd3e` ([ashhart/TensorFold](https:
 
 ## What is checked
 
-121 patches apply to `f350cd3e` with no rejects; the image builds on aarch64 for `sm_121` (about 6 minutes) and
+The following hardware results were collected with the 121-patch TensorFold 1.1.9 recipe (`f350cd3e`).
+The image builds on aarch64 for `sm_121` (about 6 minutes) and
 reaches the worker by content; link discovery finds both PCIe twins of the cabled port and the RoCE v2 GID that
 holds each port's own IPv4; NCCL and the engine's RDMA all-gather run over the cable; the full 1,048,576-token window
 serves 8 streams beside a 3.6 GiB prompt cache; greedy replies are byte-stable across every change
@@ -105,8 +106,8 @@ For long prompts with Q8 dense weights on a GB10 pair, set `TF_GLM_PROMPT_WIDE=1
 prompt rows. The engine selects it at 2,048 rows or more on SM121. The default is off.
 
 With three matched cold requests per length, median time to first token at 32,768 input tokens fell from 18.08 s to
-17.33 s. Input throughput rose 3.1%, 4.3%, and 4.2% at 4K, 32K, and 64K. Both runs used the same CUDA 13.0
-binary, EXL3 checkpoint, Q8 dense and head weights, `W8A8=0`, and one client. All ten sampled greedy answers
+17.33 s. Input throughput rose 3.1%, 4.3%, and 4.2% at 4K, 32K, and 64K. These results were measured on TensorFold 1.1.9.
+Both runs used the same CUDA 13.0 binary, EXL3 checkpoint, Q8 dense and head weights, `W8A8=0`, and one client. All ten sampled greedy answers
 and four passage likelihoods matched. To run the focused operator checks on a Spark with the tools image, use
 `docker run --rm --gpus all <image> tf-cuda-test glm-mm-wide-contract`.
 [Matched requests, CUDA checks and reproduction instructions](https://github.com/looskis/labski/tree/b4874b107855f9e56e41df923ccd9f3466aaa2e4/inference-recipes/results/glm53-tensorfold-wide-2026-11-18/)
@@ -219,15 +220,16 @@ default 6.5.
 | `MEMORY_RESERVE_GIB`, `HOST_CACHE_GIB`, `PROMPT_CACHE_GIB` | `6.5`, `0`, `5` | `PROMPT_CACHE_GIB` is `8` with EXL3 and `4` with `FP8=1` at four Sparks. See [Memory](#memory-on-a-128-gb-unified-spark); the reserve was 12 (the pair ran 9.5) before 2026-11-11 |
 | `LEARN_GIB`, `LEARN_MIN_FREE_GIB` | `0`, `15` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0113); see [Memory](#memory-on-a-128-gb-unified-spark) |
 | `KV_SHARD` | `0` | `1` keeps each stream's latent rows on one Spark (`TF_GLM_KV_SHARD`, patch 0114): about twice the tokens, 1-4% decode; use with `CACHE_FIRST=1 PROMPT_CACHE_GIB=6`, see [Memory](#memory-on-a-128-gb-unified-spark). Needs `KV=fp8`, `KV_PAGES=on`, DFlash2 or no drafter, `PARALLEL` auto or above 1. TP=2 only: `./start-tp4.sh` refuses it |
-| `L2PF` | `0` | `1` prefetches each decode window's next weights into L2 on a side stream (`TF_GLM_L2PF`, patch 0117, from upstream): the next layer's mixer input, this layer's router and KDA's `o_proj`, not the EXL3 routed experts. Upstream turns it on at TP>=2 on GB10; here it measured +2% at one stream and flat at four and eight (exact), so it stays opt-in. `TF_GLM_L2PF_MB`, `_CTAS`, `_PACE_GBPS` (12, 2, 150) pass through as exported `TF_*` variables |
+| `TF_GLM_PROMPT_WIDE` | `0` | Set to `1` for the 256-row tile on eligible SM121 Q8 projections. [Two-Spark measurements](#performance) |
+| `L2PF` | `1` | Prefetches each decode window's next weights into L2 on a side stream (`TF_GLM_L2PF`, built into TensorFold 1.3.0): the next layer's mixer input, this layer's router and KDA's `o_proj`, not the EXL3 routed experts. The engine turns it on by itself on GB10 when unset, so `0` is passed to turn it off. Measured +2% at one stream unsharded and +2.2-2.7% at one, +1.1% at four with `KV_SHARD=1` (issue #54), token hashes identical. `TF_GLM_L2PF_MB`, `_CTAS`, `_PACE_GBPS` (12, 2, 150) pass through as exported `TF_*` variables |
 | `CACHE_FIRST` | `1` | `1` sets `PROMPT_CACHE_GIB` (required) aside before the streams' windows (`TF_PROMPT_CACHE_FIRST`, patch 0112), so the cap becomes the cache; `0` counts whole windows first and gives the cache what they leave. See [Memory](#memory-on-a-128-gb-unified-spark) |
 | `PROMPT_CACHE_MIN_GIB` | empty | The smallest prompt cache a start may serve with. `start.sh` reads each rank's startup line and stops both ranks before LIVE (`E_CACHE`) when one funds less; the cache is what that start's room leaves, so `PROMPT_CACHE_GIB` caps it but does not guarantee it, even with `CACHE_FIRST=1` (issue 16). Empty: no check. `./start-tp4.sh` does not check it |
 | `WITH_VIDEO` | `0` | `1` builds `libtfvideo.so` (FFmpeg 9.0.2, static, LGPL; h264/hevc/vp8/vp9/mpeg4 in mp4/mkv) into its own image tag, so `VISION=1` serves `video_url` parts; a few minutes more at build |
 | `VISION`, `VISION_MAX_IMAGES`, `CHAT_TEMPLATE` | `1`, `50`, `auto` | Image input (`image_url` parts) on rank 0's tower, with `templates/glm-5.3-flash-vision.jinja`. `video_url` parts too with `WITH_VIDEO=1` (otherwise HTTP 500, issue 8); audio parts are unsupported and an mp4's audio track is ignored |
 | `THINKING`, `REASONING_EFFORT`, `MAX_TOKENS`, `CLEAR_THINKING` | `0`, `xhigh`, `32768`, `1` | Request defaults (`xhigh` renders the checkpoint's trained "Reasoning Effort: Max" line); earlier turns' reasoning is dropped from the prompt |
 | `EFFORT_LINE` | `thinking` | The template's `<|system|>Reasoning Effort: Max` line with thinking on only, as TensorFold v0.6.0's recipe wrote it (the served template is written to `.state/chat_template.jinja`); `always` keeps the checkpoint's template, which writes it into every prompt and makes a thinking-off reply reason in its answer. See [The effort line](#the-effort-line) |
-| `EXTRA_EOS` | `<\|assistant\|>` | Tokens that end a reply besides the checkpoint's EOS ids, comma-separated (`TF_EXTRA_EOS`, patch 0120). GLM-5.3 can close a reply with `<\|assistant\|>`, which its `generation_config.json` leaves out; without it the token reaches the reply as text and the model writes a second turn until `MAX_TOKENS`. `none`: the checkpoint's list only |
-| `THINK_OFF_SPLIT` | `0` | With thinking off, a chat reply that writes `</think>` within its first this-many tokens gets the text before it as `reasoning_content` and the rest as `content` (`TF_THINK_OFF_SPLIT`, patch 0121). GLM-5.3 sometimes drafts in its reasoning voice with thinking off; without the split the draft and the marker are the answer. A streamed reply's content waits until the marker, the end or this many tokens. `0`: off |
+| `EXTRA_EOS` | `<\|assistant\|>` | Tokens that end a reply besides the checkpoint's EOS ids, comma-separated (`TF_EXTRA_EOS`, patch 0009). GLM-5.3 can close a reply with `<\|assistant\|>`, which its `generation_config.json` leaves out; without it the token reaches the reply as text and the model writes a second turn until `MAX_TOKENS`. `none`: the checkpoint's list only |
+| `THINK_OFF_SPLIT` | `0` | With thinking off, a chat reply that writes `</think>` within its first this-many tokens gets the text before it as `reasoning_content` and the rest as `content` (`TF_THINK_OFF_SPLIT`, patch 0009). GLM-5.3 sometimes drafts in its reasoning voice with thinking off; without the split the draft and the marker are the answer. A streamed reply's content waits until the marker, the end or this many tokens. `0`: off |
 | `ABSORB_MMA`, `W8A8` | `1`, `0` | Prompt numerics: `ABSORB_MMA` is free (+8.0%, identical answers); `W8A8` rounds activations and stays off |
 | `CE_EXCHANGE` | `0` | Needs CUDA IPC between ranks, which two Sparks do not have |
 | `SERVED_NAME`, `SERVE_EXTRA_ARGS`, `TENSORFOLD_API_KEY` | `GLM-5.3-Flash`, empty, unset | The model id clients send; more `serve` flags; a bearer key for every route but `/health`. Requests that send no sampling fields get the checkpoint's `generation_config.json` (temperature 1.0, top_p 0.95) and no `top_k`; the pair's `local.sh` sets `SERVE_EXTRA_ARGS='--top-k 20'`, the old deployment's default (greedy replies unchanged) |
@@ -323,12 +325,32 @@ Measured with sparkDash's quality suite (greedy, 755 items): with the line in ev
 v0.6.0's 84.0% and MMLU 91.2%; with `EFFORT_LINE=thinking`, QA 86.0% (140 of 150 replies byte-identical to v0.6.0's)
 and MMLU 88.4%, thinking-on categories unchanged.
 
+`GET /v1/models` lists `supported_efforts` as the levels the template names in quotes (`max`, `high`, `low`), while
+`default_effort` is the configured `REASONING_EFFORT` as given, so the default `xhigh` is reported outside that list
+(issue #50). Requests with `reasoning_effort: "xhigh"` or no effort work: the engine passes `xhigh` through and the
+template renders it as the `Reasoning Effort: Max` line. A client that checks the default against the list should
+accept `xhigh`.
+
+Thinking off (the default here) is a best-effort mode on very long prompts: a 619,938-token retrieval over numeric
+filler returned repeated `</think>` and a prompt echo with thinking off on both checkpoints, with drafts on or off and
+`KV_SHARD` 0 or 1, and the right answer with thinking on (issue #32). For long-context work, send
+`enable_thinking: true` or start with `THINKING=1`.
+
 ## Engine patches
 
-`patches/engine/` holds 122 patches on TensorFold `f350cd3e`, applied in filename order at image build: 0001-0093 are
-the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-6000-TensorFold)'s, unchanged;
-0094-0106 and 0111-0121 are this pair's own or ported from that recipe or from upstream. 0107-0110 are the four-Spark patches. In patches 0001–0121 the arch-gated kernels test
-`__CUDA_ARCH__ >= 1200`, which `sm_121` satisfies.
+On TensorFold 1.3.0 (`81de26f6`), the Docker build applies `patches/engine/*.patch` in filename order.
+
+| Patches | What they do |
+| --- | --- |
+| 0001–0003 | Mixed-width EXL3 experts and 3-bit prompt kernels and tests |
+| 0004–0006 | E4M3 latent caches on KV pages |
+| 0007–0008 | Reply grammar lifetime and KV-pool capacity checks |
+| 0009–0012 | Server patches for image inputs, extra EOS tokens, thinking-off replies, tool-call handling, and fixes for Pages and GLM EXL3 arguments |
+| 0013–0016 | Sharded KV cache and DFlash2 selector fixes |
+| 0017 | Opt-in 256-row GB10 Q8 prefill tile (`TF_GLM_PROMPT_WIDE=1`). [Measurements](#performance) |
+
+<details>
+<summary>Historical patch numbers for the TensorFold 1.1.9 measurements</summary>
 
 | Patches | What they do |
 | --- | --- |
@@ -356,9 +378,10 @@ the [RTX PRO 6000 recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-2x-RTX-PRO-
 | 0119 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (0039 had 16), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Fixes what the wider window exposes on this stack: shared-window scratch is said outright (a 32-row segment no longer shrinks the KDA projection buffer to 4 bytes or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. Not taken: load-timed pricing, 15-deep MTP chains, and #1779's shared reservation (upstream turned it off for DFlash2, cc2fa8d23). On the pair (2026-11-11, greedy, token hashes identical): a 1,195-token file rewrite at one stream 151 to 201-205 tok/s decode (14.9 to 26.6 tokens a round); prose at 1/4/8 streams and four-stream rewrites unchanged; 34 MiB more fixed memory a stream |
 | 0120 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids and leave the reply as they do. A name the tokenizer does not hold refuses the start; unset, the EOS list is the checkpoint's |
 | 0121 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default (`THINK_OFF_SPLIT=0`; 1024 is the hold the author measured)): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, whole and streamed alike (a stream holds its content until the token, the hold or the end). A close after the hold stays text; raw completions, the JSON channel and logprobs requests are never split. Tests: `zig build test-think-off-split-host` |
-| NNNN (GB10 Q8 prefill) | `TF_GLM_PROMPT_WIDE=1` enables the 256-row tile for long prompts on the GB10 pair. [Measurements](#performance) |
 
 Every default-on patch was A/B tested against the image before it: greedy replies identical plus a measured gain.
+
+</details>
 
 ## 4 Sparks (TP=4, experimental)
 
@@ -502,9 +525,9 @@ Settings at four Sparks:
 | `FP8` | `1` serves Z.AI's block FP8 release (patch 0107); four Sparks only |
 | `LEARN_GIB` | Conversations on disk (patch 0113): rank 0's `CACHE_DIR/learn` holds every rank's part |
 | `MEMORY_RESERVE_GIB`, `CACHE_FIRST`, `PROMPT_CACHE_GIB` | Four Sparks: `6.5`, `1`, and `4` with `FP8=1` or `8` with EXL3 (the pair: `6.5`, `1`, `5`). `FP8=1`, measured 2026-11-11: 6,147 pages (3.15M tokens) and a 3.9 GiB prompt cache a rank, with 7.6-10.5 GiB still available on each Spark; at 9.5 the same start had no prompt cache (the pages left 0.08 GiB), at 8, 2.4 GiB. EXL3 at 6.5: the same 16,392 pages it held at 12 (all eight 1M windows) and an 8.0 GiB prompt cache instead of 3.6. See the memory table under [Weights](#4-sparks-tp4-experimental). A value set in `local.sh` or the environment wins |
-| `L2PF` | `1` prefetches the next weights into L2 during decode (patch 0117); unmeasured at four, opt-in |
-| `EXTRA_EOS` | `<\|assistant\|>` by default (patch 0120), as on the pair |
-| `THINK_OFF_SPLIT` | Opt-in (patch 0121), as on the pair |
+| `L2PF` | `1` (default) prefetches the next weights into L2 during decode, `0` turns it off; unmeasured at four |
+| `EXTRA_EOS` | `<\|assistant\|>` by default (patch 0009), as on the pair |
+| `THINK_OFF_SPLIT` | Opt-in (patch 0009), as on the pair |
 | `EFFORT_LINE`, `CHAT_TEMPLATE` | As on the pair; the written template goes to every worker |
 | `KV_SHARD` | Refused: patch 0114 shards over exactly two ranks |
 | `PROMPT_CACHE_MIN_GIB` | Not checked here (a warning says so); read rank 0's prompt cache line instead |
@@ -606,6 +629,7 @@ only ever stops containers labelled `tf.recipe=glm53-spark`.
 | A reply ends with `<\|assistant\|>` followed by the same answer again, `finish_reason: length` | The checkpoint's EOS list leaves out `<\|assistant\|>`. Keep `EXTRA_EOS` at its default (`<\|assistant\|>`) |
 | With thinking off, `content` starts with a draft ("We need ...") and holds `</think>` | The model reasoned anyway. Set `THINK_OFF_SPLIT=1024` (off by default) so the draft goes to `reasoning_content`; raise it if the draft is longer |
 | A thinking-off reply works the sum out in its answer and `finish_reason` is `length` on a short `max_tokens` | The prompt carries the template's `Reasoning Effort: Max` line (`EFFORT_LINE=always`, or a `CHAT_TEMPLATE` of your own); `EFFORT_LINE=thinking` (default) writes it with thinking on only. `/tokenize` on a one-line user message shows it: 7 tokens more |
+| A thinking-off reply to a prompt of several hundred thousand tokens repeats `</think>` and echoes the prompt | Thinking off is best-effort on very long prompts; send that request with thinking on (see [The effort line](#the-effort-line), issue #32) |
 | `[E_FABRIC]` | No directly reached address, or no RoCE v2 GID holding an IPv4 on the link's port: cable the Sparks on one subnet, or set `FABRIC_PEER` / `NCCL_IB_GID_INDEX` |
 | `[W_FABRIC]` a rail left out | The second rail does not carry a full-size ping; check the cable, the twin's address and MTU |
 | `[E_MEMORY]`, `[E_PORT]` | Less than `MIN_AVAIL_GIB` available (another rank, usually), or a port in use |
