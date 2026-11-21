@@ -293,6 +293,7 @@ CE_EXCHANGE="${CE_EXCHANGE:-0}"
 #     as yrassen for baseline's correct yrassecen. Off; turn it on only behind your own eval.
 ABSORB_MMA="${ABSORB_MMA:-1}"                    # TF_GLM_ABSORB_MMA: measured free on GB10 (see above)
 W8A8="${W8A8:-0}"                                # TF_GLM_W8A8: stashed (see above); a real rounding of activations
+TF_GLM_PROMPT_WIDE="${TF_GLM_PROMPT_WIDE:-0}"     # 256-row packed Q8 prefill tile on SM121; measured on the pair
 SERVE_EXTRA_ARGS="${SERVE_EXTRA_ARGS:-}"         # more tensorfold-native serve flags, word-split, given to every rank
 
 # --- memory guard ----------------------------------------------------------------------------------------------------
