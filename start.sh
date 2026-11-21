@@ -249,6 +249,27 @@ RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --cap-add IPC_LOCK
           --ulimit memlock=-1 --ulimit stack=67108864)
 [[ ! -e /dev/infiniband ]] || RUN_ARGS+=(--device /dev/infiniband)
 
+# GB10 efficiency-core pin (ashhart/TensorFold#1033 runbook, "GB10 CPU pinning for long CUDA runs"):
+# the Zig engine's host threads spin on the Cortex-X925 cores even between requests and soak the acpitz
+# zones toward the EC's silent hard power-off (journal ends mid-line, pstore empty; cf. the #193-class
+# host-loss reports). Pinning every rank to the A725 cluster held our pair's hottest zone at 74 C under
+# sustained serving where it previously peaked 94 C, with no measurable throughput change.
+# Detected from cpufreq (efficiency = cpuinfo_max_freq <= 3.0 GHz): a no-op on homogeneous hosts, and
+# TF_GLM_CPUSET=none disables it.
+if [[ "${TF_GLM_CPUSET:-auto}" != none ]] && [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
+  eff=(); big=0
+  for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
+    id=${c#/sys/devices/system/cpu/cpu}; id=${id%%/*}
+    f=$(<"$c")
+    if (( f <= 3000000 )); then eff+=("$id"); else big=$((big+1)); fi
+  done
+  if (( ${#eff[@]} > 0 && big > 0 )); then
+    eff_list=$(IFS=,; echo "${eff[*]}")
+    RUN_ARGS+=(--cpuset-cpus="$eff_list")
+    log "GB10 efficiency-core pin: cpuset-cpus=$eff_list (${#eff[@]} eff + $big big cores)"
+  fi
+fi
+
 # The ranks' command lines, as each Spark starts them.
 show_ranks() {
   local r
