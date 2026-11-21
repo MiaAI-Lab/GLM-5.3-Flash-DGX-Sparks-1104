@@ -24,14 +24,14 @@ carry, and each is a patch here:
 | `0018` — `absorb_q` / `expand_v` on tensor cores | 1.3.0's `cuda_latent.absorbQ`/`expandV` always take the SIMT `rowBlocks`; `TF_GLM_ABSORB_MMA` is read nowhere in the tree | **+7.4 %** (1,280 → 1,374), matching upstream's published +8.0 % |
 | `0020` — the FP8 key-tile pipeline in `common/mla.cuh` | 1.3.0 loads an E4M3 tile with two byte loads a code pair, converts, stores; 1.1.9 issued one 8-byte `__ldg` a unit and fetched tile + 2 ahead (`fetch8`/`store8`) | **+7.2 %** (1,411 → 1,512) |
 
-Together: **1,277 → 1,512 (32K) and 1,274 → 1,526 (64K), +18 %, with the six greedy replies byte-identical
-to the 1.1.9 build's.** TTFT 32K 24.6 s → 20.8 s.
+Together the first three are **1,277 → 1,512 (32K) and 1,274 → 1,526 (64K), +18 %**, with the six greedy replies
+byte-identical to the 1.1.9 build's; the paired-path and GEMM patches below take it to **1,618 / 1,628 (+27 %)**. TTFT 32K 24.6 s → 20.8 s.
 
 One patch that looks like the same class of loss and is **not**: `0019` restored the fused sparse-chunk kernel
 (`tf_glm_chunks_*_fused`, the old `fuses()` selection, 13 chunk variants against 1.3.0's 6) and measured **0 %**
 (1,365 / 1,380 against 1,374 / 1,379). Do not port it again.
 
-## What is left (-10 %), and why it is not another kernel
+## Where the rest of the gap went: first the overlap, then the GPU work
 
 Both builds profiled with Nsight Systems on the same 32K cold prompt, capture bracketed to the request
 (`--delay`/`--duration`; a whole-session capture mixes in the load and the start smoke test and reverses these totals):
@@ -66,8 +66,20 @@ to the side stream with a drafter loaded:
 | `0023` | `pairedAt` and the paired chunk stop refusing a loaded drafter | (with 0024) |
 | `0024` | restores `tapPiece` and the per-piece taps `exchangeGlue` issued on the side stream, and `shareTaps` after both chunks; drops `f.taps != null` from `pairBody`'s `BadPair` gate | **32K 1,512 → 1,554, 64K 1,526 → 1,572** (+2.8 % / +3.0 %); decode 39.5-41.4 and multi-4 74-75 against 40.4 / 80.0 (inside this pair's run-to-run spread); the six greedy replies stay byte-identical |
 
-Best 1.3.0 build here is therefore `0017` + `0018` + `0020` + `0023` + `0024`: **1,554 (32K) / 1,572 (64K)**
-against the 121-patch build's 1,719-1,724 — **-9 %**, with identical greedy replies.
+Best 1.3.0 build here is therefore `0017` + `0018` + `0020` + `0023` + `0024` + `0025`: **1,618 (32K) / 1,628 (64K)**
+against the 121-patch build's 1,719-1,724 — **-6 %**, with identical greedy replies, decode 40.9 and multi-4 78.3
+against 42.0 / 82.2.
+
+Profiled again after `0023` + `0024`: the side stream carries `SendRecv` 4.71 s + `hc_post` 0.52 s +
+`hc_partial` 0.29 s + `hc_finish` 0.15 s, the main stream 20.09 s, and the overlap factor is back to **1.29×**.
+What remains is no longer overlap but total GPU work (25.78 s against 23.12 s) — that is what `0025` attacks, and its
+own capture is still to be taken.
+
+The last piece is the packed prompt GEMM. 1.1.9 fed 4/6/8-bit prompt weights to a 128-row kernel with a two-stage
+pipeline and `__launch_bounds__(256, 2)` (41 KiB of shared memory: two blocks an SM, so a 768-row piece's 384 blocks
+fit one wave of 376 slots). 1.3.0 dropped that variant and sends the same matmuls through the three-stage bucket
+(60 KiB, one block an SM). Restoring the shape on 1.3.0's own template (`0025`) is worth
+**1,554 → 1,618 (32K) and 1,572 → 1,628 (64K)**, +4.1 % / +3.6 %, greedy identical.
 
 ## Flags that look relevant and are not (all measured, 32K cold prompt)
 
