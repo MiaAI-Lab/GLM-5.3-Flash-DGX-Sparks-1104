@@ -1,0 +1,13 @@
+diff --git a/zig/src/fabric/tp/roce_guard.zig b/zig/src/fabric/tp/roce_guard.zig
+index 8f85247..3a4a2c6 100644
+--- a/zig/src/fabric/tp/roce_guard.zig
++++ b/zig/src/fabric/tp/roce_guard.zig
+@@ -1,7 +1,7 @@
+ //! Every RoCE post's bounds before the verb: each HCA's stripe inside its slot and the registered region.
+ const std = @import("std");
+ 
+-pub const max_hcas = 2;
++pub const max_hcas = 4;
+ pub const flag_stride = 128;
+ 
+ pub const Error = error{ OutOfRegion, WriteTooLarge };

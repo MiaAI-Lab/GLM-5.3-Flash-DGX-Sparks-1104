@@ -1,0 +1,17 @@
+--- a/zig/src/fabric/tp/config.zig
++++ b/zig/src/fabric/tp/config.zig
+@@ -50,13 +50,13 @@ pub const Config = struct {
+     report_ns: u64 = std.time.ns_per_s / 2,
+     nccl_lib: []const u8 = "libnccl.so.2",
+     /// `name[:gid],...` RDMA devices for `roce` (null: active RoCE v2 ports on an IPv4 /24 the peer has, roce_pick).
+     roce_hca: ?[]const u8 = null,
+     /// TF_TP_LINK: the link a host-transport result names (`tcp-host`); a label only, not in `digest`.
+     link: ?[]const u8 = null,
+     /// Stripe over at most this many HCAs (auto detection only).
+-    roce_hcas: u8 = 2,
++    roce_hcas: u8 = 4,
+     roce_tc: u8 = 0,
+     /// TF_TP_ROCE_FAST as the RoCE kernel's `opts` word: bit 0 on, bits 8-15 pollers, bits 16-31 stagger ns (local).
+     roce_fast: u32 = 0,
+     /// TF_TP_ROCE_BLOCKS: the largest RoCE grid, a power of two 1..16; launch shape only, the bytes are the same.
+     roce_blocks: u32 = 16,
