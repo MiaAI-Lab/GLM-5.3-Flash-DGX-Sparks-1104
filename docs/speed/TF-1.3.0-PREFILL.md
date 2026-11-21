@@ -93,7 +93,18 @@ fit one wave of 376 slots). 1.3.0 dropped that variant and sends the same matmul
 drafter's own prompt work leaving, the same gain measured on its own). Baselines for all of the above: 1,512-1,530.
 
 `TF_GLM_PDL_CHAIN`, `TF_EXL3_PDL`, `TF_GLM_DSEL`, `TF_GLM_TOPK_SUM`, `TF_GLM_DSCORES`, `TF_EXL3_SHFL` and
-`TF_GLM_MM_TWO` are inert too (1,280-1,284 at stock 1.3.0, i.e. inside the noise floor).
+`TF_GLM_MM_TWO` are inert too (1,280-1,284 at stock 1.3.0, i.e. inside the noise floor). Re-measured **with the paired
+step enabled** (the first round was taken without it): `TF_GLM_OVERLAP_PIECES=8` 1,606 and
+`TF_GLM_PROMPT_STEPS=0` **1,537 (-5 %)** against a 1,617 baseline, so 1.3.0's own chunk interleaving and three pieces
+are already the right setting.
+
+One negative result worth recording: the 1104 stack's `exl3_prompt.cuh` main loop is 13 % faster a row-layer on
+`tf_exl3_prompt_gu` (2.33 ns against 2.63), but only as a set — its 8-member column-block specialisation *and* its
+two-set trellis decode. Taking the decode pairing alone into 1.3.0's `tmain`, keeping its slot-write interface, `cnt`,
+`stage` and `acc[TMT][TNB]`, measured **1,589 / 1,597 against 1,618 / 1,628: a regression**, because the second A set
+costs registers in a kernel pinned at two blocks an SM. `TSTAGES` is 3 in both trees, so pipeline depth is not the
+difference either; restoring the whole loop would mean reverting the slot-write prompt experts, which is a design
+reversal rather than a patch.
 
 `TF_GLM_CHUNK_SOLO`, `TF_GLM_PROMPT_PAIR` and `TF_GLM_OVERLAP_PIECES` are read in `cuda_ranks.zig`
 (`s.pair` defaults **true**, `solo` false, `pieces` 3), not in `platform/environment.zig` — grep the whole tree.
