@@ -676,3 +676,7 @@ in [NOTICE.md](NOTICE.md).
 
 Apache License 2.0: see [LICENSE](LICENSE). Downloaded software and weights keep their own terms; DFlash2's weights are
 CC BY-NC-ND 4.0.
+
+## Offline experiment validation
+
+See [docs/offline-validation.md](docs/offline-validation.md) for the standalone analyzer and the preserved q8 scale-register case.
