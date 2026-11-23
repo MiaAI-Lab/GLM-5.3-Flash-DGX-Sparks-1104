@@ -1,5 +1,7 @@
 # Changelog
 
+- **2026-11-23** -- Patch `0017` adapts opt-in `TF_GLM_SNAPSHOT_FORMAT=committed` to TensorFold 1.3.0 after patches `0001`–`0016`. It keeps the active FP32 KDA bank per layer and omits replay scratch at committed in-memory prompt marks. TP2 only; disk learning, KV sharding and shared KV pages are refused. The earlier compact-snapshot measurements were on the retired `f350cd3e` stack and are historical.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the
