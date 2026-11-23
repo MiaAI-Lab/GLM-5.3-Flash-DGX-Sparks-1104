@@ -1,7 +1,9 @@
+> Historical measurement: the timing, size, and request receipts below used TensorFold `f350cd3e` and the former 122-patch stack. The current PR uses TensorFold `81de26f6` plus `0001`–`0017`; those older measurements do not establish performance or output equivalence on 1.3.0. See the PR validation report for current evidence.
+
 # Compact committed prompt snapshots
 
 With a small prompt-cache budget, unnecessary bytes in each saved state can evict a reusable conversation prefix.
-Patch 0122 adds `TF_GLM_SNAPSHOT_FORMAT=committed`: at `pending == 0`, save each KDA layer's active FP32 recurrent
+Historical patch 0122 added `TF_GLM_SNAPSHOT_FORMAT=committed`: at `pending == 0`, save each KDA layer's active FP32 recurrent
 bank, selected by its saved `cur` bit, and omit the projection/replay scratch. Position, convolution, latent KV,
 indexer state, prompt hidden state and available DFlash2 context keep their existing representation. Restore uses
 the saved format and per-layer bits even when the destination slot currently has different bits.
@@ -173,7 +175,7 @@ and a shared-page store. Its live-half path keeps both banks when layer parity d
 This patch uses the saved bit for each layer and also removes the committed window's replay scratch. It does not
 include the shared-page store or claim qualification with it. Both changes touch snapshot owners and rank
 configuration, so whichever lands second needs integration and validation against the resulting main. Patch
-number 0122 is the next number on this PR's base and must be updated if main advances before merge.
+the historical patch was numbered 0122 on the retired base; the current 1.3.0 recipe carries the adapted change as 0017.
 
 A patch-application check against #42 head `5b598c2241e4836ad5fb62d6dbe091930652b6e8` confirms text conflicts:
 ours first prevents #42's 0125 from applying to `cuda_snapshots.zig`; #42 first prevents this patch from applying

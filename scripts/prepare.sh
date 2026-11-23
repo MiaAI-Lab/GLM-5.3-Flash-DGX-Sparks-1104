@@ -82,8 +82,8 @@ validate_config() {
   case "${TF_GLM_SNAPSHOT_FORMAT:-legacy}" in
     legacy) ;;
     committed)
-      [[ "$TP" == 2 && "$KV_SHARD" == 0 ]] && at_least 0 "$LEARN_GIB" \
-        || fail E_CONFIG 'TF_GLM_SNAPSHOT_FORMAT=committed needs TP=2, KV_SHARD=0 and LEARN_GIB=0.'
+      [[ "$TP" == 2 && "$KV_SHARD" == 0 && "${TF_KV_SHARE:-0}" == 0 ]] && at_least 0 "$LEARN_GIB" \
+        || fail E_CONFIG 'TF_GLM_SNAPSHOT_FORMAT=committed needs TP=2, KV_SHARD=0, TF_KV_SHARE=0 and LEARN_GIB=0.'
       ;;
     *) fail E_CONFIG 'TF_GLM_SNAPSHOT_FORMAT must be legacy or committed.' ;;
   esac

@@ -1,0 +1,732 @@
+From 705d2f6913b647b8e379556cacfd4221a642973a Mon Sep 17 00:00:00 2001
+From: wangtianwen07 <10508155+wangtianwen07@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:09:59 +0800
+Subject: [PATCH] GLM CUDA: compact committed snapshots on 1.3.0
+
+---
+ zig/build/glm_family_host.zig                 |   4 +
+ zig/glm_compact_snapshot_host.zig             | 302 ++++++++++++++++++
+ zig/src/families/glm/cuda_engine.zig          |   1 +
+ zig/src/families/glm/cuda_engine_types.zig    |   2 +-
+ zig/src/families/glm/cuda_ranks.zig           |  23 +-
+ .../families/glm/cuda_snapshot_compact.zig    |  77 +++++
+ zig/src/families/glm/cuda_snapshot_layout.zig |   7 +
+ zig/src/families/glm/cuda_snapshots.zig       |  38 ++-
+ zig/src/native/cuda_refusal.zig               |  49 +++
+ zig/src/platform/environment.zig              |   1 +
+ zig/test_support/glm_snap_fixture.zig         |   2 +
+ 11 files changed, 500 insertions(+), 6 deletions(-)
+ create mode 100644 zig/glm_compact_snapshot_host.zig
+ create mode 100644 zig/src/families/glm/cuda_snapshot_compact.zig
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index a5ee6f78a..38ed8de16 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -5,6 +5,10 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     // GLM CUDA's startup watcher (named phases, a warning while NCCL init or a load blocks), from cuda.zig's room
+     b.step("test-startup-watch-host", "Blocked startup phase warnings without a driver or communicator").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"startup watcher:"} })).step);
+     const host = b.graph.host;
++    const compact_module = b.createModule(.{ .root_source_file = b.path("zig/glm_compact_snapshot_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda } } });
++    const compact_run = b.addRunArtifact(b.addTest(.{ .root_module = compact_module, .filters = &.{ "GLM compact snapshots:", "TF_GLM_SNAPSHOT_FORMAT:" } }));
++    b.step("test-glm-compact-snapshots-host", "Committed packing and rank agreement through the actual owners").dependOn(&compact_run.step);
++    step.dependOn(&compact_run.step);
+     const exl3 = b.createModule(.{ .root_source_file = b.path("zig/glm_exl3_prompt_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda } } });
+     const exl3_run = b.addRunArtifact(b.addTest(.{ .root_module = exl3, .filters = &.{"GLM EXL3 prompt:"} }));
+     b.step("test-glm-exl3-prompt-host", "Actual EXL3 whole prompt calls, shared-slot ABI and scratch without a GPU").dependOn(&exl3_run.step);
+diff --git a/zig/glm_compact_snapshot_host.zig b/zig/glm_compact_snapshot_host.zig
+new file mode 100644
+index 000000000..d70cbed99
+--- /dev/null
++++ b/zig/glm_compact_snapshot_host.zig
+@@ -0,0 +1,302 @@
++//! GLM kept-state sizing and transfers through the actual rank owner with a recording CUDA driver.
++const std = @import("std");
++const glm = @import("glm");
++const cuda = @import("cuda");
++const t = std.testing;
++
++const Sizing = struct {
++    var next: u64 = 1 << 30;
++    fn alloc(out: *u64, bytes: usize) callconv(.c) cuda.abi.Result {
++        out.* = next;
++        next += std.mem.alignForward(usize, bytes, 256);
++        return 0;
++    }
++    fn free(_: u64) callconv(.c) cuda.abi.Result {
++        return 0;
++    }
++    fn zero(_: u64, _: u8, _: usize) callconv(.c) cuda.abi.Result {
++        return 0;
++    }
++};
++
++const rec = @import("test_support/glm_snap_driver.zig").Driver;
++const Fixture = @import("test_support/glm_snap_fixture.zig").Fixture;
++const Settings = glm.ranks.Settings;
++const Fingerprint = glm.ranks.Fingerprint;
++const Mismatch = glm.ranks.Mismatch;
++const mismatch = glm.ranks.mismatch;
++
++fn rowAt(st: *const glm.forward.State, x: glm.dsa_block.Caches, base: u64, r: usize, width: usize, per: usize) u64 {
++    return if (x.pt == 0) base + r * width else base + @as(u64, st.pages[r / per]) * x.ps + (r % per) * width;
++}
++fn same(a: u64, b: u64, len: usize) !void {
++    try t.expectEqualSlices(u8, rec.bytes(a, len), rec.bytes(b, len));
++}
++// Committed snapshots through the actual owner and recording driver.
++const CompactProbe = struct {
++    const packing = glm.snapshots.compact;
++    const poison: u8 = 0xE9;
++
++    fn first(st: *const glm.forward.State) u64 {
++        return if (st.table != 0) st.rings[0] else st.caches[0].lc;
++    }
++
++    fn expectedOmissions(st: *const glm.forward.State, expected: []u8, format: packing.Format, parity: u1) void {
++        if (format == .legacy) return;
++        const inactive: usize = @intCast(st.recAt(1 - parity, 0) - st.arena.buf.ptr);
++        @memset(expected[inactive..][0..st.rec_layer], poison);
++        if (format == .committed) {
++            const off: usize = @intCast(st.proj - st.arena.buf.ptr);
++            @memset(expected[off..][0..@intCast(first(st) - st.proj)], poison);
++        }
++    }
++
++    fn omitted(st: *const glm.forward.State, format: packing.Format) !void {
++        if (format == .legacy) return;
++        for (st.cur, 0..) |cur, i| for (rec.bytes(st.recAt(1 - cur, i), st.rec_layer)) |b| try t.expectEqual(poison, b);
++        if (format == .committed) for (rec.bytes(st.proj, @intCast(first(st) - st.proj))) |b| try t.expectEqual(poison, b);
++    }
++
++    fn valid(c: glm.config.Config, a: *const glm.forward.State, b: *const glm.forward.State, at: usize) !void {
++        try t.expectEqualSlices(u1, a.cur, b.cur);
++        try same(a.pos_dev, b.pos_dev, 4);
++        try same(a.conv, b.conv, a.kda_layers * 3 * a.conv_c * 2);
++        for (a.cur, 0..) |cur, i| try same(a.recAt(cur, i), b.recAt(cur, i), a.rec_layer);
++        for (a.caches, b.caches, 0..) |x, y, j| {
++            for (0..at) |r| {
++                try same(rowAt(a, x, x.lc, r, c.kv_lora, 512), rowAt(b, y, y.lc, r, c.kv_lora, 512), c.kv_lora);
++                try same(rowAt(a, x, x.ls, r, 4, 512), rowAt(b, y, y.ls, r, 4, 512), 4);
++            }
++            for (0..2) |k| try same(a.rings[2 * j + k], b.rings[2 * j + k], @min(at, a.ring_rows) * a.ring_row);
++            for (0..@min(at / 4 + 2, x.pk_rows)) |r| try same(rowAt(a, x, x.pk, r, c.i_dim * 2, 128), rowAt(b, y, y.pk, r, c.i_dim * 2, 128), c.i_dim * 2);
++        }
++        try same(a.mtp_pos_dev, b.mtp_pos_dev, 4);
++        try same(a.prompt_hidden, b.prompt_hidden, c.hidden * 2);
++    }
++};
++
++test "GLM compact snapshots: owner roundtrip keeps valid fields and leaves omissions poisoned" {
++    var d = rec.init();
++    for (0..2) |rank| {
++        var f: Fixture = undefined;
++        try f.initFormat(&d, rank, 2, false, true);
++        defer f.deinit();
++        try f.e.prepareSnapshots(2 * f.e.stateBytes(16384));
++        const spare = f.e.snap_pages.?.spare();
++        for ([_]CompactProbe.packing.Format{ .legacy, .committed }) |format| for ([_]usize{ 511, 4096, 16384 }) |at| for ([_]u1{ 0, 1 }) |parity| {
++            try f.mark(at, 0, @intCast(at % 251));
++            f.seq.st.cur[0] = parity;
++            const st = &f.seq.st;
++            const expected = try t.allocator.dupe(u8, rec.bytes(st.arena.buf.ptr, st.arena.buf.len));
++            defer t.allocator.free(expected);
++            CompactProbe.expectedOmissions(st, expected, format, parity);
++            try glm.snapshots.keepAsFormat(&f.e, 1, format);
++            const saved = f.e.snaps.getPtr(1).?;
++            try t.expectEqual(@backingInt(format), saved.format);
++            try t.expectEqual(try glm.snapshots.pages.rounded(saved.len), glm.snapshots.bytesFormat(&f.e, at, format));
++            @memset(rec.bytes(st.arena.buf.ptr, st.arena.buf.len), CompactProbe.poison);
++            st.cur[0] = 1 - parity; // restore must address saved parity, not this stale target parity.
++            try f.e.restoreState(1);
++            try f.expectPrefix(expected, at, 0);
++            try CompactProbe.omitted(st, format);
++            try t.expectEqual(parity, st.cur[0]);
++            try t.expectEqual(at, st.pos);
++            f.e.dropState(1);
++            f.e.dropped.clearRetainingCapacity();
++            try t.expectEqual(spare, f.e.snap_pages.?.spare());
++        };
++    }
++}
++
++test "GLM compact snapshots: FP8 paged and window owners exchange valid state with saved parity" {
++    var d = rec.init();
++    for (0..2) |rank| {
++        var f: Fixture = undefined;
++        try f.initFormat(&d, rank, 2, false, true);
++        defer f.deinit();
++        var w: glm.weights.Weights = undefined;
++        w.config = f.e.c;
++        w.share = f.e.share;
++        var layers: [2]glm.weights.Layer = undefined;
++        layers[0].mixer = .{ .mla = undefined };
++        layers[1].mixer = .{ .kda = undefined };
++        w.layers = &layers;
++        const page = glm.state.pageBytesOf(&w, true, false);
++        const ids = [_]u32{ 5, 2, 9, 0, 7, 1, 3, 8, 4, 6 };
++        var kv = try cuda.DeviceBuffer.alloc(&d, ids.len * page);
++        defer kv.free();
++        var paged = f.seq;
++        paged.st = try glm.forward.State.initPagedFormat(t.allocator, &d, &w, 16448, .{ .kv = kv.ptr, .pages = glm.pages.tableLen(16448), .page_bytes = page }, true, false);
++        defer paged.st.deinit();
++        paged.st.pages = &ids;
++        paged.st.capacity = ids.len * 512;
++        const window = &f.seq;
++        try f.e.prepareSnapshots(3 * f.e.stateBytes(4096));
++        for ([_]CompactProbe.packing.Format{.committed}) |format| for ([_]usize{ 511, 1537, 4096 }) |at| for ([_]u1{ 0, 1 }) |parity| {
++            f.e.cur = window;
++            try f.mark(at, 0, 17);
++            window.st.cur[0] = parity;
++            try glm.snapshots.keepAsFormat(&f.e, 1, format);
++            @memset(rec.bytes(paged.st.arena.buf.ptr, paged.st.arena.buf.len), CompactProbe.poison);
++            @memset(rec.bytes(kv.ptr, kv.len), CompactProbe.poison);
++            paged.st.cur[0] = 1 - parity;
++            f.e.cur = &paged;
++            try f.e.restoreState(1);
++            try CompactProbe.valid(f.e.c, &window.st, &paged.st, at);
++            try CompactProbe.omitted(&paged.st, format);
++            for (rec.bytes(paged.st.table, ids.len * 4)) |b| try t.expectEqual(CompactProbe.poison, b);
++            f.e.dropState(1);
++            f.e.dropped.clearRetainingCapacity();
++            try glm.snapshots.keepAsFormat(&f.e, 2, format);
++            @memset(rec.bytes(window.st.arena.buf.ptr, window.st.arena.buf.len), CompactProbe.poison);
++            window.st.cur[0] = 1 - parity;
++            f.e.cur = window;
++            try f.e.restoreState(2);
++            try CompactProbe.valid(f.e.c, &paged.st, &window.st, at);
++            try CompactProbe.omitted(&window.st, format);
++            f.e.dropState(2);
++            f.e.dropped.clearRetainingCapacity();
++        };
++        f.e.cur = window;
++    }
++}
++
++test "GLM compact snapshots: unknown format, pending state and failed copies do not publish" {
++    var d = rec.init();
++    var f: Fixture = undefined;
++    try f.initFormat(&d, 0, 2, false, true);
++    defer f.deinit();
++    try f.mark(4096, 0, 31);
++    try f.e.prepareSnapshots(2 * f.e.stateBytes(4096));
++    const spare = f.e.snap_pages.?.spare();
++    try t.expectError(error.SnapshotFormat, glm.snapshots.keepAsFormat(&f.e, 1, @fromBackingInt(@intCast(254))));
++    try t.expectError(error.SnapshotShape, CompactProbe.packing.plan(&f.seq.st, &f.e.c, 4096, null, .committed, &.{}));
++    f.seq.st.pending = 1;
++    try t.expectError(error.NotAtMark, glm.snapshots.keepAsFormat(&f.e, 1, .committed));
++    f.seq.st.pending = 0;
++    rec.fail_copy = rec.copies + 2;
++    try t.expectError(error.NotReady, glm.snapshots.keepAsFormat(&f.e, 1, .committed));
++    rec.fail_copy = null;
++    try t.expectEqual(@as(u32, 0), f.e.snaps.count());
++    try t.expectEqual(spare, f.e.snap_pages.?.spare());
++    try glm.snapshots.keepAsFormat(&f.e, 1, .committed);
++    const saved = f.e.snaps.getPtr(1).?;
++    saved.format = 254;
++    const copies = rec.copies;
++    try t.expectError(error.SnapshotFormat, f.e.restoreState(1));
++    try t.expectEqual(copies, rec.copies);
++    saved.format = @backingInt(CompactProbe.packing.Format.committed);
++    f.e.dropState(1);
++    f.e.dropped.clearRetainingCapacity();
++    try t.expectEqual(spare, f.e.snap_pages.?.spare());
++}
++
++test "GLM compact snapshots: full TP2 shape prices and mixed layer parity match original sizing" {
++    var d: cuda.Driver = undefined;
++    d.api.cuMemAlloc_v2 = Sizing.alloc;
++    d.api.cuMemFree_v2 = Sizing.free;
++    d.api.cuMemsetD8_v2 = Sizing.zero;
++    var w: glm.weights.Weights = undefined;
++    w.config = .{};
++    var layers: [glm.config.max_layers]glm.weights.Layer = undefined;
++    w.layers = layers[0..w.config.layers];
++    for (w.layers, 0..) |*layer, i| layer.mixer = switch (w.config.kind(@intCast(i))) {
++        .mla => .{ .mla = undefined },
++        .kda => .{ .kda = undefined },
++    };
++    const capacity = glm.native.capacity(1048576);
++    const ids = try t.allocator.alloc(u32, glm.pages.tableLen(capacity));
++    defer t.allocator.free(ids);
++    for (ids, 0..) |*id, i| id.* = @intCast(ids.len - 1 - i);
++    for (0..2) |rank| {
++        w.share = try glm.shard.Share.of(&w.config, rank, 2);
++        for ([_]bool{ false, true }) |paged| {
++            var st = if (paged)
++                try glm.forward.State.initPagedFormat(t.allocator, &d, &w, capacity, .{ .kv = 1 << 55, .pages = glm.pages.tableLen(capacity), .page_bytes = glm.state.pageBytesOf(&w, true, false) }, true, false)
++            else
++                try glm.forward.State.initFormat(t.allocator, &d, &w, capacity, true);
++            defer st.deinit();
++            if (paged) {
++                // initPagedFormat starts with capacity=0 until pages are mapped.
++                st.pages = ids;
++                st.capacity = capacity;
++            }
++            const saved = try t.allocator.alloc(u1, st.kda_layers);
++            defer t.allocator.free(saved);
++            for (saved, st.cur, 0..) |*s, *cur, i| {
++                s.* = @truncate(i);
++                cur.* = 1 - s.*;
++            }
++            const bank = st.kda_layers * st.rec_layer;
++            try t.expectEqual(@as(usize, 68 << 20), bank);
++            for ([_]usize{ 8192, 32768, 131072 }) |at| for ([_]CompactProbe.packing.Format{.committed}) |format| {
++                const p = try CompactProbe.packing.plan(&st, &w.config, at, null, format, saved);
++                const original = try glm.snapshots.layout.Plan.size(&st, &w.config, capacity, at, null, 0);
++                const scratch: usize = if (format == .committed) @intCast(CompactProbe.first(&st) - st.proj) else 0;
++                try t.expectEqual(original - bank - scratch, p.len);
++                for (saved, 0..) |parity, i| try t.expectEqual(st.rec + (@as(usize, parity) * st.kda_layers + i) * st.rec_layer, p.parts[i + 1].live);
++            };
++        }
++    }
++}
++
++test "GLM compact snapshots: configured owner refuses sharing, sharding and non-TP2" {
++    var d = rec.init();
++    var f: Fixture = undefined;
++    try f.initFormat(&d, 0, 2, false, true);
++    defer f.deinit();
++    try f.mark(4096, 0, 31);
++    try f.e.prepareSnapshots(2 * f.e.stateBytes(4096));
++    const spare = f.e.snap_pages.?.spare();
++    f.e.settings.snapshot_committed = true;
++    f.e.share_pages = true;
++    try t.expectError(error.SnapshotConfiguration, f.e.keepAs(1));
++    f.e.share_pages = false;
++    f.e.share.world = 1;
++    try t.expectError(error.SnapshotConfiguration, f.e.keepAs(1));
++    f.e.share.world = 2;
++    f.e.settings.kv_shard.on = true;
++    try t.expectError(error.SnapshotConfiguration, f.e.keepAs(1));
++    f.e.settings.kv_shard.on = false;
++    try t.expectEqual(spare, f.e.snap_pages.?.spare());
++    try f.e.keepAs(1);
++    try t.expectEqual(@as(u8, 2), f.e.snaps.get(1).?.format);
++    f.e.settings.snapshot_committed = false;
++    try f.e.restoreState(1); // the saved format, not the current setting, chooses the plan
++}
++
++test "TF_GLM_SNAPSHOT_FORMAT: defaults, parsing, sharding refusal and rank agreement" {
++    const Reader = struct {
++        fn absent(_: [:0]const u8) ?[]const u8 {
++            return null;
++        }
++        fn on(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_SNAPSHOT_FORMAT")) "committed" else null;
++        }
++        fn legacy(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_SNAPSHOT_FORMAT")) "legacy" else null;
++        }
++        fn bad(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_SNAPSHOT_FORMAT")) "comitted" else null;
++        }
++        fn sharded(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_KV_SHARD")) "1" else on(key);
++        }
++    };
++    var problem: []const u8 = "";
++    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).snapshot_committed);
++    try std.testing.expect(!(try Settings.read(Reader.legacy, &problem)).snapshot_committed);
++    const on = try Settings.read(Reader.on, &problem);
++    try std.testing.expect(on.snapshot_committed);
++    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
++    try std.testing.expectEqualStrings("TF_GLM_SNAPSHOT_FORMAT: legacy or committed", problem);
++    try std.testing.expectError(error.BadSetting, Settings.read(Reader.sharded, &problem));
++    try std.testing.expectEqualStrings("TF_GLM_SNAPSHOT_FORMAT=committed requires TF_GLM_KV_SHARD=0", problem);
++    var all = [_]Fingerprint{
++        Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)),
++        Fingerprint.of(2, 1, on, 8192, true, @splat(0), @splat(0), @splat(0)),
++    };
++    try std.testing.expectEqual(Mismatch{ .field = .snapshot_committed, .rank = 1 }, mismatch(&all).?);
++    all[0] = Fingerprint.of(2, 0, on, 8192, true, @splat(0), @splat(0), @splat(0));
++    try std.testing.expect(mismatch(&all) == null);
++}
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index b8353afba..ffc7d0671 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -149,6 +149,7 @@ pub const Engine = struct {
+         if (o.vision) |lim| ranks.mediaFingerprint(&fp, lim);
+         fp.mtp += @intFromBool(o.drafter);
+         try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
++        if (o.settings.snapshot_committed and world != 2) return error.SnapshotConfiguration;
+         try ranks.probeStart(d, lib, comm, stream, o.settings, rank, world);
+         // TF_GLM_KV_SHARD's refusals, alike on every rank from the agreed fingerprint, before anything loads
+         try kv_shard.refuse(o.settings.kv_shard, .{ .world = world, .kv8 = o.settings.kv8, .pages = o.settings.pages, .mtp_drafts = o.mtp and !o.drafter });
+diff --git a/zig/src/families/glm/cuda_engine_types.zig b/zig/src/families/glm/cuda_engine_types.zig
+index 2c6c7ba31..c2df0ca83 100644
+--- a/zig/src/families/glm/cuda_engine_types.zig
++++ b/zig/src/families/glm/cuda_engine_types.zig
+@@ -23,7 +23,7 @@ pub const Seq = struct {
+ };
+ 
+ /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
+-pub const Snap = struct { lease: @import("cuda_snapshot_pages.zig").Lease, len: usize, pos: usize, mtp_len: usize, cur: []u1, bases: [2]usize, shared: usize = 0, home: ?u8 = null };
++pub const Snap = struct { lease: @import("cuda_snapshot_pages.zig").Lease, len: usize, pos: usize, mtp_len: usize, cur: []u1, bases: [2]usize, shared: usize = 0, format: u8 = 0, home: ?u8 = null };
+ 
+ /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a cold pass's cut (cuda_prompt_cuts).
+ pub const Resume = struct { id: u64, at: usize };
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index dc761a368..7ad7c8171 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -30,6 +30,7 @@ pub const Settings = struct {
+     kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
+     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
+     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
++    snapshot_committed: bool = false, // in-memory per-layer live KDA state without replay scratch
+     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
+     kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
+ 
+@@ -188,6 +189,21 @@ pub const Settings = struct {
+             problem.* = "TF_GLM_KDA_PAD=1 requires TF_GLM_MM=1 (glm_mm is what reads the padded rows)";
+             return error.BadSetting;
+         }
++        const fmt = @import("sys").environment.value(u8, "TF_GLM_SNAPSHOT_FORMAT", get("TF_GLM_SNAPSHOT_FORMAT"), 0) catch {
++            problem.* = "TF_GLM_SNAPSHOT_FORMAT: legacy or committed";
++            return error.BadSetting;
++        };
++        s.snapshot_committed = fmt == 1;
++        if (s.snapshot_committed and s.kv_shard.on) {
++            problem.* = "TF_GLM_SNAPSHOT_FORMAT=committed requires TF_GLM_KV_SHARD=0";
++            return error.BadSetting;
++        }
++        if (s.snapshot_committed) if (get("TF_KV_SHARE")) |v| {
++            if ((std.fmt.parseInt(usize, v, 10) catch 1) != 0) {
++                problem.* = "TF_GLM_SNAPSHOT_FORMAT=committed requires TF_KV_SHARE=0";
++                return error.BadSetting;
++            }
++        };
+         return s;
+     }
+ };
+@@ -213,7 +229,7 @@ fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
+ 
+ /// What every rank must agree on, as bytes the communicator carries.
+ pub const Fingerprint = extern struct {
+-    layout: u32 = 22, // this struct's version (21 had no kv_shard words)
++    layout: u32 = 23, // version 22 had no snapshot format
+     world: u32,
+     rank: u32,
+     kv8: u32 = 0,
+@@ -223,6 +239,7 @@ pub const Fingerprint = extern struct {
+     split: u32, // TF_GLM_PREFILL_REDUCE: 0 gather, 1 split, 2 ring
+     kda_wide: u32,
+     kda_pad: u32 = 0, // TF_GLM_KDA_PAD: every rank's KDA input rows carry one width
++    snapshot_committed: u32 = 0,
+     kv_live_half: u32 = 0, // TF_GLM_KV_LIVE_HALF: every rank keeps the live KDA half alone (1) or the head whole (0)
+     pieces: u32,
+     pair: u32, // TF_GLM_PROMPT_PAIR: rank 0's paired steps need the second chunk's buffers on every rank
+@@ -261,6 +278,7 @@ pub const Fingerprint = extern struct {
+         kda_wide,
+         kda_pad,
+         kv_live_half,
++        snapshot_committed,
+         pieces,
+         pair,
+         layers,
+@@ -307,6 +325,7 @@ pub const Fingerprint = extern struct {
+             .split = if (!s.split) 0 else if (s.ring) 2 else 1,
+             .kda_wide = @intFromBool(s.kda_wide),
+             .kda_pad = @intFromBool(s.kda_pad),
++            .snapshot_committed = @intFromBool(s.snapshot_committed),
+             .kv_live_half = @intFromBool(s.kv_live_half),
+             .pieces = s.pieces,
+             .pair = @intFromBool(s.pair),
+@@ -349,6 +368,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+             "kda_wide",
+             "kda_pad",
+             "kv_live_half",
++            "snapshot_committed",
+             "pieces",
+             "pair",
+             "layers",
+@@ -474,6 +494,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
+         .split => "TF_GLM_PREFILL_REDUCE",
+         .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
+         .kda_pad => "TF_GLM_KDA_PAD",
++        .snapshot_committed => "TF_GLM_SNAPSHOT_FORMAT",
+         .kv_live_half => "TF_GLM_KV_LIVE_HALF",
+         .pieces => "TF_GLM_OVERLAP_PIECES",
+         .pair => "TF_GLM_PROMPT_PAIR",
+diff --git a/zig/src/families/glm/cuda_snapshot_compact.zig b/zig/src/families/glm/cuda_snapshot_compact.zig
+new file mode 100644
+index 000000000..012459dba
+--- /dev/null
++++ b/zig/src/families/glm/cuda_snapshot_compact.zig
+@@ -0,0 +1,77 @@
++//! Opt-in committed-state packing. Live layout and tensor precision stay unchanged.
++//! The caller must enforce pending==0 when saving. Restores must supply the SAVED cur.
++const std = @import("std");
++const State = @import("cuda_state.zig").State;
++const Config = @import("config.zig").Config;
++const layout = @import("cuda_snapshot_layout.zig");
++
++pub const Format = enum(u8) { legacy = 0, committed = 2, _ };
++
++pub fn selected() !Format {
++    return if (try @import("sys").environment.value(u8, "TF_GLM_SNAPSHOT_FORMAT", @import("profile").lookup("TF_GLM_SNAPSHOT_FORMAT"), 0) == 1) .committed else .legacy;
++}
++
++const Header = struct { first: u64, rec_end: u64, bank: usize };
++
++fn check(format: Format) !void {
++    switch (format) {
++        .legacy, .committed => {},
++        else => return error.SnapshotFormat,
++    }
++}
++
++fn header(st: *const State) !Header {
++    if (st.cur.len != st.kda_layers or st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;
++    const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
++    const bank = try std.math.mul(usize, st.kda_layers, st.rec_layer);
++    const rec_end = try std.math.add(u64, st.rec, try std.math.mul(usize, bank, 2));
++    const arena_end = try std.math.add(u64, st.arena.buf.ptr, st.arena.buf.len);
++    if (st.rec < st.arena.buf.ptr or rec_end > st.proj or st.proj > first or first > arena_end) return error.SnapshotShape;
++    return .{ .first = first, .rec_end = rec_end, .bank = bank };
++}
++
++pub fn size(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, format: Format) !usize {
++    try check(format);
++    const n = try layout.Plan.sizeWithHalf(st, c, capacity, at, head, 0, null);
++    if (format == .legacy) return layout.Plan.size(st, c, capacity, at, head, 0);
++    const h = try header(st);
++    const skipped = try std.math.add(usize, h.bank, if (format == .committed) @intCast(h.first - st.proj) else 0);
++    return try std.math.sub(usize, n, skipped);
++}
++
++fn add(p: *layout.Plan, part: layout.Part) !void {
++    if (part.len == 0) return;
++    if (p.count == p.parts.len) return error.SnapshotShape;
++    p.len = try std.math.add(usize, p.len, part.len);
++    p.parts[p.count] = part;
++    p.count += 1;
++}
++
++pub fn plan(st: *const State, c: *const Config, at: usize, head: ?usize, format: Format, saved_cur: []const u1) !layout.Plan {
++    try check(format);
++    const original = try layout.Plan.withHalf(st, c, at, head, 0, null);
++    if (format == .legacy) return layout.Plan.initFor(st, c, at, head, 0, saved_cur);
++    const h = try header(st);
++    if (saved_cur.len != st.kda_layers or original.count == 0) return error.SnapshotShape;
++    const first = original.parts[0];
++    if (first.span != 0 or first.live != st.arena.buf.ptr or first.len != h.first - st.arena.buf.ptr) return error.SnapshotShape;
++    var p = original; // retain the owner's page tables and latent metadata
++    p.count = 0;
++    p.part_lat = @splat(false);
++    p.len = 0;
++    // Position, convolution and their original alignment precede both banks.
++    try add(&p, .{ .live = first.live, .len = @intCast(st.rec - first.live) });
++    for (saved_cur, 0..) |cur, li| try add(&p, .{ .live = st.recAt(cur, li), .len = st.rec_layer });
++    // Keep padding between the banks and projection, even when replay is omitted.
++    const tail_end = if (format == .committed) st.proj else h.first;
++    try add(&p, .{ .live = h.rec_end, .len = @intCast(tail_end - h.rec_end) });
++    // Latent codes/scales, DSA rings/pooled keys, MTP metadata and prompt hidden
++    // use the original owner's parts and page mapping, without reinterpretation.
++    for (original.parts[1..original.count], 1..) |part, i| {
++        p.part_lat[p.count] = original.part_lat[i];
++        try add(&p, part);
++    }
++    const expected = try size(st, c, st.capacity, at, head, format);
++    if (p.len != expected) return error.SnapshotSize;
++    return p;
++}
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index c3297a77b..863a805a9 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -69,6 +69,13 @@ pub const Plan = struct {
+         return (try make(&whole, c, at, head, shared, true, halfOf(st.cur, st.kda_layers, liveHalfEnabled()), latent)).len;
+     }
+ 
++    /// Count a specific packing independently of the live-half environment setting.
++    pub fn sizeWithHalf(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, shared: usize, half: ?u1) !usize {
++        var whole = st.*;
++        whole.capacity = capacity;
++        return (try make(&whole, c, at, head, shared, true, half, true)).len;
++    }
++
+     fn make(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, sizing: bool, half: ?u1, latent: bool) !Plan {
+         if (at > st.capacity or st.caches.len > @import("config.zig").max_layers) return error.SnapshotShape;
+         if (st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 0ffc03c35..60646ebee 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const types = @import("cuda_engine_types.zig");
+ pub const pages = @import("cuda_snapshot_pages.zig");
++pub const compact = @import("cuda_snapshot_compact.zig");
+ pub const layout = @import("cuda_snapshot_layout.zig");
+ const kv_keep = @import("cuda_kv_shard_keep.zig");
+ const kvs = @import("cuda_kv_shard.zig");
+@@ -32,9 +33,16 @@ pub fn agree(e: anytype, budget: u64) !void {
+ }
+ 
+ pub fn bytes(e: anytype, at: usize) u64 {
++    return bytesFormat(e, at, if (e.settings.snapshot_committed) .committed else .legacy);
++}
++
++pub fn bytesFormat(e: anytype, at: usize, format: compact.Format) u64 {
+     const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64)) else null;
+     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
+-    const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at)) catch return std.math.maxInt(u64);
++    const n = (if (format == .legacy)
++        layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at))
++    else
++        compact.size(&e.cur.st, &e.c, e.capacity, at, head, format)) catch return std.math.maxInt(u64);
+     return pages.rounded(n) catch std.math.maxInt(u64);
+ }
+ 
+@@ -47,7 +55,21 @@ pub fn keep(e: anytype) !u64 {
+     return id;
+ }
+ 
++fn admit(e: anytype, format: compact.Format) !void {
++    switch (format) {
++        .legacy => {},
++        .committed => if (e.settings.kv_shard.on or e.share_pages or e.share.world != 2) return error.SnapshotConfiguration,
++        else => return error.SnapshotFormat,
++    }
++}
++
+ pub fn keepAs(e: anytype, id: u64) !void {
++    return keepAsFormat(e, id, if (e.settings.snapshot_committed) .committed else .legacy);
++}
++
++/// Explicit selection for owner tests; serving uses the rank-agreed setting.
++pub fn keepAsFormat(e: anytype, id: u64, format: compact.Format) !void {
++    try admit(e, format);
+     if (e.snaps.contains(id)) return error.StateKept;
+     if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").window_rows)
+         return error.NotAtMark;
+@@ -57,7 +79,10 @@ pub fn keepAs(e: anytype, id: u64) !void {
+     const shared = heldPages(e, e.cur.st.pos);
+     // TF_GLM_KV_SHARD: the latent rows on their owner's copy alone; every rank leases the whole state's bytes
+     const own = kv_keep.keepsLatent(hold, e.share.rank);
+-    const plan = try layout.Plan.initSharded(&e.cur.st, &e.c, e.cur.st.pos, head, shared, e.cur.st.cur, own);
++    const plan = if (format == .legacy)
++        try layout.Plan.initSharded(&e.cur.st, &e.c, e.cur.st.pos, head, shared, e.cur.st.cur, own)
++    else
++        try compact.plan(&e.cur.st, &e.c, e.cur.st.pos, head, format, e.cur.st.cur);
+     const latent_bytes = if (own) 0 else (try layout.Plan.initSharded(&e.cur.st, &e.c, e.cur.st.pos, head, shared, e.cur.st.cur, true)).len - plan.len;
+     var lease = try pool.take(plan.len + latent_bytes);
+     errdefer {
+@@ -68,7 +93,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
+     errdefer e.gpa.free(cur);
+     try pool.move(e.stream, &lease, &plan, true);
+     try e.stream.synchronize();
+-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared, .home = if (hold) |h| h.owner else null });
++    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared, .format = @backingInt(format), .home = if (hold) |h| h.owner else null });
+ }
+ 
+ pub fn restore(e: anytype, id: u64) !void {
+@@ -78,7 +103,12 @@ pub fn restore(e: anytype, id: u64) !void {
+     const home: ?u8 = if (e.settings.kv_shard.on) s.home else null;
+     const own = if (home) |h| h == e.share.rank else true; // this rank's copy holds the latent rows
+     // the kept state's own parity picks the half a live-half keep carries; the slot's dead half stays as it is
+-    const plan = try layout.Plan.initSharded(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, s.cur, own);
++    const format: compact.Format = @fromBackingInt(s.format);
++    try admit(e, format);
++    const plan = if (format == .legacy)
++        try layout.Plan.initSharded(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, s.cur, own)
++    else
++        try compact.plan(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, format, s.cur);
+     if (plan.len != s.len) return error.SnapshotSize;
+     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
+     try pool.moveParts(e.stream, &s.lease, &plan, false, !own or kv_keep.restoresLatent(home, hold, e.share.rank));
+diff --git a/zig/src/native/cuda_refusal.zig b/zig/src/native/cuda_refusal.zig
+index 070dd3294..257bf85bd 100644
+--- a/zig/src/native/cuda_refusal.zig
++++ b/zig/src/native/cuda_refusal.zig
+@@ -61,6 +61,15 @@ pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
+         if (@hasDecl(F, "drafter_refusal")) return F.drafter_refusal; // a family without an MTP head says so itself
+         return "--drafter loads a separate drafter, and this CUDA family drafts with its own MTP head: serve without --drafter";
+     }
++    if (F == @import("glm_cuda").native) {
++        const format = @import("glm_cuda").snapshots.compact.selected() catch return "TF_GLM_SNAPSHOT_FORMAT: legacy or committed";
++        if (format == .committed) {
++            if (o.learn_conversations) return "TF_GLM_SNAPSHOT_FORMAT=committed is an in-memory format: disable --learn-conversations";
++            // GLM obtains its communicator from the environment, not api.Open.tp.
++            const p = F.place() catch return "TF_GLM_SNAPSHOT_FORMAT=committed requires valid TF_GLM_RANK and TF_GLM_WORLD=2";
++            if (p.world != 2) return "TF_GLM_SNAPSHOT_FORMAT=committed requires TF_GLM_WORLD=2";
++        }
++    }
+     if (o.learn_conversations and F != nemotron.native and @import("cuda_disk.zig").keptDisk(F) == null) return "--learn-conversations keeps conversation states on disk for Nemotron, the Qwen hybrids, Flash Next, Gemma 4, Dory and Spark2.5 only on CUDA: serve this model without it";
+     if (o.learn_conversations and o.tp > 1) if (@import("cuda_disk.zig").keptDisk(F)) |K| if (@hasDecl(K, "one_rank") and K.one_rank) return "--learn-conversations keeps one rank's states on disk for this CUDA family: serve without --tp or without --learn-conversations";
+     if (o.kv8 and !(@hasDecl(F, "Options") and @hasField(F.Options, "kv8"))) return "--kv-cache fp8: this CUDA family keeps bf16 caches; serve without it";
+@@ -83,6 +92,46 @@ fn qwen35Tp(comptime F: type, o: api.Open) ?[]const u8 {
+     return if (o.learn_conversations) qwen35_learn_ranks else qwen35_plan_only;
+ }
+ 
++test "CUDA disk open: compact GLM admission uses the actual environment rank and refuses disk learning" {
++    const env = struct {
++        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
++        extern "c" fn unsetenv([*:0]const u8) c_int;
++    };
++    const keys = [_][:0]const u8{ "TF_GLM_SNAPSHOT_FORMAT", "TF_GLM_WORLD", "TF_GLM_RANK" };
++    var saved: [keys.len]?[:0]u8 = @splat(null);
++    defer for (keys, saved) |key, value| {
++        if (value) |v| {
++            _ = env.setenv(key, v, 1);
++            std.testing.allocator.free(v);
++        } else _ = env.unsetenv(key);
++    };
++    for (keys, &saved) |key, *value| {
++        if (std.c.getenv(key)) |v| value.* = try std.testing.allocator.dupeSentinel(u8, std.mem.span(v), 0);
++    }
++    const F = @import("glm_cuda").native;
++    const o: api.Open = .{ .dir = "d", .model_type = glm_model_type }; // generic --tp defaults to 1
++    _ = env.setenv(keys[0], "committed", 1);
++    _ = env.setenv(keys[1], "2", 1);
++    for ([_][:0]const u8{ "0", "1" }) |rank| {
++        _ = env.setenv(keys[2], rank, 1);
++        try std.testing.expect(family(F, o) == null);
++    }
++    var disk = o;
++    disk.learn_conversations = true;
++    try std.testing.expectStringStartsWith(family(F, disk) orelse "", "TF_GLM_SNAPSHOT_FORMAT=committed is an in-memory format");
++    for ([_][:0]const u8{ "1", "3", "invalid" }) |world| {
++        _ = env.setenv(keys[1], world, 1);
++        try std.testing.expect(family(F, o) != null);
++    }
++    _ = env.setenv(keys[1], "2", 1);
++    _ = env.setenv(keys[2], "2", 1);
++    try std.testing.expect(family(F, o) != null);
++    _ = env.unsetenv(keys[2]);
++    try std.testing.expect(family(F, o) != null);
++    _ = env.setenv(keys[0], "legacy", 1);
++    try std.testing.expect(family(F, o) == null);
++}
++
+ test "a family must consume rank options before tensor parallelism is admitted" {
+     const Single = struct {
+         pub const Options = struct { context: usize };
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 8809e92f9..7a7603998 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -31,6 +31,7 @@ pub fn isReal(kind: Kind) bool {
+ }
+ 
+ pub const rules = [_]Rule{
++    .{ .name = "TF_GLM_SNAPSHOT_FORMAT", .scope = .glm, .kind = .word, .words = &.{ "legacy", "committed" }, .forms = "legacy or committed" },
+     .{ .name = "TF_CACHE_EVICT", .scope = .common, .kind = .word, .words = &.{ "main", "decayed_resume" }, .forms = "main or decayed_resume (default main)" },
+     .{ .name = "TF_FLASHNEXT_BATCH_DRAWS", .scope = .cuda, .kind = .flag, .blank_default = false, .forms = "0 or 1 (0 restores per-stream Flash Next row draws; default 1)" },
+     .{ .name = "TF_STARTUP_RECEIPT", .scope = .common, .kind = .flag, .forms = "0 or 1 (opt-in startup and first completion receipts)" },
+diff --git a/zig/test_support/glm_snap_fixture.zig b/zig/test_support/glm_snap_fixture.zig
+index 8490e04d8..7f02ac8f7 100644
+--- a/zig/test_support/glm_snap_fixture.zig
++++ b/zig/test_support/glm_snap_fixture.zig
+@@ -22,6 +22,8 @@ pub const Fixture = struct {
+         w.layers = &layers;
+         f.seq = .{ .st = try glm.forward.State.initFormat(t.allocator, d, &w, 16448, kv8) };
+         f.e = undefined;
++        f.e.settings = .{};
++        f.e.share_pages = false;
+         f.e.cur = &f.seq;
+         f.e.gpa = t.allocator;
+         f.e.d = d;

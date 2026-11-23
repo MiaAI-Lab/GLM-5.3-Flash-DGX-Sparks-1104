@@ -23,6 +23,7 @@ check 'decimal zero learn budget' accepted TF_GLM_SNAPSHOT_FORMAT=committed LEAR
 check 'disk learning refused' refused TF_GLM_SNAPSHOT_FORMAT=committed LEARN_GIB=1
 check 'fractional disk learning refused' refused TF_GLM_SNAPSHOT_FORMAT=committed LEARN_GIB=0.1
 check 'KV sharding refused' refused TF_GLM_SNAPSHOT_FORMAT=committed KV_SHARD=1
+check 'shared pages refused' refused TF_GLM_SNAPSHOT_FORMAT=committed TF_KV_SHARE=1
 check 'four ranks refused' refused TF_GLM_SNAPSHOT_FORMAT=committed TP=4
 check 'one rank refused' refused TF_GLM_SNAPSHOT_FORMAT=committed TP=1
 check 'typo refused' refused TF_GLM_SNAPSHOT_FORMAT=comitted
