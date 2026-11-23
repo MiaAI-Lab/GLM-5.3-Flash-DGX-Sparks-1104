@@ -1,0 +1,188 @@
+From f8730c858af3518e346bb5e7bd9fa10449cee389 Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 07:46:26 +0900
+Subject: [PATCH] glm cuda: the prompt chunk's E4M3 keys load eight bytes at a
+ time
+
+chunks_wide's E4M3 path reads one code byte per load inside load_kv. Each
+thread's eight codes come in one 8-byte load now, a tile's loads are issued
+before any is converted, and the loop fetches tile + 2 while the current
+tile's math runs. The conversion is the same cvt -> fmul -> bf16 sequence,
+value for value, so neither the arithmetic nor the store order changes. The
+byte-at-a-time path is removed rather than left behind, and the FP8-only
+pieces sit behind if constexpr so the BF16 instances compile what they
+compiled before.
+
+The loads are ordinary loads rather than __ldg: these rows come from an
+earlier grid, and glm_pdl.cuh asks a kernel that reads what an earlier grid
+wrote to read it coherently.
+
+CHUNK_THREADS = 256 comes with it, and two static_asserts hold the E4M3 tile
+split to it.
+
+Measured on one GB10 pair, KV=fp8 with the page pool, L2PF=1, three cold
+prefill runs per size (medians): 16K 1209.2 -> 1290.5 tok/s (+6.7%), 64K
+1226.9 -> 1309.1 (+6.7%). Single runs: decode 37.72/48.59 -> 38.32/49.50,
+mixed 50K prompt 60.65 -> 56.78 s, greedy token hashes identical.
+---
+ zig/kernels/cuda/common/mla.cuh | 101 ++++++++++++++++++++++----------
+ 1 file changed, 71 insertions(+), 30 deletions(-)
+
+diff --git a/zig/kernels/cuda/common/mla.cuh b/zig/kernels/cuda/common/mla.cuh
+index fb535d0..4ebee84 100644
+--- a/zig/kernels/cuda/common/mla.cuh
++++ b/zig/kernels/cuda/common/mla.cuh
+@@ -7,6 +7,8 @@
+ namespace glm_attn {
+ 
+ constexpr int LW = 512, KT = 32, CH = 512, KPAD = LW + 8;
++/// The block the chunk kernels launch with (cuda_latent's 256); the tile split assumes it.
++constexpr int CHUNK_THREADS = 256;
+ 
+ // p fp32 summed as Triton's tile does: a thread's two columns, the quad (xor 2, 1), then warps (w0 + w2) + (w1 + w3).
+ __device__ __forceinline__ float quad_sum(float v) {
+@@ -55,6 +57,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   static_assert(!(SPLIT && FP8), "a split cache holds BF16 rows");
+   static_assert(!(PAGED8 && !FP8), "PAGED8 requires FP8");
+   constexpr int MT = HB / 16, KW = LW + RW;
++  static_assert(!FP8 || KW % 8 == 0, "an E4M3 row is whole 8-code units");
++  static_assert(!FP8 || (KT * (KW / 8)) % CHUNK_THREADS == 0, "the E4M3 tile split assumes the block divides KT * KW / 8");
+   extern __shared__ __align__(16) unsigned char smem[];
+   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
+   __nv_bfloat16* kvs = qs + HB * KW;
+@@ -70,6 +74,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
+   const __nv_bfloat16* paged = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * KW) : lc;
+   const __nv_bfloat16* keys_at = SPLIT ? lc + (c * CH - start) * KW : paged;
++  // E4M3 rows load eight bytes at a time; every page and scale row this kernel addresses is a multiple of 8 bytes.
+   const unsigned char* codes8 = reinterpret_cast<const unsigned char*>(lc);
+   const float* scales8 = scales;
+   if constexpr (PAGED8) {
+@@ -79,43 +84,72 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+       scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) - start;
+     }
+   }
+-  auto load_kv = [&](int tile) {
+-    __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
+-    const int64_t first = start + tile * KT;
+-    for (int idx = t; idx < KT * (KW / 8); idx += blockDim.x) {
+-      const int key = idx / (KW / 8), u = idx % (KW / 8);
+-      const int64_t ki = first + key;
+-      const bool ok = sparse ? ki < n : ki <= limit;
+-      const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+-      if constexpr (FP8) {
+-        const unsigned char* code_base = codes8;
+-        int64_t code_row = src;
+-        float row_scale = 1.0f;
+-        if constexpr (PAGED8) {
+-          if (sparse) {
+-            const int s = ok ? (int)src : 0;
++  // E4M3 tiles: a thread's eight codes in one 8-byte load, all issued before any is converted; tile + 2 is prefetched.
++  constexpr int UPT = KT * (KW / 8) / CHUNK_THREADS;  // units a thread moves a tile
++  uint2 raw[FP8 ? UPT : 1];
++  float rsc[FP8 ? UPT : 1];
++  auto fetch8 = [&](int tile) {
++    if constexpr (FP8) {
++      const int64_t first = start + tile * KT;
++      if constexpr (PAGED8) {
++        if (sparse) {
++          const unsigned char* scale_bytes = reinterpret_cast<const unsigned char*>(scales);
++  #pragma unroll
++          for (int i = 0; i < UPT; ++i) {
++            const int idx = t + i * CHUNK_THREADS, key = idx / (KW / 8), u = idx % (KW / 8);
++            const int64_t ki = first + key;
++            const bool ok = ki < n;
++            const int s = ok ? tok[r * w + ki] : 0;
+             const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;
+             const int row = s & (CH - 1);
+-            code_base = codes8 + page;
+-            code_row = row;
+-            row_scale = ok ? *reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page + row * 4) : 1.0f;
+-          } else {
+-            row_scale = ok ? scales8[src] : 1.0f;
++            raw[i] = ok ? *reinterpret_cast<const uint2*>(codes8 + page + (row * KW + u * 8)) : make_uint2(0u, 0u);
++            rsc[i] = ok ? *reinterpret_cast<const float*>(scale_bytes + page + row * 4) : 1.0f;
+           }
+-        } else {
+-          row_scale = ok ? scales8[src] : 1.0f;
++          return;
+         }
+-#pragma unroll
++      }
++  #pragma unroll
++      for (int i = 0; i < UPT; ++i) {
++        const int idx = t + i * CHUNK_THREADS, key = idx / (KW / 8), u = idx % (KW / 8);
++        const int64_t ki = first + key;
++        const bool ok = sparse ? ki < n : ki <= limit;
++        const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
++        raw[i] = ok ? *reinterpret_cast<const uint2*>(codes8 + src * KW + u * 8) : make_uint2(0u, 0u);
++        rsc[i] = ok ? scales8[src] : 1.0f;
++      }
++      }
++};
++  auto store8 = [&](int tile) {
++    if constexpr (FP8) {
++      __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
++  #pragma unroll
++      for (int i = 0; i < UPT; ++i) {
++        const int idx = t + i * CHUNK_THREADS, key = idx / (KW / 8), u = idx % (KW / 8);
++        const uint32_t wv[2] = {raw[i].x, raw[i].y};
++  #pragma unroll
+         for (int j = 0; j < 8; j += 2) {
+-          const uint16_t bits = ok ? (uint16_t)code_base[code_row * LW + u * 8 + j] |
+-                                        ((uint16_t)code_base[code_row * LW + u * 8 + j + 1] << 8) : 0;
++          const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);
+           const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+-          dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
+-          dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
++          dst[wide<KW>(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
++          dst[wide<KW>(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
+         }
+-      } else {
+-        cp16(dst + wide<KW>(key, u), keys_at + src * KW + u * 8, ok);
+       }
++      }
++};
++  auto load_kv = [&](int tile) {
++    if constexpr (FP8) {
++      fetch8(tile);
++      store8(tile);
++      return;
++    }
++    __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
++    const int64_t first = start + tile * KT;
++    for (int idx = t; idx < KT * (KW / 8); idx += blockDim.x) {
++      const int key = idx / (KW / 8), u = idx % (KW / 8);
++      const int64_t ki = first + key;
++      const bool ok = sparse ? ki < n : ki <= limit;
++      const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
++      cp16(dst + wide<KW>(key, u), keys_at + src * KW + u * 8, ok);
+     }
+   };
+   float m[MT][2], l[MT][2], o[MT][8][4];
+@@ -146,6 +180,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+         wait<0>();
+     }
+     __syncthreads();
++    if constexpr (FP8) {
++      if (tile + 2 < tiles) fetch8(tile + 2);  // in flight during this tile's math
++    }
+     const __nv_bfloat16* kv = kvs + (tile & 1) * KT * KW;
+     const int64_t first = start + tile * KT;
+     float sc[4];
+@@ -227,7 +264,11 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+     __syncthreads();
+     for (int i = 0; i < MT; ++i)
+       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
+-    if (tile + 2 < tiles) load_kv(tile + 2);
++    if constexpr (FP8) {
++      if (tile + 2 < tiles) store8(tile + 2);
++    } else if (tile + 2 < tiles) {
++      load_kv(tile + 2);
++    }
+     commit();
+   }
+   for (int i = 0; i < MT; ++i)
+-- 
+2.43.0
+
