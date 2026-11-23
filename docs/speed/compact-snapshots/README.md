@@ -1,4 +1,4 @@
-> Historical measurement: the timing, size, and request receipts below used TensorFold `f350cd3e` and the former 122-patch stack. The current PR uses TensorFold `81de26f6` plus `0001`–`0017`; those older measurements do not establish performance or output equivalence on 1.3.0. See the PR validation report for current evidence.
+> Historical measurement: the timing, size, and request receipts below used TensorFold `f350cd3e` and the former 122-patch stack. The current PR uses TensorFold `81de26f6` plus `0001`–`0017`; those older measurements do not establish performance or output equivalence on 1.3.0. See [current validation](validation-2026-11-23.md) for new evidence.
 
 # Compact committed prompt snapshots
 

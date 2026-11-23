@@ -1,0 +1,11 @@
+# TensorFold 1.3.0 compact snapshot validation (2026-11-23)
+
+The recipe pin is TensorFold `81de26f649677aa72ae0034d4af6e010cd947038` with patches `0001`–`0017` applied in order. All 17 applied without rejects in a clean checkout. Zig 0.17.0 and CUDA 13.3 built the native `sm_121` executable on a DGX Spark; its SHA-256 was `d2d1fe754bcbade0859a6aeca322e32730447736788cf4e4802343b4b7a7263e`. Both test ranks used that executable on GB10 GPUs at TP2. The validation used the same checkpoint, template, FP8 KV, DFlash2 settings, and command line across arms, except for the prompt cache budget and `TF_GLM_SNAPSHOT_FORMAT`.
+
+Host checks on the patched tree passed: the original snapshot suite 23/23, compact snapshot owner and rank-agreement suite 6/6, and CUDA disk-open suite 15/15. The recipe script suite passed, including 12 compact-format admission cases. The clean source pin plus all 17 patches also passed a second strict application check.
+
+For the device check, three fresh starts ran the same four deterministic chat requests (20, 2,582 and 20,502 prompt tokens; the last request repeats the 20,502-token prompt). Arms were cache off, a 2.5 GiB cache with `legacy`, and a 2.5 GiB cache with `committed`. The full response message and finish reason matched the cache-off reference in all four cases for both cached arms. On the repeated long request, the cache-off arm reported zero cached tokens, while both cached arms reported 20,480 cached tokens. This exercises restore on the running pair and shows that the committed format retained the same output for these requests.
+
+These are correctness checks, not a new performance measurement. The four requests do not establish throughput or latency gains, a full workload matrix, or behavior under `TF_KV_SHARE`, KV sharding, disk learning, or other rank counts. Those combinations are refused by the committed setting. The earlier timing results in [README.md](README.md) remain tied to the retired TensorFold `f350cd3e` stack.
+
+The original two service containers were restarted after the test. Both returned to their original image identity (`sha256:3e062d0898178099e8a1451e24de0e6fb276472f915f0f7449085d509704beb1`); rank 0's `/v1/models` endpoint answered again.
