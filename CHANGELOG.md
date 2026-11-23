@@ -1,5 +1,14 @@
 # Changelog
 
+- **2026-11-23 (fixes)** -- Engine patch `0018`: `tf_glm_lat_write_fp8_paged` copies latent rows that are written
+  earlier in the same pass, but it never opened with `glm_pdl::enter()`, so under PDL it could run before those rows
+  were ready. It opens with the wait now, like every other GLM CUDA kernel. `zig build test-glm-pdl-scan` on
+  `81de26f6` + `0001`-`0016` reports `glm_glue_latent.cuh: tf_glm_lat_write_fp8_paged must open with
+  glm_pdl::enter();` and passes with `0018` added (CPU only). On one GB10 pair at `KV=fp8` with the page pool and
+  `L2PF=1`, three cold runs each: prefill 16K 1,210.6 -> 1,211.4 tok/s, 64K 1,219.9 -> 1,230.3, decode 37.57/48.67
+  -> 37.59/48.79 tok/s, mixed 50K prompt 60.70 -> 60.82 s, greedy token hashes identical. Rebuild the image to pick
+  it up.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the

@@ -1,0 +1,44 @@
+From 88b2ebcd7a1864be16f9799366084fdea4058db2 Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Mon, 23 Nov 2026 14:39:14 +0900
+Subject: [PATCH] glm cuda: tf_glm_lat_write_fp8_paged opens with the PDL wait
+
+0004 added tf_glm_lat_write_fp8_paged and 0006 launches it through cuda_pdl.launch,
+but the kernel never opens with glm_pdl::enter(). Every other GLM kernel does, and
+TensorFold's own scan says why: a dependent launch may start before the grid before it
+retires, so a kernel that reads what that grid wrote has to wait, then read coherently.
+
+The rows this kernel copies are written earlier in the same pass (rmsnorm into lat), and
+the grids in between are PDL launches of their own, so the wait covers the producer
+transitively.
+
+It is a correctness fix, not a speed one, and nothing was timed: with PDL the kernel now
+waits for the grid before it, and through enter() it also triggers its own dependents.
+Without PDL both instructions are no-ops.
+
+On 0001-0016 without this patch, `zig build test-glm-pdl-scan` fails with:
+  glm_glue_latent.cuh: tf_glm_lat_write_fp8_paged must open with glm_pdl::enter();
+With it the scan passes (measured 2026-11-23, CPU only).
+
+It is not part of the fused prompt chunk kernel: every E4M3-page latent write runs it,
+decode included, so it is its own patch.
+
+---
+ zig/kernels/cuda/glm_glue_latent.cuh | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/zig/kernels/cuda/glm_glue_latent.cuh b/zig/kernels/cuda/glm_glue_latent.cuh
+index f9ebbaf..7db8888 100644
+--- a/zig/kernels/cuda/glm_glue_latent.cuh
++++ b/zig/kernels/cuda/glm_glue_latent.cuh
+@@ -105,6 +105,7 @@ extern "C" __global__ void __launch_bounds__(512)
+ extern "C" __global__ void __launch_bounds__(512)
+     tf_glm_lat_write_fp8_paged(const __nv_bfloat16* lat, int64_t stride, unsigned char* cache, float* scales,
+                                const int* pos, const int* pt, int64_t ps) {
++  glm_pdl::enter();  // a dependent launch: the kernel before it writes lat
+   const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+   const int64_t page = (int64_t)pt[at / 512] * ps, row = at % 512;
+   const int d = threadIdx.x;
+-- 
+2.43.0
+
