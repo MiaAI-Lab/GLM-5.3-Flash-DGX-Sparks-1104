@@ -1,5 +1,15 @@
 # Changelog
 
+- **2026-11-23** -- Engine patch `0017`: `chunks_wide`'s E4M3 path loaded one code byte at a time; it now
+  reads a thread's eight codes in one 8-byte load and fetches two tiles ahead, with the same conversion sequence
+  (`cvt` -> `fmul` -> bf16), so the arithmetic and the store order are unchanged. The byte-at-a-time path is removed,
+  and the FP8-only pieces sit behind `if constexpr` so the BF16 instances compile what they compiled before. The
+  reads are ordinary loads, not `__ldg`: the rows come from an earlier grid and `glm_pdl.cuh` asks for a coherent
+  read. `CHUNK_THREADS = 256` comes with it, plus two `static_assert`s that hold the E4M3 tile split to it. On one
+  GB10 pair at `KV=fp8` with the page pool and `L2PF=1`, three cold prefill runs per size (medians): 16K 1,209.2 ->
+  1,290.5 tok/s (+6.7%), 64K 1,226.9 -> 1,309.1 (+6.7%). Single runs: decode 37.72/48.59 -> 38.32/49.50, mixed 50K
+  prompt 60.65 -> 56.78 s, greedy token hashes identical. Rebuild the image to pick it up.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the
