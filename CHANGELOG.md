@@ -1,5 +1,9 @@
 # Changelog
 
+- **2026-11-24** -- Engine patch `0028` adds two EXL3 prompt path counters, logged every 256 calls: prompt calls that
+  took the common prompt kernel, and ones that fell back to the 1,024-row compact path, so the split can be read out
+  of a run's log instead of inferred. Diagnostics only; no arithmetic.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the
