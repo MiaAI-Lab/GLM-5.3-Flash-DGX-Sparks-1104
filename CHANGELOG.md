@@ -1,5 +1,13 @@
 # Changelog
 
+- **2026-11-24** -- Engine patch `0022` raises a prompt chunk from 2048 rows to 4096. The common EXL3 experts decode
+  every expert's weights once a call, and a prompt pass makes one call a chunk, so that decode is a fixed cost
+  amortised over the chunk's rows (288 routed experts over 45 layers); 4096 rows halves it. Exact, not a numerics
+  change: a pair's sums do not depend on which item holds it, so the bits are the same and the ship check is
+  identical greedy replies. The partials sizing `0019` introduces is `nch * min(rows, 512)`, so the wider chunk does
+  not change the partials allocation. Measured on one GB10 pair at 32K, three cold runs per configuration in
+  consecutive windows: 1,353.0 -> 1,422.9 tok/s (+5.2%), on the fused stack (`0019`-`0021`) below it.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the
