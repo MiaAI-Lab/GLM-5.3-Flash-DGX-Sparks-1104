@@ -1,0 +1,142 @@
+From 9351218610606509bc80e979dbde86f64a1f8216 Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 20:17:14 +0900
+Subject: [PATCH] kernel-contract: the six fused prompt-chunk launches
+
+The launches register with .usage = none: the 13.0 receipts are still owed,
+the way glm_kv_paged_records.zig leaves its twins. The five-SM receipts from
+kernel-contract-limits at nvcc 13.3.1 sit in measurements/pending_133.zig, so
+the 13.3 lookup finds them and a release-compiler check compares the release
+numbers instead of these. A test holds each launch against its window twin
+(image, threads, shared bytes, opt-in, bound) and against every SM's limits.
+
+bf16 sits at 123-124 (16-wide) and 211-251 (32-wide) registers, E4M3 at
+128-204 and 248-255, all with no static shared bytes and a 256-thread bound.
+The 32-wide E4M3 forms are at the ceiling on sm_80/sm_89.
+---
+ zig/src/core/contract/glm_fused_records.zig   | 55 +++++++++++++++++++
+ .../contract/measurements/pending_133.zig     |  6 ++
+ zig/src/core/contract/registry.zig            |  1 +
+ zig/src/core/contract/registry_joins.zig      |  3 +-
+ zig/src/families/glm/cuda_kv8_test.zig        |  2 +-
+ 5 files changed, 65 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/core/contract/glm_fused_records.zig
+
+diff --git a/zig/src/core/contract/glm_fused_records.zig b/zig/src/core/contract/glm_fused_records.zig
+new file mode 100644
+index 00000000..5400539a
+--- /dev/null
++++ b/zig/src/core/contract/glm_fused_records.zig
+@@ -0,0 +1,55 @@
++//! GLM's fused prompt-chunk launches: nvcc 13.0's receipts owed, 13.3's in glm_cuda_records.zig.
++//! Each fused launch is its window twin's with the merge folded in: same image, block and shared bytes.
++const std = @import("std");
++const registry = @import("registry.zig");
++const limits = @import("limits.zig");
++
++pub const cuda = [_]registry.CudaRecord{
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_16_fused", .symbol = "tf_glm_chunks_16_fused", .image = "glm_glue", .threads = 256, .dynamic = 83328, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_16_fp8_fused", .symbol = "tf_glm_chunks_16_fp8_fused", .image = "glm_glue", .threads = 256, .dynamic = 83328, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_16_fp8_paged_fused", .symbol = "tf_glm_chunks_16_fp8_paged_fused", .image = "glm_glue", .threads = 256, .dynamic = 83328, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_32_fused", .symbol = "tf_glm_chunks_32_fused", .image = "glm_glue", .threads = 256, .dynamic = 101120, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_32_fp8_fused", .symbol = "tf_glm_chunks_32_fp8_fused", .image = "glm_glue", .threads = 256, .dynamic = 101120, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_32_fp8_paged_fused", .symbol = "tf_glm_chunks_32_fp8_paged_fused", .image = "glm_glue", .threads = 256, .dynamic = 101120, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++};
++
++fn twin(fused: registry.CudaRecord) !registry.CudaRecord {
++    const symbol = fused.launch.symbol[0 .. fused.launch.symbol.len - "_fused".len];
++    for (registry.all_cuda) |r| if (std.mem.eql(u8, r.launch.symbol, symbol)) return r;
++    return error.MissingRecord;
++}
++
++test "GLM fused chunks: 13.0 pending, 13.3's receipts fit every SM, and each launch is its window twin's" {
++    for (cuda) |r| {
++        try std.testing.expect(std.mem.endsWith(u8, r.launch.symbol, "_fused"));
++        try std.testing.expect(std.mem.endsWith(u8, r.launch.name, r.launch.symbol));
++        try std.testing.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 0 }));
++        const got = registry.usageFor(r, .{ .major = 13, .minor = 3 });
++        for (limits.sms, got) |sm, u| {
++            try std.testing.expect(u.regs > 0 and u.bound == r.launch.threads);
++            var text: std.ArrayList(u8) = .empty;
++            defer text.deinit(std.testing.allocator);
++            try std.testing.expectEqual(@as(usize, 0), try limits.cuda(r.launch, u, sm, &text, std.testing.allocator));
++        }
++        // the merge folds into the same block: the twin's image, threads, shared bytes and bound
++        const w = try twin(r);
++        try std.testing.expectEqualStrings(w.launch.image, r.launch.image);
++        try std.testing.expectEqual(w.launch.threads, r.launch.threads);
++        try std.testing.expectEqual(w.launch.dynamic, r.launch.dynamic);
++        try std.testing.expectEqual(w.launch.opt_in, r.launch.opt_in);
++        try std.testing.expectEqual(w.launch.min_sm, r.launch.min_sm);
++        for (registry.usageFor(w, .{ .major = 13, .minor = 3 }), got) |a, b| {
++            try std.testing.expectEqual(a.static, b.static);
++            try std.testing.expectEqual(a.bound, b.bound);
++        }
++    }
++}
++
++test "GLM fused chunks: every fused launch is registered once, beside its window twin" {
++    var n: usize = 0;
++    for (registry.all_cuda) |r| {
++        if (std.mem.startsWith(u8, r.launch.symbol, "tf_glm_chunks_") and std.mem.endsWith(u8, r.launch.symbol, "_fused")) n += 1;
++    }
++    try std.testing.expectEqual(cuda.len, n);
++    for (cuda) |r| _ = try twin(r);
++}
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index 9ed1d36a..48352930 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -73,4 +73,10 @@ pub const records = [_]Override{
+     .{ .name = "mla tf_mla_rope", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 22, .static = 0, .bound = 32 }, .{ .regs = 22, .static = 0, .bound = 32 } } },
+     .{ .name = "mla tf_mla_gate", .usage = .{ .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 } } },
+     .{ .name = "exl3_experts tf_exl3_plan_finish_after", .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
++    .{ .name = "glm_glue tf_glm_chunks_16_fused", .usage = .{ .{ .regs = 123, .static = 0, .bound = 256 }, .{ .regs = 123, .static = 0, .bound = 256 }, .{ .regs = 123, .static = 0, .bound = 256 }, .{ .regs = 124, .static = 0, .bound = 256 }, .{ .regs = 124, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_16_fp8_fused", .usage = .{ .{ .regs = 204, .static = 0, .bound = 256 }, .{ .regs = 204, .static = 0, .bound = 256 }, .{ .regs = 204, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_16_fp8_paged_fused", .usage = .{ .{ .regs = 190, .static = 0, .bound = 256 }, .{ .regs = 190, .static = 0, .bound = 256 }, .{ .regs = 192, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_32_fused", .usage = .{ .{ .regs = 211, .static = 0, .bound = 256 }, .{ .regs = 211, .static = 0, .bound = 256 }, .{ .regs = 211, .static = 0, .bound = 256 }, .{ .regs = 251, .static = 0, .bound = 256 }, .{ .regs = 251, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_32_fp8_fused", .usage = .{ .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 252, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 248, .static = 0, .bound = 256 }, .{ .regs = 248, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_32_fp8_paged_fused", .usage = .{ .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 253, .static = 0, .bound = 256 }, .{ .regs = 249, .static = 0, .bound = 256 }, .{ .regs = 249, .static = 0, .bound = 256 } } },
+ };
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index a62d7f2a..a92949db 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -485,6 +485,7 @@ test {
+     _ = @import("exl3_prompt_pending.zig");
+     _ = @import("exl3_prompt_records.zig");
+     _ = @import("glm_kv_paged_records.zig");
++    _ = @import("glm_fused_records.zig");
+     _ = @import("registry_pending_test.zig");
+     _ = @import("flashnext_pages_pending.zig");
+     _ = @import("flashnext_attn_lanes_pending.zig");
+diff --git a/zig/src/core/contract/registry_joins.zig b/zig/src/core/contract/registry_joins.zig
+index 7631c78d..c53b31dd 100644
+--- a/zig/src/core/contract/registry_joins.zig
++++ b/zig/src/core/contract/registry_joins.zig
+@@ -52,7 +52,8 @@ pub const cuda_pending = @import("qwen_whole_records.zig").records ++
+     @import("hc_activation_records.zig").cuda ++
+     @import("qwen4_records.zig").cuda ++
+     @import("exl3_prompt_records.zig").cuda ++
+-    @import("glm_kv_paged_records.zig").cuda;
++    @import("glm_kv_paged_records.zig").cuda ++
++    @import("glm_fused_records.zig").cuda;
+ pub const metal_before = @import("fsr_records.zig").metal ++
+     @import("scale_index_records.zig").metal ++
+     @import("lfm3_records.zig").metal;
+diff --git a/zig/src/families/glm/cuda_kv8_test.zig b/zig/src/families/glm/cuda_kv8_test.zig
+index 5cf5b2e0..bb6b0aaa 100644
+--- a/zig/src/families/glm/cuda_kv8_test.zig
++++ b/zig/src/families/glm/cuda_kv8_test.zig
+@@ -347,7 +347,7 @@ test "GLM FP8 KV: the glue resolves the paged symbols and opts their chunks into
+     d.api.cuModuleGetFunction = Res.function;
+     d.api.cuFuncSetAttribute = Res.attr;
+     const ks = try glue.Kernels.load(.{ .d = &d, .handle = null });
+-    inline for (.{ .{ "tf_glm_lat_write_fp8_paged", 0 }, .{ "tf_glm_chunks_16_fp8_paged", glue.chunksSmem(16) }, .{ "tf_glm_chunks_32_fp8_paged", glue.chunksSmem(32) } }) |e| {
++    inline for (.{ .{ "tf_glm_lat_write_fp8_paged", 0 }, .{ "tf_glm_chunks_16_fp8_paged", glue.chunksSmem(16) }, .{ "tf_glm_chunks_32_fp8_paged", glue.chunksSmem(32) }, .{ "tf_glm_chunks_16_fused", glue.chunksSmem(16) }, .{ "tf_glm_chunks_32_fused", glue.chunksSmem(32) }, .{ "tf_glm_chunks_16_fp8_fused", glue.chunksSmem(16) }, .{ "tf_glm_chunks_32_fp8_fused", glue.chunksSmem(32) }, .{ "tf_glm_chunks_16_fp8_paged_fused", glue.chunksSmem(16) }, .{ "tf_glm_chunks_32_fp8_paged_fused", glue.chunksSmem(32) } }) |e| {
+         const h = Res.handleOf(e[0]) orelse return error.SymbolNotResolved;
+         if (e[1] == 0) try t.expect(Res.bytesOn(h) == null) else try t.expectEqual(@as(?c_int, @intCast(e[1])), Res.bytesOn(h));
+     }
+-- 
+2.43.0
+
