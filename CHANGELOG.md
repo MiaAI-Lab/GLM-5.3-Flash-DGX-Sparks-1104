@@ -1,5 +1,10 @@
 # Changelog
 
+- **2026-11-24** -- Engine patch `0029` lets a DFlash2 drafter and the prompt pair path run together: the target's
+  MTP rows are skipped when a drafter exists (they are never read), a step that reaches into the last window runs
+  alone because pairBody's chunks take no taps, and the pair's taps go to the drafter's context input the way
+  prefillChunk's do. The kernels' arithmetic is unchanged.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the

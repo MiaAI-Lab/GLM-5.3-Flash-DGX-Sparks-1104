@@ -1,0 +1,139 @@
+From 58652efc0bca98a5fd0c9143a33631ca89798c1e Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 13:04:23 +0900
+Subject: [PATCH] glm: draft pairing, no tapped steps
+
+A DFlash2 drafter and the prompt pair path can run together now: the target's MTP rows are skipped when a
+drafter exists (they are never read), a step that reaches into the last window runs alone because pairBody's
+chunks take no taps, and the pair's taps go to the drafter's context input the way prefillChunk's do.
+The kernels' arithmetic is unchanged.
+
+---
+ zig/src/families/glm/cuda_engine.zig      |  2 +-
+ zig/src/families/glm/cuda_prompt_pair.zig | 18 ++++++++++++++--
+ zig/src/families/glm/dflash.zig           | 25 ++++++++++++++++++++++-
+ 3 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 4e8697ab..b807bb6f 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -476,7 +476,7 @@ pub const Engine = struct {
+         if (f.prof) |p| p.mark(e.stream, .draw);
+         if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
+         stamp = prof_mod.span(f.prof, e.stream, .mtp);
+-        if (e.mtp) try prompt_solo.mtpRows(e, &f, as_i32);
++        if (e.mtp and e.drafter == null) try prompt_solo.mtpRows(e, &f, as_i32); // DFlash2 drafts: the target MTP rows are never read
+         stamp.end();
+         if (f.prof) |p| p.mark(e.stream, .mtp);
+         stamp = prof_mod.span(f.prof, e.stream, .commit);
+diff --git a/zig/src/families/glm/cuda_prompt_pair.zig b/zig/src/families/glm/cuda_prompt_pair.zig
+index bf895cd2..22207bd0 100644
+--- a/zig/src/families/glm/cuda_prompt_pair.zig
++++ b/zig/src/families/glm/cuda_prompt_pair.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const fw = @import("cuda_forward.zig");
+ const weights = @import("cuda_weights.zig");
++const dflash = @import("dflash.zig");
+ const snapshots = @import("cuda_snapshots.zig");
+ const engine = @import("cuda_engine.zig");
+ const Engine = engine.Engine;
+@@ -60,10 +61,12 @@ pub fn piecesOf(e: *const Engine, b: *const fw.Buffers) ?*const fw.Pieces {
+ 
+ /// Rank 0's choice for the step at `start` (the others take the ids it sends); not with a drafter, prompt rows or prof.
+ pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
+-    if (e.pair == null or !e.settings.pair or e.drafter != null or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
++    if (e.pair == null or !e.settings.pair or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
+     if (e.cur.cuts.items.len > 0) return false; // a paired step would step over a request start
+     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
+     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
++    // a step that reaches into the last window taps, and this pairBody's chunks take no taps: run those alone
++    if (e.drafter != null and start + 2 * fw.prefill_rows > len -| @as(usize, @intCast(dflash.WIN))) return false;
+     // a resumed step restores its kept state, and the rings' base, after this choice
+     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
+     return ringsAgree(base, e.cur.st.ring_rows, start, @min(len - start - fw.prefill_rows, fw.prefill_rows));
+@@ -75,7 +78,8 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel:
+     if (len <= start + ra) return error.BadChunk;
+     const rb: usize = @min(len - start - ra, fw.prefill_rows);
+     const pair = if (e.pair) |*p| p else return error.BadChunk;
+-    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or e.drafter != null or e.prompt_logprobs != null) return error.BadChunk;
++    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or e.prompt_logprobs != null) return error.BadChunk;
++    if (e.drafter != null and start + 2 * fw.prefill_rows > len -| @as(usize, @intCast(dflash.WIN))) return error.BadChunk; // pairedAt's tap rule
+     if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rb)) return error.BadChunk; // pairedAt's rule, every rank
+     if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
+     e.gate(cancel) catch |err| {
+@@ -90,6 +94,12 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel:
+     fb.prof = null;
+     fa.index_split = split; // the step's choice (TF_GLM_INDEX_SPLIT) for both chunks
+     fb.index_split = split;
++    // DFlash2 taps (prefillChunk's rule): only a chunk that reaches into the last window. a's go to taps_prefill; b's
++    // there too when a has none, else into the drafter's context input past a's kept rows (dflash pairTaps)
++    const keep_from = len -| @as(usize, @intCast(dflash.WIN));
++    const a_kept = start + ra -| keep_from; // a's rows in the last window (keep_from > start: b follows a)
++    if (a_kept == 0) fa.taps = null;
++    fb.taps = if (e.drafter) |dr| (if (start + ra + rb <= keep_from) null else if (a_kept > 0) dr.pairTaps(a_kept) else dr.taps(true)) else null;
+     const st = &e.cur.st;
+     try st.ready(e.stream, ra + rb); // one rebase for both chunks, at a as a chunk at a time, before b's view copies it
+     var sb = st.*;
+@@ -104,6 +114,10 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel:
+     try fw.Forward.pairBody(&fa, &fb, ra, rb);
+     pair.steps += 1;
+     e.index_splits += @intFromBool(split);
++    if (e.drafter) |dr| { // a's rows from taps_prefill, then b's where they were tapped, each as its own chunk's would
++        try dr.prompt(e, e.slot, start, ra, len);
++        if (a_kept > 0) try dr.promptIn(e, e.slot, start + ra, rb, len, a_kept) else try dr.prompt(e, e.slot, start + ra, rb, len);
++    }
+     try mtpRows(e, &fa, ids[1 .. ra + 1], e.bp.fnormed);
+     try fa.commit(ra);
+     st.pending = rb;
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index aa039ffc..564ee5e8 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -240,6 +240,16 @@ pub const Drafter = struct {
+     /// The same ordinary context ingest, with this prompt's rows at row0 in the batched tap buffer.
+     pub const promptSegment = ingestPrompt;
+ 
++    /// A paired step's second chunk whose tap rows are already in the context input from row `row0` (pairTaps).
++    pub const promptIn = ingestPromptIn;
++
++    /// Where a paired step's second chunk taps when the first's last `first_rows` rows go in too (cuda_prompt_pair):
++    /// the context input past them, idle through the pass. The first's ingest copies its rows in before them, then the
++    /// second's reads its own in place (promptIn), so a pair needs no tap rows of its own.
++    pub fn pairTaps(dr: *const Drafter, first_rows: usize) taps_mod.Taps {
++        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * TAP_ROW };
++    }
++
+     /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
+     pub fn ingest(dr: *Drafter, e: anytype, runs: []const Run) !void {
+         var N: usize = 0;
+@@ -248,7 +258,7 @@ pub const Drafter = struct {
+         if (N > MAX_CTX) return error.DrafterContextTooWide;
+         var row: usize = 0;
+         for (runs) |r| {
+-            try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW);
++            if (r.taps != dr.cin + row * TAP_ROW) try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW); // in place: promptIn
+             for (0..r.n) |j| {
+                 dr.h_cpos[row + j] = r.pos0 + @as(i64, @intCast(j));
+                 dr.h_crings[row + j] = r.ring;
+@@ -336,3 +346,16 @@ pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize,
+     const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0, dr.tap_rows)) orelse return;
+     try dr.ingest(e, &.{run});
+ }
++
++/// The same, for a paired step's second chunk whose tap rows the first's ingest already placed in the context input
++/// (tapped at pairTaps while the first's rows go in before them): the ingest reads them where they are, as the copy
++/// would have left them at row 0. Every one of its rows is in the last window.
++pub fn ingestPromptIn(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
++    if (start < len -| @as(usize, @intCast(WIN)) or row0 > MAX_CTX or rows > MAX_CTX - row0) return error.BadPromptContext;
++    const cin = dr.cin;
++    defer dr.cin = cin;
++    dr.cin = cin + row0 * TAP_ROW;
++    const s = try dr.slot(i);
++    const run = (try promptRun(s.ring.?.ptr, dr.cin, start, rows, len, 0, dr.tap_rows)) orelse return;
++    try dr.ingest(e, &.{run});
++}
+-- 
+2.43.0
+
