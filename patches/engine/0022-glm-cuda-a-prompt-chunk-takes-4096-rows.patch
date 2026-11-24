@@ -1,0 +1,36 @@
+From ce76247873bb42c2619ada9f186869d6162d5dc1 Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 13:04:22 +0900
+Subject: [PATCH] glm cuda: a prompt chunk takes 4096 rows
+
+The common EXL3 experts decode every expert's weights once a call, and a
+prompt pass makes one call a chunk, so that decode is a fixed cost amortised
+over the chunk's rows: 288 routed experts over 45 layers make it the largest
+fixed cost in a prompt pass. 4096 rows halves it relative to 2048.
+
+Exact, not a numerics change: a pair's sums do not depend on which item holds
+it, so the bits are the same and the ship check is identical greedy replies.
+
+Measured on one GB10 pair at 32K, three cold runs per configuration in
+consecutive windows: 1,353.0 -> 1,422.9 tok/s (+5.2%), on the fused stack
+(0019-0021) below it.
+---
+ zig/src/families/glm/cuda_state.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 812401ff..00bb9fad 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -16,7 +16,7 @@ const mlp = @import("cuda_mlp.zig");
+ const kda_block = @import("cuda_kda_block.zig");
+ 
+ /// A prompt chunk's rows (decode.PREFILL_ROWS).
+-pub const prefill_rows = 2048;
++pub const prefill_rows = 4096;
+ /// A decode window's rows (Engine's max_rows).
+ pub const window_rows = 32;
+ /// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.
+-- 
+2.43.0
+
