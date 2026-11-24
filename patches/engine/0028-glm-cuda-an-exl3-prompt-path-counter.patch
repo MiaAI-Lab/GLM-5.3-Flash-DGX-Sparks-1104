@@ -1,0 +1,53 @@
+From b4bbac0a3361c9ee14fae1f173229098435dcc06 Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 13:04:23 +0900
+Subject: [PATCH] glm cuda: an EXL3 prompt path counter
+
+Two counters, logged every 256 calls: prompt calls that took the common prompt kernel, and ones that fell back
+to the 1,024-row compact path, so the split can be read out of a run's log instead of inferred. Diagnostics
+only; no arithmetic.
+
+---
+ zig/src/families/glm/cuda_exl3.zig | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
+index 1f1bf078..5e74d322 100644
+--- a/zig/src/families/glm/cuda_exl3.zig
++++ b/zig/src/families/glm/cuda_exl3.zig
+@@ -220,6 +220,16 @@ pub const Kernels = cuda.exl3_experts.Experts;
+ const common = cuda.exl3_experts;
+ pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
+ pub const top_k = 8;
++/// Diagnostic (patch 0021): prompt calls that took the common prompt kernel, and ones that fell back
++/// to the 1,024-row compact path. Logged every 256 calls; remove once the split is known.
++var prompt_calls: usize = 0;
++var compact_calls: usize = 0;
++fn notePath(prompt: bool) void {
++    if (prompt) prompt_calls += 1 else compact_calls += 1;
++    if ((prompt_calls + compact_calls) % 256 == 0) {
++        std.log.info("exl3 prompt path: prompt kernel {d}, compact fallback {d}", .{ prompt_calls, compact_calls });
++    }
++}
+ /// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
+ pub const chunk_rows = 1024;
+ /// The prompt item plan has no decode grouper's shared-memory cap; one call covers a supported whole prompt pass.
+@@ -285,6 +295,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
+     if (prompt and common.prompt.eligible(l)) {
+         const scratch = try common.prompt.scratch(sc.picks, l, @min(rows, prompt_rows), slots);
+         var at: usize = 0;
++        notePath(true);
+         while (at < rows) : (at += prompt_rows) {
+             const n: usize = @min(prompt_rows, rows - at);
+             try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * 4, count);
+@@ -296,6 +307,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
+ 
+ /// Compact routed picks and output for decode or prompt layers without the whole-pass kernel.
+ fn compact(k: *const Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, ey: u64) !void {
++    if (rows >= prompt_rows) notePath(false);
+     const l = layer(w, count, dims, width, limit);
+     const cap: usize = @min(rows, chunk_rows);
+     const arena = sc.picks + picksBytes(rows);
+-- 
+2.43.0
+
