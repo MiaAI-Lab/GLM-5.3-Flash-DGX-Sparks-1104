@@ -1,5 +1,13 @@
 # Changelog
 
+- **2026-11-24** -- Engine patch `0030` restructures the prompt's EXL3 expert path into one kernel: it takes the pair
+  layout (`ys`, `yrow`) the pair path writes, drops the `skip` id (the shared expert's slot stays the caller's), and
+  batches N in `prompt_down_n`, so a prompt's experts are one launch rather than the compact fallback's per-item
+  blocks. Measured at 32K on one GB10 pair, three runs per configuration, base then this patch on the same pair and
+  launcher: 1,601.4 -> 1,702.8 tok/s (+6.3%) over the rest of this series (`0001`-`0029`). Upstream
+  ashhart/TensorFold#4701 is the same restructure in review; this patch is what 1.3.0 plus this recipe needs until it
+  lands.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the
