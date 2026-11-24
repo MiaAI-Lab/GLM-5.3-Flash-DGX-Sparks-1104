@@ -1,5 +1,16 @@
 # Changelog
 
+- **2026-11-24** -- Engine patches `0023`-`0027` give a prompt's absorb step head-batched GEMMs and settle the
+  prompt path's shape tests. `0023`: the absorb runs one GEMV per row today; `latent_mma_kn`/`latent_mma_nk` take a
+  128-row bucket per shape instead, loaded with the dynamic shared memory their three stages need. `0024` launches
+  them with `pdl` and puts them behind `TF_GLM_ABSORB_MMA`. `0025` gives packed prompts the two-stage 128-row blocks
+  (`sharedBytesStages` names their smem). `0026` takes 1.1.9's own shape test for the GEMMs (a prompt, a whole
+  chunk of rows, 16-byte aligned, whole tiles) and for the packed prompt launch. `0027` is the review: `TF_*` switch
+  spellings (and `ABSORB_MMA` off when unset), a trap when `blockDim.x` is not `chunk_threads`, the GEMM smem
+  comment, and the solo pass's ring test. Measured on one GB10 pair at 32K cold prefill, the gate on against off:
+  1,557.5 -> 1,697.3 tok/s (+9.0%). That is the group's only isolated number; `0025`-`0027` make no separate speed
+  claim.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the

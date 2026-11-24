@@ -1,0 +1,180 @@
+From f747e23977fd56aa0efe6f0fdaff09a88077691b Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 13:04:23 +0900
+Subject: [PATCH] glm: the absorb-MMA predicate takes the recipe's shape test
+
+mmaRows takes the pass kind and the shape (a prompt, a whole chunk of rows, 16-byte aligned, whole tiles)
+the way 1.1.9's own test does, so this build's arithmetic matches that stack instead of re-cutting it; the
+packed prompt launch follows the same shape test.
+
+---
+ zig/kernels/cuda/common/mla.cuh      |  1 +
+ zig/kernels/cuda/glm_glue_num.cuh    |  7 +++---
+ zig/kernels/cuda/glm_mm.cu           |  5 +++--
+ zig/src/families/glm/cuda_glue.zig   |  4 +++-
+ zig/src/families/glm/cuda_latent.zig | 33 +++++++++++++++++-----------
+ zig/src/families/glm/cuda_mm.zig     |  2 +-
+ zig/src/families/glm/cuda_state.zig  |  3 +++
+ 7 files changed, 35 insertions(+), 20 deletions(-)
+
+diff --git a/zig/kernels/cuda/common/mla.cuh b/zig/kernels/cuda/common/mla.cuh
+index 0735cd00..a6f80c7b 100644
+--- a/zig/kernels/cuda/common/mla.cuh
++++ b/zig/kernels/cuda/common/mla.cuh
+@@ -141,6 +141,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   }
+   // E4M3 tiles: a thread's eight codes in one 8-byte load, all issued before any is converted; tile + 2 is prefetched.
+   constexpr int UPT = KT * (KW / 8) / CHUNK_THREADS;  // units a thread moves a tile
++  static_assert(KT * (KW / 8) % CHUNK_THREADS == 0, "the 8-byte key split assumes whole units per thread");
+   uint2 raw[FP8 ? UPT : 1];
+   float rsc[FP8 ? UPT : 1];
+   auto load_kv = [&](int tile) {
+diff --git a/zig/kernels/cuda/glm_glue_num.cuh b/zig/kernels/cuda/glm_glue_num.cuh
+index 863c8418..c665d430 100644
+--- a/zig/kernels/cuda/glm_glue_num.cuh
++++ b/zig/kernels/cuda/glm_glue_num.cuh
+@@ -1,4 +1,5 @@
+-// Opt-in prompt kernels that change rounding slightly (each behind a TF_GLM_* flag, off by default):
++// Opt-in prompt kernels that change rounding slightly (each behind a TF_GLM_* flag; the 1104 recipe ships
++// TF_GLM_ABSORB_MMA=1, so that one is on by default there and off in the engine's own defaults):
+ //   tf_glm_latent_mma_kn / _nk: absorb_q / expand_v for prompt rows as a head-batched bf16 GEMM on tensor cores
+ //     (TF_GLM_ABSORB_MMA=1); fp32 sums in mma order instead of the SIMT kernels' fma-and-shuffle order.
+ #pragma once
+@@ -145,7 +146,7 @@ __device__ __forceinline__ void latent_mma(const __nv_bfloat16* __restrict__ x,
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_latent_mma_kn(const __nv_bfloat16* x, int64_t xr, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t orow,
+                          int64_t rows, int n, int k) {
+-  glm_pdl::enter();   // a dependent launch: the kernel before it writes x and w
++  glm_pdl::enter();   // a dependent launch: the kernel before it writes x (w is a static weight)
+   glm_num::latent_mma<true, 3>(x, xr, w, out, orow, rows, n, k);
+ }
+ 
+@@ -153,7 +154,7 @@ extern "C" __global__ void __launch_bounds__(256)
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_latent_mma_nk(const __nv_bfloat16* x, int64_t xr, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t orow,
+                          int64_t rows, int n, int k) {
+-  glm_pdl::enter();   // a dependent launch: the kernel before it writes x and w
++  glm_pdl::enter();   // a dependent launch: the kernel before it writes x (w is a static weight)
+   glm_num::latent_mma<false, 3>(x, xr, w, out, orow, rows, n, k);
+ }
+ 
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 166baad3..35803e81 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -231,8 +231,9 @@ extern "C" __global__ void glm_mm_reduce(const float* __restrict__ part, void* _
+ }
+ 
+ // one instance a (bits, row bucket): (16, 1 warp row), (32, 1), (64, 2), (128, 2); three stages
+-// Packed prompts, two stages (41 KB: two blocks an SM instead of one). Each output's K groups keep their order, so
+-// the sums are the three-stage kernels' bit for bit; a 768-row piece's 384 blocks fit one wave of 376 slots.
++// Packed prompts, two stages (37-41 KB by width: two blocks an SM instead of one, 376 slots). Each output's K
++// groups keep their order, so the sums are the three-stage kernels' bit for bit; a 768-row piece's 384 blocks then
++// need 1.02 waves instead of 2.04.
+ #define GLM_MM_PROMPT2(B)                                                                                              \
+     extern "C" __global__ void __launch_bounds__(256, 2) glm_mm##B##_128s2(const __nv_bfloat16* __restrict__ x,        \
+         long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index df3b9232..52fc9a36 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -107,7 +107,9 @@ pub const Kernels = struct {
+     }
+ };
+ 
+-/// glm_glue_num.cuh's head-batched prompt GEMMs: dynamic smem their 3 stages need.
++/// glm_glue_num.cuh's head-batched prompt GEMMs: dynamic smem their 3 stages need, 3 x Tile<B_KN>::STAGE of
++/// LBM x (LAP + LBP) bf16. Written out because a .cuh cannot export a constant; changing STAGES or the paddings
++/// there means changing these two numbers here. A launch with too little smem fails in cuLaunchKernel, not silently.
+ pub const latent_mma_smem = [2]u32{ 3 * (128 * 40 + 32 * 136) * 2, 3 * (128 * 40 + 128 * 40) * 2 };
+ 
+ /// An element-wise kernel's launch: a block of 256 columns, `rows` x the blocks to cover `d`.
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index d37d2ad3..e5f65439 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -33,26 +33,33 @@ fn cdiv(a: usize, b: usize) u32 {
+ /// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
+ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
+     if (d != 256 or lw != 512) return error.LatentShape;
+-    if (mmaRows(rows, .{ q, wk, out })) return headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q, heads * d, wk, out, heads * lw, rows, heads, lw, d);
++    if (mmaRows(set.prompt, rows, .{ q, wk, out }, heads, lw, d)) return headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q, heads * d, wk, out, heads * lw, rows, heads, lw, d);
+     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
+ }
+ 
+-/// A prompt chunk's rows, whole and 16-byte aligned: the tensor-core GEMMs. The recipe measured
+-/// this as +8.0% prefill with identical answers (ABSORB_MMA); 1.3.0 dropped the kernels.
+-fn mmaRows(rows: usize, ptrs: [3]u64) bool {
+-    if (rows < prompt_rows) return false;
+-    if (!absorbMma()) return false;
++/// A prompt pass, a whole chunk of rows, 16-byte aligned, n and k whole tiles: the tensor-core GEMMs. The three
++/// conditions are 1.1.9's own (its `Set.absorb_mma` is `TF_GLM_ABSORB_MMA` and the pass being a prompt, and its
++/// mmaRows adds `rows < prompt_rows`), kept as they are so this build's arithmetic matches that stack rather than
++/// re-cutting the recipe. The sums run in mma order instead of the SIMT kernels' fma-and-shuffle order, so the fp32
++/// rounding differs between the two paths (NLL, not a bitwise claim) and a prompt's tail chunk, being shorter than a
++/// chunk, keeps the SIMT result.
++fn mmaRows(prompt: bool, rows: usize, ptrs: [3]u64, heads: usize, n: usize, k: usize) bool {
++    if (!prompt or !absorbMma() or rows < prompt_rows) return false;
++    if (n % 128 != 0 or k % 32 != 0) return false;
++    if ((heads * n) % 8 != 0 or (heads * k) % 8 != 0) return false;
+     for (ptrs) |p| if (p % 16 != 0) return false;
+     return true;
+ }
+ 
+-/// TF_GLM_ABSORB_MMA (default on, the recipe's own): these kernels sum in mma order instead of the SIMT kernels'
+-/// fma-and-shuffle order, so the bits differ from ABSORB_MMA=0 — off falls back to the row-block kernels.
+-var absorb_mma: ?bool = null;
++/// TF_GLM_ABSORB_MMA, read once (0 unread, 1 off, 2 on), the way cuda_pdl.on() reads TF_GLM_PDL: exact "0" falls
++/// back to the row-block kernels, anything else keeps the tensor-core ones. This recipe ships ABSORB_MMA=1
++/// (scripts/config.sh), which is why the default is on here.
++var absorb_mma_state: std.atomic.Value(u8) = .init(0);
+ fn absorbMma() bool {
+-    if (absorb_mma) |v| return v;
+-    const on = if (std.c.getenv("TF_GLM_ABSORB_MMA")) |v| std.mem.eql(u8, std.mem.span(v), "1") else true;
+-    absorb_mma = on;
++    const v = absorb_mma_state.load(.monotonic);
++    if (v != 0) return v == 2;
++    const on = if (std.c.getenv("TF_GLM_ABSORB_MMA")) |c| !std.mem.eql(u8, std.mem.span(c), "0") else true;
++    absorb_mma_state.store(if (on) 2 else 1, .monotonic);
+     return on;
+ }
+ 
+@@ -75,7 +82,7 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
+ /// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
+ pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
+     if (dv != 256 or lw != 512) return error.LatentShape;
+-    if (mmaRows(rows, .{ ol, wv, out })) return headsMma(set.glue.latent_mma_nk, glue.latent_mma_smem[1], stream, ol, heads * lw, wv, out, heads * dv, rows, heads, dv, lw);
++    if (mmaRows(set.prompt, rows, .{ ol, wv, out }, heads, dv, lw)) return headsMma(set.glue.latent_mma_nk, glue.latent_mma_smem[1], stream, ol, heads * lw, wv, out, heads * dv, rows, heads, dv, lw);
+     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 022e346a..653830f4 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -136,7 +136,7 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
+             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
+         } else if (big) { // packed prompts: the 128-row blocks in two stages, two an SM (the three-stage kernels' sums)
+             try cuda.launch.launch(k.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = sharedBytesStages(w.bits, bm, 2), .pdl = k.pdl }, s, &a);
+-        } else { // decode windows: the row buckets, one slice
++        } else { // decode windows: the row buckets, at the shape's split-K slices
+             const f = if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
+             try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(w.bits, bm), .pdl = k.pdl }, s, &a);
+         }
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 00bb9fad..8e8e1bd9 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -559,6 +559,9 @@ pub const State = struct {
+     pub fn ready(st: *State, stream: cuda.Stream, rows: usize) !void {
+         if (st.pos + rows > st.capacity) return error.PastCapacity;
+         if (st.pos + rows > st.base + st.ring_rows) try st.rebase(stream, false);
++        // rebase() leaves the window alone when one pass is wider than the rings: refuse rather than write into the
++        // arena field after them (solo_rows == index_ring leaves no slack).
++        if (st.pos + rows > st.base + st.ring_rows) return error.RingTooSmall;
+     }
+ 
+     /// Before the MTP head's pass of `n` rows at mtp_len, likewise for its caches.
+-- 
+2.43.0
+
