@@ -1,0 +1,204 @@
+From 93c5059c473f86215c223fdc3a2f15952e869926 Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 13:04:23 +0900
+Subject: [PATCH] glm: review fixes for the prompt path, absorb-MMA and the audit
+
+A TF_* switch reads 0/false/no/off and 1/true/yes/on and anything else as unset, and ABSORB_MMA is off when
+unset like other opt-in kernels (the 1104 recipe passes ABSORB_MMA=1 itself). The fused chunk kernel traps
+when blockDim.x is not chunk_threads, the GEMM smem comment says what too little smem does (a launch is only
+refused above the device's limit), and the solo pass's ring test rebases when the pass fits after the move
+instead of refusing.
+
+---
+ zig/kernels/cuda/common/mla.cuh      |  1 +
+ zig/kernels/cuda/glm_glue_num.cuh    |  2 +-
+ zig/kernels/cuda/glm_mm.cu           |  6 ++---
+ zig/src/families/glm/cuda_engine.zig |  3 ++-
+ zig/src/families/glm/cuda_glue.zig   |  5 ++--
+ zig/src/families/glm/cuda_latent.zig | 35 ++++++++++++++++++----------
+ zig/src/families/glm/cuda_state.zig  | 18 ++++++++++----
+ 7 files changed, 46 insertions(+), 24 deletions(-)
+
+diff --git a/zig/kernels/cuda/common/mla.cuh b/zig/kernels/cuda/common/mla.cuh
+index a6f80c7b..8c1a9531 100644
+--- a/zig/kernels/cuda/common/mla.cuh
++++ b/zig/kernels/cuda/common/mla.cuh
+@@ -108,6 +108,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+                             int sw = 1, int sr = 0) {
++  if (blockDim.x != CHUNK_THREADS) __trap();  // UPT and the BF16 warp map (warp * 64) both assume 256
+   static_assert(!(FP8 && RW != 0), "the E4M3 cache holds the latent alone");
+   static_assert(!(SPLIT && FP8), "a split cache holds BF16 rows");
+   static_assert(!(PAGED8 && !FP8), "PAGED8 requires FP8");
+diff --git a/zig/kernels/cuda/glm_glue_num.cuh b/zig/kernels/cuda/glm_glue_num.cuh
+index c665d430..2a1f8ad4 100644
+--- a/zig/kernels/cuda/glm_glue_num.cuh
++++ b/zig/kernels/cuda/glm_glue_num.cuh
+@@ -46,7 +46,7 @@ struct LatTile {
+ };
+ 
+ template <bool B_KN, int STAGES>
+-__device__ __forceinline__ void latent_mma(const __nv_bfloat16* __restrict__ x, int64_t xr,
++__device__ __forceinline__ void latent_mma(const __nv_bfloat16* x, int64_t xr,
+                                            const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
+                                            int64_t orow, int64_t rows, int N, int K) {
+   using T = LatTile<B_KN>;
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 35803e81..03fbe81e 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -231,9 +231,9 @@ extern "C" __global__ void glm_mm_reduce(const float* __restrict__ part, void* _
+ }
+ 
+ // one instance a (bits, row bucket): (16, 1 warp row), (32, 1), (64, 2), (128, 2); three stages
+-// Packed prompts, two stages (37-41 KB by width: two blocks an SM instead of one, 376 slots). Each output's K
+-// groups keep their order, so the sums are the three-stage kernels' bit for bit; a 768-row piece's 384 blocks then
+-// need 1.02 waves instead of 2.04.
++// Packed prompts, two stages (37-41 KB by width, so two blocks fit an SM: 96 slots on a GB10's 48 SMs against the
++// three-stage kernel's 48). Each output's K groups keep their order, so the sums are the three-stage kernels' bit for
++// bit; a 768-row piece is 384 blocks, four waves at two blocks an SM.
+ #define GLM_MM_PROMPT2(B)                                                                                              \
+     extern "C" __global__ void __launch_bounds__(256, 2) glm_mm##B##_128s2(const __nv_bfloat16* __restrict__ x,        \
+         long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index b8353afb..4e8697ab 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -303,7 +303,8 @@ pub const Engine = struct {
+         e.kv_room = null;
+         e.kv_stage = null;
+         errdefer e.freeKvShard();
+-        const rows = @max(fw.prefill_rows, shared_rows);
++        const solo_room: usize = if (e.settings.solo) fw.solo_rows else 0; // a solo pass takes solo_rows rows
++        const rows = @max(@max(fw.prefill_rows, shared_rows), solo_room);
+         const hl = e.share.mla.len();
+         const half = rows * hl * e.c.kv_lora * 2;
+         e.kv_room = try cuda.DeviceBuffer.alloc(e.d, kv_attn.roomBytes(rows, hl, e.c.kv_lora));
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 52fc9a36..041f0bad 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -107,9 +107,10 @@ pub const Kernels = struct {
+     }
+ };
+ 
+-/// glm_glue_num.cuh's head-batched prompt GEMMs: dynamic smem their 3 stages need, 3 x Tile<B_KN>::STAGE of
++/// glm_glue_num.cuh's head-batched prompt GEMMs: dynamic smem their 3 stages need, 3 x LatTile<B_KN>::STAGE of
+ /// LBM x (LAP + LBP) bf16. Written out because a .cuh cannot export a constant; changing STAGES or the paddings
+-/// there means changing these two numbers here. A launch with too little smem fails in cuLaunchKernel, not silently.
++/// there means changing these two numbers here. Too little smem is not caught: cuLaunchKernel only refuses a request
++/// above the device's limit, so the kernel would stage its tiles outside the block's window.
+ pub const latent_mma_smem = [2]u32{ 3 * (128 * 40 + 32 * 136) * 2, 3 * (128 * 40 + 128 * 40) * 2 };
+ 
+ /// An element-wise kernel's launch: a block of 256 columns, `rows` x the blocks to cover `d`.
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index e5f65439..7fe27220 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -12,9 +12,11 @@ pub const heads_tile = 16;
+ pub const heads_tile_wide = 32;
+ pub const prompt_rows = 64;
+ pub const prompt_rb = 64;
++/// The chunk kernels' block: mla.cuh's CHUNK_THREADS must equal it (its FP8 tile split counts on 256, and the BF16
++/// path's warp map reads 8 warps).
++pub const chunk_threads = 256;
+ 
+ /// The block the chunk kernels launch with (common/mla.cuh's CHUNK_THREADS).
+-pub const chunk_threads = 256;
+ 
+ /// latent.head_block: a rank's 32 heads a program in prompt chunks (each key read once), 16 in decode windows.
+ pub fn headBlock(rows: usize) usize {
+@@ -37,12 +39,12 @@ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, ro
+     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
+ }
+ 
+-/// A prompt pass, a whole chunk of rows, 16-byte aligned, n and k whole tiles: the tensor-core GEMMs. The three
+-/// conditions are 1.1.9's own (its `Set.absorb_mma` is `TF_GLM_ABSORB_MMA` and the pass being a prompt, and its
+-/// mmaRows adds `rows < prompt_rows`), kept as they are so this build's arithmetic matches that stack rather than
+-/// re-cutting the recipe. The sums run in mma order instead of the SIMT kernels' fma-and-shuffle order, so the fp32
+-/// rounding differs between the two paths (NLL, not a bitwise claim) and a prompt's tail chunk, being shorter than a
+-/// chunk, keeps the SIMT result.
++/// A prompt pass of at least `prompt_rows` rows (64, a latent tile constant — not a chunk), 16-byte aligned, with n and
++/// k whole tiles: the tensor-core GEMMs. The conditions are 1.1.9's own (`Set.absorb_mma`, i.e. the flag and a prompt
++/// pass, and `rows < prompt_rows`), kept as they are so this build's arithmetic matches that stack. The sums run in mma
++/// order instead of the SIMT kernels' fma-and-shuffle order, so the fp32 rounding differs between the two paths (NLL,
++/// not a bitwise claim). The cost of that 64-row test: a pass under 64 rows — a short prompt, or a prompt-cache suffix
++/// that short — takes SIMT and can differ in the low bits from the same rows computed inside a longer pass.
+ fn mmaRows(prompt: bool, rows: usize, ptrs: [3]u64, heads: usize, n: usize, k: usize) bool {
+     if (!prompt or !absorbMma() or rows < prompt_rows) return false;
+     if (n % 128 != 0 or k % 32 != 0) return false;
+@@ -51,14 +53,23 @@ fn mmaRows(prompt: bool, rows: usize, ptrs: [3]u64, heads: usize, n: usize, k: u
+     return true;
+ }
+ 
+-/// TF_GLM_ABSORB_MMA, read once (0 unread, 1 off, 2 on), the way cuda_pdl.on() reads TF_GLM_PDL: exact "0" falls
+-/// back to the row-block kernels, anything else keeps the tensor-core ones. This recipe ships ABSORB_MMA=1
+-/// (scripts/config.sh), which is why the default is on here.
++/// TF_GLM_ABSORB_MMA, read once (0 unread, 1 off, 2 on) the way cuda_pdl.on() reads TF_GLM_PDL: unset, 0/false/no/off
++/// keep the SIMT kernels; 1/true/yes/on take the tensor-core ones; any other spelling is a mistake and reads as off. Off when unset, like every other opt-in kernel in
++/// this family; the 1104 recipe passes ABSORB_MMA=1 itself (scripts/config.sh), so it loses nothing by that default.
+ var absorb_mma_state: std.atomic.Value(u8) = .init(0);
++/// A TF_* switch's spelling: 0/false/no/off and 1/true/yes/on, anything else unset.
++fn onOff(v: []const u8) ?bool {
++    const no = [_][]const u8{ "0", "false", "no", "off" };
++    const yes = [_][]const u8{ "1", "true", "yes", "on" };
++    for (no) |x| if (std.ascii.eqlIgnoreCase(v, x)) return false;
++    for (yes) |x| if (std.ascii.eqlIgnoreCase(v, x)) return true;
++    return null;
++}
++
+ fn absorbMma() bool {
+     const v = absorb_mma_state.load(.monotonic);
+     if (v != 0) return v == 2;
+-    const on = if (std.c.getenv("TF_GLM_ABSORB_MMA")) |c| !std.mem.eql(u8, std.mem.span(c), "0") else true;
++    const on = if (std.c.getenv("TF_GLM_ABSORB_MMA")) |c| onOff(std.mem.span(c)) orelse false else false;
+     absorb_mma_state.store(if (on) 2 else 1, .monotonic);
+     return on;
+ }
+@@ -156,7 +167,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64,
+         a.add(@as(i64, @intCast(t.ps)));
+     }
+     const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+-    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
++    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
+ }
+ 
+ /// latent.sparse_attention: rows with counts > 0 over their selected tokens (i32 [rows][w]); others left alone.
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 8e8e1bd9..070eed84 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -558,16 +558,24 @@ pub const State = struct {
+     /// Before a pass of `rows` rows at pos: within capacity, and the index rings holding them (rebased if not).
+     pub fn ready(st: *State, stream: cuda.Stream, rows: usize) !void {
+         if (st.pos + rows > st.capacity) return error.PastCapacity;
+-        if (st.pos + rows > st.base + st.ring_rows) try st.rebase(stream, false);
+-        // rebase() leaves the window alone when one pass is wider than the rings: refuse rather than write into the
+-        // arena field after them (solo_rows == index_ring leaves no slack).
+-        if (st.pos + rows > st.base + st.ring_rows) return error.RingTooSmall;
++        if (st.pos + rows > st.base + st.ring_rows) {
++            // A rebase moves the window to the pool boundary below pos, so what is left is ring_rows - pos % pool: a pass
++            // wider than that cannot fit however far it moves (solo_rows == index_ring leaves no slack), and one that can
++            // fit is rebased first.
++            if (rows > st.ring_rows - st.pos % sparse.pool) return error.RingTooSmall;
++            try st.rebase(stream, false);
++            if (st.pos + rows > st.base + st.ring_rows) return error.RingTooSmall;
++        }
+     }
+ 
+     /// Before the MTP head's pass of `n` rows at mtp_len, likewise for its caches.
+     pub fn readyMtp(st: *State, stream: cuda.Stream, n: usize) !void {
+         if (st.mtp_len + n > st.capacity) return error.PastCapacity;
+-        if (st.mtp_len + n > st.mtp_base + st.ring_rows) try st.rebase(stream, true);
++        if (st.mtp_len + n > st.mtp_base + st.ring_rows) {
++            if (n > st.ring_rows - st.mtp_len % sparse.pool) return error.RingTooSmall;
++            try st.rebase(stream, true);
++            if (st.mtp_len + n > st.mtp_base + st.ring_rows) return error.RingTooSmall;
++        }
+     }
+ 
+     /// Rebase at the earliest pool a rollback may revisit; MTP retains a whole verify window before its cursor.
+-- 
+2.43.0
+

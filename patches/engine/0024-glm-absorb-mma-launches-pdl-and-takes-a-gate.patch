@@ -1,0 +1,71 @@
+From c3333b18d53622e12aff806242a82eafb394403a Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 13:04:23 +0900
+Subject: [PATCH] glm: absorb-MMA launches PDL and takes a gate
+
+The two GEMMs launch with pdl, and sit behind TF_GLM_ABSORB_MMA so the path can be turned off without a
+rebuild. That gate is how the group was measured: 1,557.5 tok/s off against 1,697.3 on, 32K cold prefill on
+one GB10 pair.
+
+---
+ zig/kernels/cuda/glm_glue_num.cuh    |  3 +++
+ zig/src/families/glm/cuda_latent.zig | 11 +++++++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/zig/kernels/cuda/glm_glue_num.cuh b/zig/kernels/cuda/glm_glue_num.cuh
+index 557fb16d..863c8418 100644
+--- a/zig/kernels/cuda/glm_glue_num.cuh
++++ b/zig/kernels/cuda/glm_glue_num.cuh
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include "glm_triton.cuh"
++#include "glm_pdl.cuh"
+ 
+ namespace glm_num {
+ 
+@@ -144,6 +145,7 @@ __device__ __forceinline__ void latent_mma(const __nv_bfloat16* __restrict__ x,
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_latent_mma_kn(const __nv_bfloat16* x, int64_t xr, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t orow,
+                          int64_t rows, int n, int k) {
++  glm_pdl::enter();   // a dependent launch: the kernel before it writes x and w
+   glm_num::latent_mma<true, 3>(x, xr, w, out, orow, rows, n, k);
+ }
+ 
+@@ -151,6 +153,7 @@ extern "C" __global__ void __launch_bounds__(256)
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_latent_mma_nk(const __nv_bfloat16* x, int64_t xr, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t orow,
+                          int64_t rows, int n, int k) {
++  glm_pdl::enter();   // a dependent launch: the kernel before it writes x and w
+   glm_num::latent_mma<false, 3>(x, xr, w, out, orow, rows, n, k);
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index a964b465..d37d2ad3 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -41,10 +41,21 @@ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, ro
+ /// this as +8.0% prefill with identical answers (ABSORB_MMA); 1.3.0 dropped the kernels.
+ fn mmaRows(rows: usize, ptrs: [3]u64) bool {
+     if (rows < prompt_rows) return false;
++    if (!absorbMma()) return false;
+     for (ptrs) |p| if (p % 16 != 0) return false;
+     return true;
+ }
+ 
++/// TF_GLM_ABSORB_MMA (default on, the recipe's own): these kernels sum in mma order instead of the SIMT kernels'
++/// fma-and-shuffle order, so the bits differ from ABSORB_MMA=0 — off falls back to the row-block kernels.
++var absorb_mma: ?bool = null;
++fn absorbMma() bool {
++    if (absorb_mma) |v| return v;
++    const on = if (std.c.getenv("TF_GLM_ABSORB_MMA")) |v| std.mem.eql(u8, std.mem.span(v), "1") else true;
++    absorb_mma = on;
++    return on;
++}
++
+ /// Head h's out [rows][n] at +h*n = x [rows][k] at +h*k by w [heads][k][n]: 128x128 tiles, a z a head.
+ fn headsMma(f: cuda.Function, smem: u32, stream: cuda.Stream, x: u64, xr: usize, w: u64, out: u64, orow: usize, rows: usize, heads: usize, n: usize, k: usize) !void {
+     if (n % 128 != 0 or k % 32 != 0 or xr % 8 != 0 or orow % 8 != 0) return error.LatentShape;
+-- 
+2.43.0
+
