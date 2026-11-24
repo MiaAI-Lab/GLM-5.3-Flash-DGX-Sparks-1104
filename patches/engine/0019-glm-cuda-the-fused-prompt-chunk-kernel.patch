@@ -1,0 +1,564 @@
+From 21fa1a6cc944c06120b14ab788907e528f0ff561 Mon Sep 17 00:00:00 2001
+From: chai <tsaitomd@gmail.com>
+Date: Tue, 24 Nov 2026 17:08:19 +0900
+Subject: [PATCH] glm cuda: the fused prompt-chunk kernel
+
+When a sparse call's partials would not fit the pool (cuda_latent.fuses), one
+block handles a (row, HB heads) and loops the row's chunks, merging in the
+kernel, so the prompt chunk costs one launch and no partial buffer. The fused
+form is sparse only: a dense block has no counts to walk, so it traps.
+
+fetch8 and store8 move out of chunks_wide into namespace-scope templates in
+common/mla.cuh, so both read the E4M3 cache through one implementation. A
+prefill now funds one dense pass's partials instead of every sparse call's,
+which is what makes fuses() reachable.
+
+Measured on one GB10 pair: base and patched images started alternately, three
+cold prefill runs per start; the PR body carries the table. glm-ref, the greedy
+token hashes and the 35,941-token token_sha are unchanged.
+---
+ zig/kernels/cuda/common/mla.cuh      | 313 ++++++++++++++++++++++-----
+ zig/kernels/cuda/glm_glue_attn.cuh   |  54 +++++
+ zig/src/families/glm/cuda_glue.zig   |  12 +
+ zig/src/families/glm/cuda_latent.zig |  36 ++-
+ zig/src/families/glm/cuda_state.zig  |   6 +-
+ 5 files changed, 366 insertions(+), 55 deletions(-)
+
+diff --git a/zig/kernels/cuda/common/mla.cuh b/zig/kernels/cuda/common/mla.cuh
+index 4ebee84f..0735cd00 100644
+--- a/zig/kernels/cuda/common/mla.cuh
++++ b/zig/kernels/cuda/common/mla.cuh
+@@ -36,6 +36,61 @@ __device__ __forceinline__ void ldm4(uint32_t* r, const void* p) {
+ // A KW-wide bf16 row's 16-byte unit u in shared memory, swizzled by the row so ldmatrix's eight rows hit eight banks.
+ template <int KW = LW>
+ __device__ __forceinline__ int wide(int row, int u) { return row * KW + ((u ^ (row & 7)) << 3); }
++
++// E4M3 tiles: each thread's 8-code units in one 8-byte load apiece, all issued before any is converted (fetch8),
++// then converted value for value as before (store8). W is the row width, UPT the units a thread moves a tile; the
++// chunk kernels and the fused kernel read the same cache, so they share this.
++template <int W, int UPT, bool PAGED8>
++__device__ __forceinline__ void fetch8(uint2 (&raw)[UPT], float (&rsc)[UPT], int tile, int64_t start, int64_t n,
++                                       int64_t limit, const unsigned char* codes8, const float* scales8,
++                                       const float* scales, const int* tok, int64_t r, int64_t w, const int* pt,
++                                       int64_t pstep, int t, bool sparse) {
++  const int64_t first = start + tile * KT;
++  if constexpr (PAGED8) {
++    if (sparse) {
++      const unsigned char* scale_bytes = reinterpret_cast<const unsigned char*>(scales);
++#pragma unroll
++      for (int i = 0; i < UPT; ++i) {
++        const int idx = t + i * CHUNK_THREADS, key = idx / (W / 8), u = idx % (W / 8);
++        const int64_t ki = first + key;
++        const bool ok = ki < n;
++        const int s = ok ? tok[r * w + ki] : 0;  // a visible position: 0 <= s < 2^31
++        const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;  // CH = 512 rows a page
++        const int row = s & (CH - 1);
++        raw[i] = ok ? *reinterpret_cast<const uint2*>(codes8 + page + (row * W + u * 8)) : make_uint2(0u, 0u);
++        rsc[i] = ok ? *reinterpret_cast<const float*>(scale_bytes + page + row * 4) : 1.0f;
++      }
++      return;
++    }
++  }
++#pragma unroll
++  for (int i = 0; i < UPT; ++i) {
++    const int idx = t + i * CHUNK_THREADS, key = idx / (W / 8), u = idx % (W / 8);
++    const int64_t ki = first + key;
++    const bool ok = sparse ? ki < n : ki <= limit;
++    const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
++    raw[i] = ok ? *reinterpret_cast<const uint2*>(codes8 + src * W + u * 8) : make_uint2(0u, 0u);
++    rsc[i] = ok ? scales8[src] : 1.0f;
++  }
++}
++
++template <int W, int UPT>
++__device__ __forceinline__ void store8(const uint2 (&raw)[UPT], const float (&rsc)[UPT], __nv_bfloat16* kvs, int tile, int t) {
++  __nv_bfloat16* dst = kvs + (tile & 1) * KT * W;
++#pragma unroll
++  for (int i = 0; i < UPT; ++i) {
++    const int idx = t + i * CHUNK_THREADS, key = idx / (W / 8), u = idx % (W / 8);
++    const uint32_t wv[2] = {raw[i].x, raw[i].y};
++#pragma unroll
++    for (int j = 0; j < 8; j += 2) {
++      const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);  // codes j, j + 1 (little-endian)
++      const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
++      dst[wide<W>(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
++      dst[wide<W>(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
++    }
++  }
++}
++
+ // p's [32][32] rows (64 bytes): unit u of row r.
+ __device__ __forceinline__ int narrow(int row, int u) { return row * KT + ((u ^ ((row >> 1) & 3)) << 3); }
+ 
+@@ -88,58 +143,10 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   constexpr int UPT = KT * (KW / 8) / CHUNK_THREADS;  // units a thread moves a tile
+   uint2 raw[FP8 ? UPT : 1];
+   float rsc[FP8 ? UPT : 1];
+-  auto fetch8 = [&](int tile) {
+-    if constexpr (FP8) {
+-      const int64_t first = start + tile * KT;
+-      if constexpr (PAGED8) {
+-        if (sparse) {
+-          const unsigned char* scale_bytes = reinterpret_cast<const unsigned char*>(scales);
+-  #pragma unroll
+-          for (int i = 0; i < UPT; ++i) {
+-            const int idx = t + i * CHUNK_THREADS, key = idx / (KW / 8), u = idx % (KW / 8);
+-            const int64_t ki = first + key;
+-            const bool ok = ki < n;
+-            const int s = ok ? tok[r * w + ki] : 0;
+-            const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;
+-            const int row = s & (CH - 1);
+-            raw[i] = ok ? *reinterpret_cast<const uint2*>(codes8 + page + (row * KW + u * 8)) : make_uint2(0u, 0u);
+-            rsc[i] = ok ? *reinterpret_cast<const float*>(scale_bytes + page + row * 4) : 1.0f;
+-          }
+-          return;
+-        }
+-      }
+-  #pragma unroll
+-      for (int i = 0; i < UPT; ++i) {
+-        const int idx = t + i * CHUNK_THREADS, key = idx / (KW / 8), u = idx % (KW / 8);
+-        const int64_t ki = first + key;
+-        const bool ok = sparse ? ki < n : ki <= limit;
+-        const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+-        raw[i] = ok ? *reinterpret_cast<const uint2*>(codes8 + src * KW + u * 8) : make_uint2(0u, 0u);
+-        rsc[i] = ok ? scales8[src] : 1.0f;
+-      }
+-      }
+-};
+-  auto store8 = [&](int tile) {
+-    if constexpr (FP8) {
+-      __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
+-  #pragma unroll
+-      for (int i = 0; i < UPT; ++i) {
+-        const int idx = t + i * CHUNK_THREADS, key = idx / (KW / 8), u = idx % (KW / 8);
+-        const uint32_t wv[2] = {raw[i].x, raw[i].y};
+-  #pragma unroll
+-        for (int j = 0; j < 8; j += 2) {
+-          const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);
+-          const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+-          dst[wide<KW>(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
+-          dst[wide<KW>(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
+-        }
+-      }
+-      }
+-};
+   auto load_kv = [&](int tile) {
+     if constexpr (FP8) {
+-      fetch8(tile);
+-      store8(tile);
++      fetch8<KW, UPT, PAGED8>(raw, rsc, tile, start, n, limit, codes8, scales8, scales, tok, r, w, pt, pstep, t, sparse);
++      store8<KW, UPT>(raw, rsc, kvs, tile, t);
+       return;
+     }
+     __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
+@@ -181,7 +188,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+     }
+     __syncthreads();
+     if constexpr (FP8) {
+-      if (tile + 2 < tiles) fetch8(tile + 2);  // in flight during this tile's math
++      if (tile + 2 < tiles) fetch8<KW, UPT, PAGED8>(raw, rsc, tile + 2, start, n, limit, codes8, scales8, scales, tok, r, w, pt, pstep, t, sparse);  // in flight during this tile's math
+     }
+     const __nv_bfloat16* kv = kvs + (tile & 1) * KT * KW;
+     const int64_t first = start + tile * KT;
+@@ -265,7 +272,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+     for (int i = 0; i < MT; ++i)
+       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
+     if constexpr (FP8) {
+-      if (tile + 2 < tiles) store8(tile + 2);
++      if (tile + 2 < tiles) store8<KW, UPT>(raw, rsc, kvs, tile + 2, t);
+     } else if (tile + 2 < tiles) {
+       load_kv(tile + 2);
+     }
+@@ -284,6 +291,208 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+     }
+ }
+ 
++// chunks_wide's sparse rows with tf_glm_merge in the block (block (row, HB heads), grid z 1): the row's nch chunks
++// in turn, each computed as chunks_wide's own block computes it (fresh m, l, o; the same code, copied, so chunks_wide's
++// kernels keep their bytes), then merged into the row's running result by tf_glm_merge's sequence, chunk by chunk;
++// out bf16 [rows][heads][LW] as tf_glm_merge writes it, and count-0 rows left alone. No partials.
++template <int HB, bool FP8 = false, int RW = 0, bool PAGED8 = false>
++__device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
++                            const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
++                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
++                            __nv_bfloat16* out = nullptr, int nch = 1) {
++  if (blockDim.x != CHUNK_THREADS) __trap();  // the block the chunk kernels launch with
++  if (!sparse) __trap();  // sparse only: a dense block has no counts to walk
++  if (nch <= 0) __trap();  // nothing to merge
++  static_assert(RW == 0, "chunks_fused reads LW-wide keys only");
++  constexpr int MT = HB / 16;
++  extern __shared__ __align__(16) unsigned char smem[];
++  __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
++  __nv_bfloat16* kvs = qs + HB * LW;
++  __nv_bfloat16* ps = kvs + 2 * KT * LW;
++  float* red = reinterpret_cast<float*>(ps + HB * KT);
++  float* stat = red + HB * 4;
++  const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
++  const int kg = warp & 3, hh = warp >> 2;
++  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB;
++  const int64_t n = cnt[r];
++  if (n == 0) return;  // tf_glm_merge skips sparse count-0 rows
++  float om[MT][8][4], mm[MT][2], lm[MT][2];  // the merge's running o, m, l (tf_glm_merge's registers)
++  for (int64_t c = 0; c < nch; ++c) {
++  const int64_t start = c * CH;
++  const bool live = start < n;
++  const __nv_bfloat16* keys_at = lc;  // a key's row comes as the token list has it
++  const unsigned char* codes8 = reinterpret_cast<const unsigned char*>(lc);
++  const float* scales8 = scales;
++  constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;  // units a thread moves a tile
++  uint2 raw[FP8 ? UPT : 1];
++  float rsc[FP8 ? UPT : 1];
++  auto load_kv = [&](int tile) {
++    if constexpr (FP8) {
++      fetch8<LW, UPT, PAGED8>(raw, rsc, tile, start, n, 0, codes8, scales8, scales, tok, r, w, pt, pstep, t, true);
++      store8<LW, UPT>(raw, rsc, kvs, tile, t);
++      return;
++    }
++    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
++    const int64_t first = start + tile * KT;
++    for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
++      const int key = idx / (LW / 8), u = idx % (LW / 8);
++      const int64_t ki = first + key;
++      const bool ok = ki < n;
++      const int64_t src = ok ? (int64_t)tok[r * w + ki] : 0;
++      cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
++    }
++  };
++  float m[MT][2], l[MT][2], o[MT][8][4];
++  for (int i = 0; i < MT; ++i)
++    for (int e = 0; e < 2; ++e) m[i][e] = -INFINITY, l[i][e] = 0.0f;
++  for (int i = 0; i < MT; ++i)
++    for (int j = 0; j < 8; ++j)
++      for (int e = 0; e < 4; ++e) o[i][j][e] = 0.0f;
++  constexpr int tiles = CH / KT;
++  if (live) {
++    if (c == 0)  // the row's heads once (the later chunks keep them)
++      for (int idx = t; idx < HB * (LW / 8); idx += blockDim.x) {
++        const int hd = idx / (LW / 8), u = idx % (LW / 8);
++        const bool ok = h0 + hd < heads;
++        cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
++      }
++    load_kv(0);
++    commit();
++    load_kv(1);
++    commit();
++  }
++  for (int tile = 0; live && tile < tiles; ++tile) {
++    if constexpr (FP8) {
++      wait<0>();
++    } else {
++      if (tile + 1 < tiles)
++        wait<1>();
++      else
++        wait<0>();
++    }
++    __syncthreads();
++    if constexpr (FP8) {
++      if (tile + 2 < tiles) fetch8<LW, UPT, PAGED8>(raw, rsc, tile + 2, start, n, 0, codes8, scales8, scales, tok, r, w, pt, pstep, t, true);  // in flight during this tile's math
++    }
++    const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
++    const int64_t first = start + tile * KT;
++    float sc[4];
++    if (hh < MT) {
++      float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++#pragma unroll 4
++      for (int kk = 0; kk < LW; kk += 32) {
++        uint32_t a0[4], a1[4], b[4];
++        ldm4<false>(a0, qs + wide(hh * 16 + (lane & 15), (kk >> 3) + (lane >> 4)));
++        ldm4<false>(a1, qs + wide(hh * 16 + (lane & 15), ((kk + 16) >> 3) + (lane >> 4)));
++        ldm4<false>(b, kv + wide(kg * 8 + (lane & 7), (kk >> 3) + (lane >> 3)));
++        glm_router::mma16816(acc, a0, b);
++        glm_router::mma16816(acc, a1, b + 2);
++      }
++      for (int e = 0; e < 2; ++e) {
++        const int64_t ki = first + kg * 8 + q * 2 + e;
++        const bool ok = ki < n;
++        sc[e] = ok ? __fmul_rn(acc[e], scale) : -INFINITY;
++        sc[e + 2] = ok ? __fmul_rn(acc[e + 2], scale) : -INFINITY;
++      }
++      for (int hf = 0; hf < 2; ++hf) {
++        const float mx = quad_max(fmaxf(sc[hf * 2], sc[hf * 2 + 1]));
++        if (q == 0) red[(hh * 16 + hf * 8 + g) * 4 + kg] = mx;
++      }
++    }
++    __syncthreads();
++    if (t < HB * 4) {
++      float v = red[t];
++      v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
++      v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
++      if ((t & 3) == 0) stat[t / 4] = v;
++    }
++    __syncthreads();
++    float alpha[MT][2];
++    for (int i = 0; i < MT; ++i)
++      for (int hf = 0; hf < 2; ++hf) {
++        const float tm = stat[i * 16 + hf * 8 + g];
++        const bool active = tm != -INFINITY;
++        const float nm = active ? fmaxf(m[i][hf], tm) : m[i][hf];
++        alpha[i][hf] = active ? (m[i][hf] == -INFINITY ? 0.0f : glm_triton::exp_approx(m[i][hf] - nm)) : 1.0f;
++        if (i == hh) {
++          float p[2];
++          for (int e = 0; e < 2; ++e) {
++            const int64_t ki = first + kg * 8 + q * 2 + e;
++            const bool ok = ki < n;
++            p[e] = active && ok ? glm_triton::exp_approx(sc[hf * 2 + e] - nm) : 0.0f;
++          }
++          const int hr = i * 16 + hf * 8 + g, col = kg * 8 + q * 2;
++          *reinterpret_cast<__nv_bfloat162*>(ps + narrow(hr, col >> 3) + (col & 7)) = __floats2bfloat162_rn(p[0], p[1]);
++          const float s = quad_sum(p[0] + p[1]);
++          if (q == 0) red[hr * 4 + kg] = s;
++        }
++        m[i][hf] = nm;
++      }
++    __syncthreads();
++    if (t < HB * 4) {
++      float v = red[t];
++      v = v + __shfl_xor_sync(0xffffffffu, v, 2);
++      v = v + __shfl_xor_sync(0xffffffffu, v, 1);
++      if ((t & 3) == 0) stat[HB + t / 4] = v;
++    }
++    for (int i = 0; i < MT; ++i)
++      for (int j = 0; j < 8; ++j)
++        for (int e = 0; e < 4; ++e) o[i][j][e] = __fmul_rn(o[i][j][e], alpha[i][e / 2]);
++#pragma unroll
++    for (int k16 = 0; k16 < KT; k16 += 16) {
++      uint32_t a[MT][4];
++      for (int i = 0; i < MT; ++i) ldm4<false>(a[i], ps + narrow(i * 16 + (lane & 15), (k16 >> 3) + (lane >> 4)));
++#pragma unroll
++      for (int j = 0; j < 8; j += 2) {
++        uint32_t b[4];
++        ldm4<true>(b, kv + wide(k16 + (lane & 15), ((warp * 64 + j * 8) >> 3) + (lane >> 4)));
++        for (int i = 0; i < MT; ++i) {
++          glm_router::mma16816(o[i][j], a[i], b);
++          glm_router::mma16816(o[i][j + 1], a[i], b + 2);
++        }
++      }
++    }
++    __syncthreads();
++    for (int i = 0; i < MT; ++i)
++      for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
++    if constexpr (FP8) {
++      if (tile + 2 < tiles) store8<LW, UPT>(raw, rsc, kvs, tile + 2, t);
++    } else if (tile + 2 < tiles) {
++      load_kv(tile + 2);
++    }
++    commit();
++  }
++  // tf_glm_merge's step for chunk c on this thread's (head, column) elements: its m, l are the chunk's pm, pl
++  for (int i = 0; i < MT; ++i)
++    for (int hf = 0; hf < 2; ++hf) {
++        const float cm = m[i][hf], cl = l[i][hf], was = c == 0 ? -INFINITY : mm[i][hf];
++        const bool active = cl > 0.0f;
++        const float nm = active ? fmaxf(was, cm) : was;
++        const float b = active ? glm_triton::exp_approx(cm - nm) : 0.0f;
++        if (c == 0) {
++          for (int j = 0; j < 8; ++j)
++            for (int e = 0; e < 2; ++e) om[i][j][hf * 2 + e] = __fmaf_rn(b, o[i][j][hf * 2 + e], 0.0f);
++          lm[i][hf] = __fmaf_rn(b, cl, 0.0f);
++        } else {
++          const float a = active ? (was == -INFINITY ? 0.0f : glm_triton::exp_approx(was - nm)) : 1.0f;
++          for (int j = 0; j < 8; ++j)
++            for (int e = 0; e < 2; ++e)
++              om[i][j][hf * 2 + e] = __fmaf_rn(om[i][j][hf * 2 + e], a, __fmul_rn(b, o[i][j][hf * 2 + e]));
++          lm[i][hf] = __fmaf_rn(lm[i][hf], a, __fmul_rn(b, cl));
++        }
++        mm[i][hf] = nm;
++      }
++  }  // chunks
++  for (int i = 0; i < MT; ++i)
++    for (int e = 0; e < 4; ++e) {
++      const int64_t hd = h0 + i * 16 + g + (e / 2) * 8;
++      if (hd >= heads) continue;
++      for (int j = 0; j < 8; ++j)
++        out[(r * heads + hd) * LW + warp * 64 + j * 8 + q * 2 + e % 2] =
++            __float2bfloat16_rn(glm_triton::div_full(om[i][j][e], lm[i][e / 2]));
++    }
++}
++
+ }  // namespace glm_attn
+ 
+ // Ling-3.1's forms on the latent: per-rank merge, q absorb and v expand at D-wide heads, rope, head gate.
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 1ea4683c..bc1309d3 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -174,3 +174,57 @@ extern "C" __global__ void __launch_bounds__(128)
+       }
+   }
+ }
++
++// The fused form: a block a (row, HB heads), the row's nch chunks in turn, merged in the kernel; no partials.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok, const int* cnt,
++                           __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale, int nch,
++                           const int* pt, int64_t pstep) {
++  glm_pdl::enter();
++  glm_attn::chunks_fused<16, false, 0, false>(qa, lc, nullptr, tok, cnt, nullptr, nullptr, nullptr, rows, heads, w,
++                                                scale, 1, pt, pstep, nullptr, out, nch);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_32_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok, const int* cnt,
++                           __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale, int nch,
++                           const int* pt, int64_t pstep) {
++  glm_pdl::enter();
++  glm_attn::chunks_fused<32, false, 0, false>(qa, lc, nullptr, tok, cnt, nullptr, nullptr, nullptr, rows, heads, w,
++                                                scale, 1, pt, pstep, nullptr, out, nch);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_fp8_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* tok,
++                               const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale,
++                               int nch) {
++  glm_pdl::enter();
++  glm_attn::chunks_fused<16, true, 0, false>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr, tok, cnt,
++                                               nullptr, nullptr, nullptr, rows, heads, w, scale, 1, nullptr, 0, scales,
++                                               out, nch);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_32_fp8_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* tok,
++                               const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t w, float scale,
++                               int nch) {
++  glm_pdl::enter();
++  glm_attn::chunks_fused<32, true, 0, false>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr, tok, cnt,
++                                               nullptr, nullptr, nullptr, rows, heads, w, scale, 1, nullptr, 0, scales,
++                                               out, nch);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_fp8_paged_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
++                                     const int* tok, const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads,
++                                     int64_t w, float scale, int nch, const int* pt, int64_t pstep) {
++  glm_pdl::enter();
++  glm_attn::chunks_fused<16, true, 0, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr, tok, cnt,
++                                              nullptr, nullptr, nullptr, rows, heads, w, scale, 1, pt, pstep, scales,
++                                              out, nch);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_32_fp8_paged_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
++                                     const int* tok, const int* cnt, __nv_bfloat16* out, int64_t rows, int64_t heads,
++                                     int64_t w, float scale, int nch, const int* pt, int64_t pstep) {
++  glm_pdl::enter();
++  glm_attn::chunks_fused<32, true, 0, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), nullptr, tok, cnt,
++                                              nullptr, nullptr, nullptr, rows, heads, w, scale, 1, pt, pstep, scales,
++                                              out, nch);
++}
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 7329a6bc..b808dff6 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -73,6 +73,12 @@ pub const Kernels = struct {
+     chunks_32_fp8: cuda.Function,
+     chunks_16_fp8_paged: cuda.Function,
+     chunks_32_fp8_paged: cuda.Function,
++    chunks_16_fused: cuda.Function,
++    chunks_32_fused: cuda.Function,
++    chunks_16_fp8_fused: cuda.Function,
++    chunks_32_fp8_fused: cuda.Function,
++    chunks_16_fp8_paged_fused: cuda.Function,
++    chunks_32_fp8_paged_fused: cuda.Function,
+     merge: cuda.Function,
+     scores: cuda.Function,
+ 
+@@ -87,6 +93,12 @@ pub const Kernels = struct {
+         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
+         try k.chunks_16_fp8_paged.allowDynamicShared(chunksSmem(16));
+         try k.chunks_32_fp8_paged.allowDynamicShared(chunksSmem(32));
++        try k.chunks_16_fused.allowDynamicShared(chunksSmem(16));
++        try k.chunks_32_fused.allowDynamicShared(chunksSmem(32));
++        try k.chunks_16_fp8_fused.allowDynamicShared(chunksSmem(16));
++        try k.chunks_32_fp8_fused.allowDynamicShared(chunksSmem(32));
++        try k.chunks_16_fp8_paged_fused.allowDynamicShared(chunksSmem(16));
++        try k.chunks_32_fp8_paged_fused.allowDynamicShared(chunksSmem(32));
+         return k;
+     }
+ };
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index f141fa14..941b4fe6 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -13,6 +13,9 @@ pub const heads_tile_wide = 32;
+ pub const prompt_rows = 64;
+ pub const prompt_rb = 64;
+ 
++/// The block the chunk kernels launch with (common/mla.cuh's CHUNK_THREADS).
++pub const chunk_threads = 256;
++
+ /// latent.head_block: a rank's 32 heads a program in prompt chunks (each key read once), 16 in decode windows.
+ pub fn headBlock(rows: usize) usize {
+     return if (rows >= 64) heads_tile_wide else heads_tile;
+@@ -82,7 +85,7 @@ pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usi
+ }
+ 
+ /// The chunk partials of one attention call: po fp32 [nch][rows][heads][lw], pm and pl fp32 [nch][rows][heads].
+-pub const Partials = struct { po: u64, pm: u64, pl: u64 };
++pub const Partials = struct { po: u64, pm: u64, pl: u64, rows: usize = 0 }; // rows: the region's capacity
+ 
+ /// latent.attention: causal qa over the cache in `nch` 512-key chunks into out bf16; `dummy`: the merge's count i32.
+ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, t: Table, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+@@ -127,10 +130,41 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64,
+ 
+ pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
+     const nch = chunksFor(w);
++    if (fuses(p, nch, rows)) return fused(set, stream, qa, cache, scales, t, tokens, counts, w, out, rows, heads, lw, nch, scale, headBlock(rows));
+     try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows), true);
+     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+ }
+ 
++/// Whether a sparse call of `rows` rows over `nch` chunks merges in the kernel: its partials would not fit `p`.
++pub fn fuses(p: Partials, nch: usize, rows: usize) bool {
++    // `nch * rows` would trap on overflow; dividing is exact for usize and cannot.
++    return p.rows != 0 and nch != 0 and rows > p.rows / nch;
++}
++
++/// The fused launch: one block handles a (row, HB heads), `nch` chunks a block, out bf16 as merge writes it, no partials.
++fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, out: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
++    if (lw != 512) return error.LatentShape;
++    const kv8 = scales != 0;
++    const paged8 = kv8 and t.pt != 0;
++    if (t.pt != 0 and t.logical != paged8) return error.TokenUnits;
++    const f = switch (hb) {
++        heads_tile => if (!kv8) set.glue.chunks_16_fused else if (paged8) set.glue.chunks_16_fp8_paged_fused else set.glue.chunks_16_fp8_fused,
++        heads_tile_wide => if (!kv8) set.glue.chunks_32_fused else if (paged8) set.glue.chunks_32_fp8_paged_fused else set.glue.chunks_32_fp8_fused,
++        else => return error.HeadBlock,
++    };
++    var a: cuda.Args = .{};
++    a.add(qa);
++    a.add(cache);
++    if (kv8) a.add(scales);
++    inline for (.{ tokens, counts, out, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intCast(nch)) }) |v| a.add(v);
++    if (!kv8 or paged8) {
++        a.add(t.pt);
++        a.add(@as(i64, @intCast(t.ps)));
++    }
++    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
++    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
++}
++
+ fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64, rows: usize, heads: usize, lw: usize, nch: usize, sparse: bool) !void {
+     if (lw != 512) return error.LatentShape;
+     var a: cuda.Args = .{};
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 41e31d2a..812401ff 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -268,7 +268,9 @@ pub const Buffers = struct {
+         const lw: usize = c.kv_lora;
+         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
+         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
+-        const partial_rows = @max(nch * part_rows, latent.chunksFor(sparse.width) * seg); // dense calls, or one sparse
++        // A prefill funds one dense pass's partials and lets a wider sparse call merge in the kernel
++        // (cuda_latent's fuses) instead of paying for every sparse call up front.
++        const partial_rows = if (prefill) nch * part_rows else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg);
+         const np_max = capacity / sparse.pool;
+         const sel = selectLs(rows, prefill, seg, np_max);
+         var mm: usize = 4;
+@@ -355,7 +357,7 @@ pub const Buffers = struct {
+                 .ol = p[28],
+                 .vn = p[29],
+                 .qi = p[30],
+-                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33] },
++                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33], .rows = partial_rows },
+                 .dummy = p[34],
+                 .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39], .bits_rows = sel.bits_rows },
+                 .tokens = p[40],
+-- 
+2.43.0
+

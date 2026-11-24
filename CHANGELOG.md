@@ -1,5 +1,21 @@
 # Changelog
 
+- **2026-11-24** -- Engine patches `0019`-`0021` add the fused prompt-chunk kernel. `0019`: when a sparse call's
+  partials would not fit the pool (`cuda_latent.fuses`: `nch * rows > p.rows`), one block handles a (row, HB heads),
+  loops the row's chunks and merges in the kernel, so the chunk costs one launch and no partial buffer. Sparse only
+  (a dense block traps); `fetch8`/`store8` move into `common/mla.cuh` so both paths read the E4M3 cache through one
+  implementation, and a prefill now funds one dense pass's partials instead of every sparse call's. `0020` adds
+  `fusedSame` to `tf-cuda-test glm-ref`: three sparse cache forms at four row counts, both output buffers filled with
+  0xff, the partials nulled before the fused call, byte for byte against `chunks_wide` + merge. `0021` registers the
+  six launches with the kernel contract: `usage = registry.none` (13.0 receipts owed), the nvcc 13.3.1 five-SM
+  receipts in `measurements/pending_133.zig`, and a test that holds each launch against its window twin and against
+  every SM's limits. Measured on one GB10 pair, `KV=fp8` with the page pool, `L2PF=1`, base and patched images
+  started alternately twice, three cold prefill runs per start (medians): 16K 1,297.4/1,298.0 -> 1,334.0/1,324.6
+  (+2.8%/+2.0%), 64K 1,316.5/1,313.4 -> 1,358.9/1,355.5 (+3.2%/+3.2%); `glm-ref` 26 PASS, the fused output
+  byte-identical to the path it replaces, and `kernel-contract-limits` reports all six launches current on all five
+  SMs. The 1.1.9 recipe measures 1,618.6 / 1,644.6 at 16K / 64K on this pair in a separate window; no share of that
+  gap is claimed here.
+
 - **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
   `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
   turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the
